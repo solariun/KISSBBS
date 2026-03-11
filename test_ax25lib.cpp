@@ -14,6 +14,8 @@
 // code that links ax25lib can be compiled with -std=c++11.
 // =============================================================================
 #include "ax25lib.hpp"
+#include "ini.hpp"
+#include "basic.hpp"
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -687,6 +689,150 @@ TEST(Timers, T1RetransmitReachesLinkFailed) {
 
     delete conn_a;
     delete accepted;
+}
+
+// =============================================================================
+// 8. IniConfig
+// =============================================================================
+TEST(IniConfig, LoadFromString) {
+    // Write a temp INI file
+    const char* path = "/tmp/test_kissbbs.ini";
+    {
+        FILE* f = fopen(path, "w");
+        ASSERT_NE(f, nullptr);
+        fprintf(f, "[ax25]\ncallsign = W1AW-1\nmtu = 64\n[bbs]\nname = TestBBS\n");
+        fclose(f);
+    }
+    IniConfig cfg;
+    ASSERT_TRUE(cfg.load(path));
+    EXPECT_EQ(cfg.get("ax25", "callsign"), "W1AW-1");
+    EXPECT_EQ(cfg.get_int("ax25", "mtu"), 64);
+    EXPECT_EQ(cfg.get("bbs", "name"), "TestBBS");
+    EXPECT_EQ(cfg.get("bbs", "missing", "default"), "default");
+}
+
+TEST(IniConfig, MissingFile) {
+    IniConfig cfg;
+    EXPECT_FALSE(cfg.load("/tmp/nonexistent_kissbbs_12345.ini"));
+}
+
+TEST(IniConfig, Comments) {
+    const char* path = "/tmp/test_kissbbs_comments.ini";
+    {
+        FILE* f = fopen(path, "w");
+        ASSERT_NE(f, nullptr);
+        fprintf(f, "[sec]\nkey = value  ; inline comment\nkey2 = other # hash comment\n");
+        fclose(f);
+    }
+    IniConfig cfg;
+    ASSERT_TRUE(cfg.load(path));
+    EXPECT_EQ(cfg.get("sec", "key"), "value");
+    EXPECT_EQ(cfg.get("sec", "key2"), "other");
+}
+
+TEST(IniConfig, BoolAndDouble) {
+    const char* path = "/tmp/test_kissbbs_types.ini";
+    {
+        FILE* f = fopen(path, "w");
+        ASSERT_NE(f, nullptr);
+        fprintf(f, "[s]\nflag = true\npi = 3.14\n");
+        fclose(f);
+    }
+    IniConfig cfg;
+    ASSERT_TRUE(cfg.load(path));
+    EXPECT_TRUE(cfg.get_bool("s", "flag"));
+    EXPECT_NEAR(cfg.get_double("s", "pi"), 3.14, 0.001);
+}
+
+// =============================================================================
+// 9. Basic interpreter
+// =============================================================================
+static std::string run_basic(const std::string& src) {
+    Basic interp;
+    std::string output;
+    interp.on_send = [&](const std::string& s) { output += s; };
+    interp.on_recv = [](int) -> std::string { return "test_input"; };
+    interp.load_string(src);
+    interp.run();
+    return output;
+}
+
+TEST(BasicInterp, PrintString) {
+    std::string out = run_basic("10 PRINT \"Hello, World!\"");
+    EXPECT_NE(out.find("Hello, World!"), std::string::npos);
+}
+
+TEST(BasicInterp, Arithmetic) {
+    std::string out = run_basic("10 PRINT 2 + 3 * 4");
+    EXPECT_NE(out.find("14"), std::string::npos);
+}
+
+TEST(BasicInterp, StringConcat) {
+    std::string out = run_basic("10 A$ = \"Hello\" : B$ = \" World\" : PRINT A$ + B$");
+    EXPECT_NE(out.find("Hello World"), std::string::npos);
+}
+
+TEST(BasicInterp, IfThen) {
+    std::string out = run_basic("10 X = 5\n20 IF X > 3 THEN PRINT \"big\"");
+    EXPECT_NE(out.find("big"), std::string::npos);
+}
+
+TEST(BasicInterp, IfThenElse) {
+    std::string out = run_basic("10 X = 1\n20 IF X > 3 THEN PRINT \"big\" ELSE PRINT \"small\"");
+    EXPECT_NE(out.find("small"), std::string::npos);
+    EXPECT_EQ(out.find("big"), std::string::npos);
+}
+
+TEST(BasicInterp, ForNext) {
+    std::string out = run_basic("10 FOR I = 1 TO 3\n20 PRINT STR$(I)\n30 NEXT I");
+    EXPECT_NE(out.find("1"), std::string::npos);
+    EXPECT_NE(out.find("2"), std::string::npos);
+    EXPECT_NE(out.find("3"), std::string::npos);
+}
+
+TEST(BasicInterp, GosubReturn) {
+    std::string out = run_basic(
+        "10 GOSUB 100\n"
+        "20 PRINT \"back\"\n"
+        "30 END\n"
+        "100 PRINT \"sub\"\n"
+        "110 RETURN\n"
+    );
+    EXPECT_NE(out.find("sub"), std::string::npos);
+    EXPECT_NE(out.find("back"), std::string::npos);
+}
+
+TEST(BasicInterp, StringFunctions) {
+    std::string out = run_basic(
+        "10 A$ = \"Hello World\"\n"
+        "20 PRINT UPPER$(A$)\n"
+        "30 PRINT LEN(A$)\n"
+        "40 PRINT LEFT$(A$, 5)\n"
+    );
+    EXPECT_NE(out.find("HELLO WORLD"), std::string::npos);
+    EXPECT_NE(out.find("11"), std::string::npos);
+    EXPECT_NE(out.find("Hello"), std::string::npos);
+}
+
+TEST(BasicInterp, ExecCommand) {
+    Basic interp;
+    std::string output;
+    interp.on_send = [&](const std::string& s) { output += s; };
+    interp.on_recv = [](int) -> std::string { return ""; };
+    interp.load_string("10 EXEC \"echo hello_exec\", R$\n20 PRINT R$");
+    interp.run();
+    EXPECT_NE(output.find("hello_exec"), std::string::npos);
+}
+
+TEST(BasicInterp, ExecTimeout) {
+    Basic interp;
+    std::string output;
+    interp.on_send = [&](const std::string& s) { output += s; };
+    interp.on_recv = [](int) -> std::string { return ""; };
+    // sleep 10 with 100ms timeout should return TIMEOUT
+    interp.load_string("10 EXEC \"sleep 10\", R$, 100\n20 PRINT R$");
+    interp.run();
+    EXPECT_NE(output.find("TIMEOUT"), std::string::npos);
 }
 
 // Main — GoogleTest entry point

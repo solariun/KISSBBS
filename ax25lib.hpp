@@ -412,4 +412,31 @@ struct CLIParams {
     static void print_help(const char* prog, const char* extra = "");
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// APRS helpers (ax25::aprs namespace)
+// ─────────────────────────────────────────────────────────────────────────────
+namespace aprs {
+
+// Parsed APRS message
+struct Msg { std::string to, text, seq; };
+
+// Build APRS position info string  (!DDMM.mmN/DDDMM.mmWsym[comment])
+// lat/lon: decimal degrees (negative = S / W); sym: APRS symbol char
+std::string make_pos(double lat, double lon, char sym = '>', const std::string& comment = "");
+
+// Build APRS message info string  (:ADDRESSEE :text{seq})
+// Sequence number auto-incremented globally.
+std::string make_msg(const std::string& dest, const std::string& text);
+
+// Parse APRS message info field. Returns true and fills 'out' on success.
+bool parse_msg(const std::string& info, Msg& out);
+
+// Returns true if info field looks like a position report (starts with !/@=/`)
+bool is_pos(const std::string& info);
+
+// Extract printable text from a Frame's info field (replaces non-printable with '.')
+std::string info_str(const Frame& f);
+
+} // namespace aprs
+
 } // namespace ax25

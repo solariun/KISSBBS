@@ -774,4 +774,73 @@ void CLIParams::print_help(const char* prog, const char* extra) {
     if (extra && *extra) std::cerr << extra;
 }
 
+// =============================================================================
+// APRS helpers
+// =============================================================================
+namespace aprs {
+
+std::string make_pos(double lat, double lon, char sym, const std::string& comment) {
+    char latch = lat >= 0 ? 'N' : 'S';
+    char lonch = lon >= 0 ? 'E' : 'W';
+    double alat = lat >= 0 ? lat : -lat;
+    double alon = lon >= 0 ? lon : -lon;
+    int latd = (int)alat;  double latm = (alat - latd) * 60.0;
+    int lond = (int)alon;  double lonm = (alon - lond) * 60.0;
+    char buf[96];
+    snprintf(buf, sizeof(buf), "!%02d%05.2f%c/%03d%05.2f%c%c%s",
+             latd, latm, latch, lond, lonm, lonch, sym, comment.c_str());
+    return buf;
+}
+
+static int g_aprs_seq = 0;
+std::string make_msg(const std::string& dest, const std::string& text) {
+    char addr[10];
+    snprintf(addr, sizeof(addr), "%-9s", dest.c_str());
+    ++g_aprs_seq;
+    char buf[256];
+    snprintf(buf, sizeof(buf), ":%s:%s{%03d}", addr, text.c_str(), g_aprs_seq);
+    return buf;
+}
+
+bool parse_msg(const std::string& info, Msg& m) {
+    if (info.size() < 11 || info[0] != ':') return false;
+    std::string::size_type sep = info.find(':', 1);
+    if (sep == std::string::npos || sep > 10) return false;
+    // trim the addressee
+    std::string to = info.substr(1, sep - 1);
+    std::string::size_type b = to.find_first_not_of(" \t");
+    std::string::size_type e = to.find_last_not_of(" \t");
+    m.to = (b == std::string::npos) ? "" : to.substr(b, e - b + 1);
+    m.text = info.substr(sep + 1);
+    // strip {seq}
+    std::string::size_type brace = m.text.rfind('{');
+    if (brace != std::string::npos) {
+        m.seq = m.text.substr(brace + 1);
+        std::string::size_type cb = m.seq.find('}');
+        if (cb != std::string::npos) m.seq.resize(cb);
+        m.text.resize(brace);
+    }
+    // trim text
+    b = m.text.find_first_not_of(" \t");
+    e = m.text.find_last_not_of(" \t");
+    m.text = (b == std::string::npos) ? "" : m.text.substr(b, e - b + 1);
+    return true;
+}
+
+bool is_pos(const std::string& info) {
+    if (info.empty()) return false;
+    char c = info[0];
+    return c == '!' || c == '=' || c == '@' || c == '/' || c == '`';
+}
+
+std::string info_str(const Frame& f) {
+    std::string s(f.info.begin(), f.info.end());
+    for (auto& c : s)
+        if ((unsigned char)c < 0x20 && c != '\r' && c != '\n') c = '.';
+    while (!s.empty() && (s.back() == '\r' || s.back() == '\n')) s.pop_back();
+    return s;
+}
+
+} // namespace aprs
+
 } // namespace ax25
