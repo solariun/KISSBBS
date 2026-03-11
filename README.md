@@ -3,8 +3,9 @@
 [![CI](https://github.com/solariun/KISSBBS/actions/workflows/ci.yml/badge.svg)](https://github.com/solariun/KISSBBS/actions/workflows/ci.yml)
 
 A self-contained C++11 library implementing the AX.25 amateur-radio link-layer
-protocol over KISS-mode TNCs.  Includes a full-featured BBS example with remote
-shell access, an interactive KISS terminal, and a comprehensive GoogleTest suite.
+protocol over KISS-mode TNCs.  Includes a full-featured BBS with INI config,
+a Tiny BASIC scripting engine (SQLite · TCP sockets · HTTP GET · shell exec),
+remote shell access, an interactive KISS terminal, and a 57-test GoogleTest suite.
 
 ---
 
@@ -21,6 +22,9 @@ shell access, an interactive KISS terminal, and a comprehensive GoogleTest suite
 9. [Usage Examples](#9-usage-examples)
 10. [Running Tests](#10-running-tests)
 11. [BBS Example](#11-bbs-example)
+12. [INI Configuration](#12-ini-configuration)
+13. [BASIC Scripting](#13-basic-scripting)
+14. [APRS Helpers (ax25::aprs)](#14-aprs-helpers-ax25aprs)
 
 ---
 
@@ -432,29 +436,30 @@ sequenceDiagram
 
 ### Prerequisites
 
-| Platform | Compiler | Extra deps |
-|----------|----------|------------|
-| macOS    | Xcode CLT (`xcode-select --install`) | — |
-| Linux    | `g++` ≥ 7 | `sudo apt-get install build-essential` |
+| Platform | Compiler | Required | Optional |
+|----------|----------|----------|----------|
+| macOS    | Xcode CLT (`xcode-select --install`) | — | `brew install sqlite` |
+| Linux    | `g++` ≥ 7 | `build-essential` | `libsqlite3-dev` |
 
-For the test suite you also need GoogleTest:
+**SQLite3** — needed for the `DBOPEN/DBEXEC/DBQUERY` BASIC commands.
+The Makefile auto-detects it via `pkg-config`; everything else compiles without it.
 
 ```bash
 # macOS
-brew install googletest
+brew install googletest sqlite
 
 # Ubuntu / Debian
-sudo apt-get install libgtest-dev
+sudo apt-get install libgtest-dev libsqlite3-dev
 
 # Fedora
-sudo dnf install gtest-devel
+sudo dnf install gtest-devel sqlite-devel
 ```
 
 ### Build targets
 
 ```bash
 make          # build bbs and ax25kiss binaries
-make test     # compile and run all 43 unit tests
+make test     # compile and run all 57 unit tests
 make clean    # remove all build artefacts
 ```
 
@@ -701,9 +706,9 @@ make test
 Expected output:
 
 ```
-[==========] Running 43 tests from 8 test suites.
+[==========] Running 57 tests from 10 test suites.
 ...
-[  PASSED  ] 43 tests.
+[  PASSED  ] 57 tests.
 ```
 
 ### Test suites
@@ -718,59 +723,73 @@ Expected output:
 | `RouterConnection` | 6 | Full connect+disconnect, data transfer, bidirectional data, large data chunked, DM rejection, address assignment |
 | `RouterUI` | 2 | UI send/receive, APRS broadcast (fires on_ui regardless of dest) |
 | `Timers` | 1 | T1 retransmit leading to link failure after N2 retries |
+| `IniConfig` | 4 | Load file, missing file, inline comments, bool/double getters |
+| `BasicInterp` | 10 | PRINT, arithmetic, string concat, IF/THEN/ELSE, FOR/NEXT, GOSUB/RETURN, string functions, EXEC, EXEC timeout |
 
 ---
 
 ## 11. BBS Example
 
-`bbs.cpp` is a feature-complete BBS that demonstrates the library in production use.
+`bbs.cpp` is a full-featured BBS that demonstrates the library in production use.
+Configuration can be supplied via command-line flags **or** a `bbs.ini` file.
 
-### Start the BBS
+### Quick start — command line
 
 ```bash
 make
-./bbs /dev/ttyUSB0 9600 -c W1BBS -n "My BBS" -B 600
+./bbs -c W1BBS-1 -b 9600 -n "My BBS" -B 600 /dev/ttyUSB0
 ```
 
-Full option list:
+### Quick start — INI file
+
+```bash
+cp bbs.ini my_station.ini
+# edit callsign, device, etc.
+./bbs -C my_station.ini
+```
+
+### Full option reference
 
 ```
-Usage: bbs <device> <baud> -c <mycall> [options]
-
-AX.25 options:
-  -c <CALL>      My callsign (required)
-  -d <CALL>...   Digipeater path
-  -m <bytes>     MTU (default 128)
-  -w <n>         Window size 1-7 (default 3)
-  -t <ms>        T1 retransmit ms (default 3000)
-  -T <ms>        T3 keep-alive ms (default 60000)
-  -r <n>         Max retries N2 (default 10)
+AX.25 / KISS parameters:
+  -c <CALL[-N]>   My callsign (required)
+  -b <baud>       Baud rate (default: 9600)
+  -p <path>       Digipeater path, comma-separated (e.g. WIDE1-1,WIDE2-1)
+  -m <bytes>      I-frame MTU (default: 128)
+  -w <1-7>        Window size (default: 3)
+  -t <ms>         T1 retransmit timer (default: 3000)
+  -k <ms>         T3 keep-alive timer (default: 60000)
+  -T <units>      KISS TX delay ×10 ms (default: 30)
+  -s <0-255>      KISS persistence (default: 63)
 
 BBS options:
-  -n <name>      BBS name shown in welcome banner
-  -u <text>      Beacon/UNPROTO text
-  -B <secs>      Beacon interval seconds (default 0 = off)
+  -n <name>       BBS name (default: AX25BBS)
+  -u <text>       APRS beacon info string
+  -B <secs>       Beacon interval seconds (0 = off)
+  -C <file>       Load configuration from INI file
 
-One-shot modes (no interactive BBS):
-  --ui <DEST> <text>    Send a single UI frame and exit
-  --aprs <text>         Send a single APRS frame and exit
+One-shot modes:
+  --ui <DEST> <text>    Send one UI frame and exit
+  --aprs <text>         Send one APRS frame and exit
 ```
 
-### BBS commands (once connected)
+### Session commands (once connected via AX.25)
 
 | Command | Description |
 |---------|-------------|
-| `H` or `?` | Help |
-| `I` | Station info |
-| `M` | Send a message to another connected user |
-| `UI <DEST> <text>` | Send an AX.25 UI frame |
-| `POS <lat> <lon> [sym] [comment]` | Transmit APRS position |
+| `H` / `?` | Help |
+| `U` | List connected users |
+| `M <CALL> <msg>` | Send in-BBS message to a connected user |
+| `UI <DEST> <text>` | Send a raw UI frame over the air |
+| `POS <lat> <lon> [sym] [comment]` | Transmit APRS position (decimal degrees) |
 | `AMSG <CALL> <msg>` | Send an APRS message to any callsign |
-| `SH` | Open a remote shell (PTY bridge) |
-| `BYE` or `Q` | Disconnect |
+| `I` | BBS and station info |
+| `B` | Send APRS beacon immediately |
+| `SH` | Open a remote shell (PTY bridge, escape `~.` to exit) |
+| `BYE` / `Q` | Disconnect |
 
-All connected users see incoming UI frames and APRS traffic in real time.
-Incoming APRS messages addressed to a connected user are routed to their session.
+All connected users see incoming UI and APRS traffic in real time.
+Incoming APRS messages addressed to a connected user are automatically routed to their session.
 
 ---
 
@@ -808,3 +827,333 @@ Connection::~Connection() {
 
 The trade-off is that an object can only belong to **one** list at a time, which
 is fine here since a Connection belongs to exactly one Router.
+
+---
+
+## 12. INI Configuration
+
+`bbs.ini` is an optional configuration file that sets all BBS parameters.
+Command-line flags always take precedence over file values.
+
+### File format
+
+```ini
+; Lines starting with ; or # are comments
+[section]
+key = value   ; inline comments also work
+```
+
+### Full reference
+
+```ini
+[kiss]
+device = /dev/ttyUSB0     ; serial port (or /dev/tty.usbserial-* on macOS)
+baud   = 9600             ; baud rate: 1200 / 9600 / 38400 / 115200
+
+[ax25]
+callsign    = W1BBS-1     ; your station callsign (required)
+mtu         = 128         ; max bytes per I-frame
+window      = 3           ; sliding window size (1–7)
+t1_ms       = 3000        ; retransmit timer (ms)
+t3_ms       = 60000       ; keep-alive timer (ms)
+n2          = 10          ; max retries before link failure
+txdelay     = 30          ; KISS TX delay (×10 ms)
+persist     = 63          ; KISS persistence byte (0–255)
+; digipeaters = WIDE1-1,WIDE2-1   ; optional digi path
+
+[bbs]
+name             = MyBBS
+beacon           = !2330.00S/04636.00W>MyBBS AX.25 BBS
+beacon_interval  = 600          ; seconds, 0 = off
+welcome_script   = welcome.bas  ; optional BASIC script run on each connect
+
+[basic]
+script_dir = .
+database   = bbs.db       ; SQLite database file for BASIC scripts
+```
+
+### Using `IniConfig` in your own code
+
+```cpp
+#include "ini.hpp"
+
+IniConfig cfg;
+if (!cfg.load("bbs.ini")) {
+    std::cerr << "config file not found, using defaults\n";
+}
+
+std::string call   = cfg.get("ax25", "callsign", "N0CALL");
+int         baud   = cfg.get_int("kiss", "baud", 9600);
+bool        beacon = cfg.get_bool("bbs", "beacon_enabled", false);
+double      lat    = cfg.get_double("bbs", "lat", 0.0);
+
+// Check existence before reading optional keys
+if (cfg.has("bbs", "welcome_script")) {
+    std::string script = cfg.get("bbs", "welcome_script");
+}
+
+// Iterate all keys in a section
+for (auto& kv : cfg.section("ax25")) {
+    std::cout << kv.first << " = " << kv.second << "\n";
+}
+```
+
+---
+
+## 13. BASIC Scripting
+
+The BBS ships a **Tiny BASIC interpreter** (`basic.hpp` / `basic.cpp`) that lets
+you write BBS welcome screens, menus, and automated services without recompiling.
+
+### How it fits in
+
+```
+bbs.ini → welcome_script = welcome.bas
+              ↓
+          Basic interp;
+          interp.on_send = [&](auto s){ conn->send(s); };   // PRINT/SEND → AX.25
+          interp.on_recv = [&](int ms){ return conn_readline(); };
+          interp.set_str("callsign$", caller);               // pre-filled vars
+          interp.load_file("welcome.bas");
+          interp.run();
+```
+
+### Language quick reference
+
+#### Variables
+
+| Name pattern | Type | Example |
+|---|---|---|
+| `NAME$` | String | `A$ = "hello"` |
+| `NAME` or `NAME%` | Number (double) | `X = 42` |
+
+#### Flow control
+
+```basic
+10 IF X > 5 THEN PRINT "big" ELSE PRINT "small"
+20 IF A$ = "BYE" THEN GOTO 999
+30 GOSUB 500         : REM call subroutine at line 500
+40 FOR I = 1 TO 10 STEP 2
+50   PRINT I
+60 NEXT I
+70 END
+500 PRINT "in sub"
+510 RETURN
+999 PRINT "bye!" : END
+```
+
+#### I/O — AX.25 session
+
+```basic
+10 PRINT "What is your name?"   ' sends to AX.25 connection
+20 INPUT name$                  ' waits for a line from the user
+30 SEND "Hello " + name$ + "!"  ' alias for PRINT
+40 RECV reply$, 15000           ' receive with 15-second timeout
+```
+
+#### System — run external commands
+
+```basic
+10 EXEC "date", result$                    ' default 10 s timeout
+20 EXEC "ls /tmp", listing$, 5000          ' 5 s timeout
+30 EXEC "df -h", out$, 3000, 1             ' last 1 = capture stderr too
+40 PRINT out$
+
+' Process is killed with SIGKILL on timeout; result$ gets "[TIMEOUT]"
+```
+
+#### Database — SQLite3
+
+```basic
+10 DBOPEN "bbs.db"
+20 DBEXEC "CREATE TABLE IF NOT EXISTS msgs (id INTEGER PRIMARY KEY, txt TEXT)"
+30 DBEXEC "INSERT INTO msgs (txt) VALUES ('hello')"
+40 DBQUERY "SELECT COUNT(*) FROM msgs", count$
+50 PRINT "Total messages: " + count$
+60 DBCLOSE
+```
+
+#### Network — raw TCP sockets
+
+```basic
+10 SOCKOPEN "towncrier.aprs.net", 10152, sock%
+20 IF sock% < 0 THEN PRINT "connect failed" : END
+30 SOCKSEND sock%, "user N0CALL pass -1 vers KISSBBS 1.0\r\n"
+40 SOCKRECV sock%, line$, 5000     ' 5 s timeout
+50 PRINT line$
+60 SOCKCLOSE sock%
+```
+
+#### Web — HTTP GET
+
+```basic
+10 HTTPGET "http://wttr.in/?format=3", weather$
+20 PRINT weather$
+```
+
+> **Note:** Only plain HTTP is supported (no TLS).  For HTTPS use a local
+> proxy or the EXEC command with `curl`.
+
+#### String functions
+
+| Function | Returns | Example |
+|---|---|---|
+| `LEN(s$)` | length | `LEN("hi")` → `2` |
+| `LEFT$(s$, n)` | first n chars | `LEFT$("ABCDE", 3)` → `"ABC"` |
+| `RIGHT$(s$, n)` | last n chars | `RIGHT$("ABCDE", 2)` → `"DE"` |
+| `MID$(s$, pos, len)` | substring (1-based) | `MID$("ABCDE", 2, 3)` → `"BCD"` |
+| `UPPER$(s$)` | uppercase | `UPPER$("hello")` → `"HELLO"` |
+| `LOWER$(s$)` | lowercase | `LOWER$("HI")` → `"hi"` |
+| `TRIM$(s$)` | strip whitespace | `TRIM$("  x  ")` → `"x"` |
+| `STR$(n)` | number→string | `STR$(42)` → `"42"` |
+| `VAL(s$)` | string→number | `VAL("3.14")` → `3.14` |
+| `INSTR(s$, f$)` | position (1-based, −1=not found) | `INSTR("HELLO", "LL")` → `3` |
+| `CHR$(n)` | character from ASCII code | `CHR$(65)` → `"A"` |
+| `ASC(s$)` | ASCII code of first char | `ASC("A")` → `65` |
+
+#### Math functions
+
+`INT(x)` · `ABS(x)` · `SQR(x)`
+
+### Pre-defined variables
+
+The BBS sets these before running your script:
+
+| Variable | Content |
+|---|---|
+| `callsign$` | Remote station callsign (e.g. `"W1AW-7"`) |
+| `bbs_name$` | BBS name from config or `-n` flag |
+| `db_path$` | SQLite database path from `[basic] database` |
+
+### Complete BBS script example
+
+```basic
+10  REM ── Welcome banner ────────────────────────────────────────────
+20  PRINT "*** " + bbs_name$ + " AX.25 BBS ***"
+30  PRINT "Welcome " + callsign$ + "!"
+40  PRINT ""
+
+50  REM ── Fetch weather (non-blocking, 8 s timeout) ─────────────────
+60  HTTPGET "http://wttr.in/?format=3", wx$
+70  IF wx$ <> "" THEN PRINT "Weather: " + wx$
+80  PRINT ""
+
+90  REM ── Message count from database ───────────────────────────────
+100 DBOPEN db_path$
+110 DBEXEC "CREATE TABLE IF NOT EXISTS msgs (id INTEGER PRIMARY KEY, call TEXT, txt TEXT)"
+120 DBQUERY "SELECT COUNT(*) FROM msgs", cnt$
+130 PRINT "Messages in database: " + cnt$
+140 DBCLOSE
+150 PRINT ""
+
+160 REM ── Interactive menu ──────────────────────────────────────────
+170 PRINT "Commands: H=Help  BYE=Quit"
+180 INPUT "> ", cmd$
+190 cmd$ = UPPER$(TRIM$(cmd$))
+200 IF cmd$ = "BYE" THEN PRINT "73 de " + bbs_name$ : END
+210 IF cmd$ = "H"   THEN GOSUB 900
+220 GOTO 180
+
+900 PRINT "H    This help"
+910 PRINT "BYE  Disconnect"
+920 RETURN
+```
+
+### Embedding `Basic` in your own application
+
+```cpp
+#include "basic.hpp"
+
+Basic interp;
+
+// Wire I/O to your transport
+interp.on_send = [&](const std::string& s) {
+    conn->send(s);                        // send to AX.25 connection
+};
+interp.on_recv = [&](int timeout_ms) -> std::string {
+    return read_line_with_timeout(timeout_ms); // blocking read with timeout
+};
+interp.on_log = [](const std::string& msg) {
+    std::cerr << "[BASIC] " << msg << "\n";
+};
+
+// Pre-fill variables
+interp.set_str("callsign$", remote_call);
+interp.set_num("channel",   1.0);
+
+// Load and run
+if (interp.load_file("menu.bas")) {
+    bool ok = interp.run();
+    if (!ok) std::cerr << "BASIC runtime error\n";
+}
+
+// Or load from a string literal (useful for unit tests)
+interp.load_string(
+    "10 PRINT \"Hello \" + callsign$\n"
+    "20 END\n"
+);
+interp.run();
+```
+
+---
+
+## 14. APRS Helpers (`ax25::aprs`)
+
+All APRS formatting utilities live in the `ax25::aprs` sub-namespace, making
+them available to any code that includes `ax25lib.hpp` — not just the BBS.
+
+```cpp
+#include "ax25lib.hpp"
+using namespace ax25;
+
+// ── Build a position report ───────────────────────────────────────────
+// lat/lon: decimal degrees (negative = S / W)
+// sym:     single APRS symbol character  (default '>' = car)
+std::string pos = aprs::make_pos(-23.55, -46.63, '-', "W1AW Home");
+// → "!2333.00S/04637.80W-W1AW Home"
+
+router.send_aprs(pos);
+
+// ── Build an APRS message ─────────────────────────────────────────────
+// Addressee is auto-padded to 9 chars; sequence number auto-increments.
+std::string msg = aprs::make_msg("PY2XXX-7", "Hello from W1AW!");
+// → ":PY2XXX-7 :Hello from W1AW!{001}"
+
+router.send_aprs(msg);
+
+// ── Parse an incoming APRS message ───────────────────────────────────
+router.on_ui = [](const Frame& f) {
+    std::string info(f.info.begin(), f.info.end());
+    aprs::Msg m;
+    if (aprs::parse_msg(info, m)) {
+        std::cout << "APRS MSG to=" << m.to
+                  << " text=" << m.text
+                  << " seq=" << m.seq << "\n";
+    } else if (aprs::is_pos(info)) {
+        std::cout << "APRS POS from " << f.src.str()
+                  << ": " << aprs::info_str(f) << "\n";
+    }
+};
+
+// ── Extract printable text from any frame ─────────────────────────────
+// Replaces non-printable bytes with '.'
+std::string readable = aprs::info_str(frame);
+```
+
+### APRS symbol cheat-sheet (common values)
+
+| Symbol char | Meaning |
+|---|---|
+| `>` | Car / mobile |
+| `-` | House |
+| `K` | School |
+| `k` | Truck |
+| `u` | Truck 18-wheeler |
+| `/` | Phone |
+| `[` | Human / jogger |
+| `Y` | Yacht / sailboat |
+| `'` | Aircraft |
+| `#` | Digipeater |
+| `&` | Gateway |
+
+Full table: [APRS Symbol Reference](http://www.aprs.org/symbols.html)
