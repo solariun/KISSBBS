@@ -1,0 +1,18 @@
+# Build artefacts
+ax25lib.o
+bbs
+ax25kiss
+test_ax25lib
+
+# macOS metadata
+.DS_Store
+*.swp
+*.swo
+
+# Editor
+.vscode/
+.idea/
+*.orig
+
+# Dependency files
+*.d

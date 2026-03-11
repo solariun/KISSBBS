@@ -1,0 +1,90 @@
+# =============================================================================
+# CI — Build + Test on every push and pull request
+#
+# Matrix:
+#   Ubuntu 22.04  — g++  (C++11 library, C++17 test binary)
+#   Ubuntu 22.04  — clang++ (same flags)
+#   macOS latest  — Apple Clang
+#
+# GoogleTest is installed from the distro package manager / Homebrew.
+# =============================================================================
+name: CI
+
+on:
+  push:
+    branches: [ "**" ]
+  pull_request:
+    branches: [ "**" ]
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }} / ${{ matrix.compiler }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            compiler: g++
+          - os: ubuntu-22.04
+            compiler: clang++
+          - os: macos-latest
+            compiler: g++   # Homebrew GCC (avoids Apple Clang quirks)
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Install GoogleTest (Ubuntu) ─────────────────────────────────────────
+      - name: Install GoogleTest (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libgtest-dev cmake
+          # On Ubuntu 22.04 libgtest-dev ships pre-compiled
+          # If not: cd /usr/src/gtest && sudo cmake . && sudo make && sudo cp lib/*.a /usr/lib
+
+      # ── Install GoogleTest + GCC (macOS) ────────────────────────────────────
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install googletest gcc
+          # Make sure Homebrew GCC is on PATH as 'g++'
+          GCC_BIN=$(ls /opt/homebrew/bin/g++-* 2>/dev/null | sort -V | tail -1)
+          if [ -z "$GCC_BIN" ]; then
+            GCC_BIN=$(ls /usr/local/bin/g++-* 2>/dev/null | sort -V | tail -1)
+          fi
+          echo "GCC_BIN=$GCC_BIN" >> $GITHUB_ENV
+
+      # ── Build library + binaries with C++11 ─────────────────────────────────
+      - name: Build (C++11)
+        env:
+          CXX: ${{ matrix.compiler }}
+        run: |
+          # On macOS with the gcc matrix entry, use the versioned binary
+          if [ "$RUNNER_OS" = "macOS" ] && [ -n "$GCC_BIN" ]; then
+            export CXX="$GCC_BIN"
+          fi
+          make all CXX="$CXX" 2>&1
+
+      # ── Compile & run all unit tests ─────────────────────────────────────────
+      - name: Test
+        env:
+          CXX: ${{ matrix.compiler }}
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ] && [ -n "$GCC_BIN" ]; then
+            export CXX="$GCC_BIN"
+          fi
+          make test CXX="$CXX" 2>&1
+
+      # ── Upload test results on failure ───────────────────────────────────────
+      - name: Upload test log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-failure-${{ matrix.os }}-${{ matrix.compiler }}
+          path: |
+            test_ax25lib
+          retention-days: 7
