@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 
@@ -878,6 +879,123 @@ Basic::Value Basic::eval_func(const std::string& fname, Lexer& lx) {
         return Value(a.to_num()<=b.to_num()?a.to_num():b.to_num());
     }
 
+    // ── REGEX functions ───────────────────────────────────────────────────────
+    // REMATCH(pattern$, str$) → 1 if pattern matches anywhere, 0 otherwise
+    if (fname == "REMATCH") {
+        Value pat = eval_expr(lx); lx.eat_ch(',');
+        Value str = eval_expr(lx); lx.eat_ch(')');
+        try {
+            std::regex re(pat.to_str());
+            return Value(std::regex_search(str.to_str(), re) ? 1.0 : 0.0);
+        } catch (...) { return Value(0.0); }
+    }
+    // REFIND$(pattern$, str$) → first full match, or ""
+    if (fname == "REFIND$") {
+        Value pat = eval_expr(lx); lx.eat_ch(',');
+        Value str = eval_expr(lx); lx.eat_ch(')');
+        try {
+            std::regex  re(pat.to_str());
+            std::smatch m;
+            std::string s = str.to_str();
+            if (std::regex_search(s, m, re)) return Value(m[0].str());
+        } catch (...) {}
+        return Value(std::string(""));
+    }
+    // REALL$(pattern$, str$ [, sep$]) → all matches joined by sep$ (default ",")
+    if (fname == "REALL$") {
+        Value pat = eval_expr(lx); lx.eat_ch(',');
+        Value str = eval_expr(lx);
+        std::string sep = ",";
+        if (lx.eat_ch(',')) { Value sv = eval_expr(lx); sep = sv.to_str(); }
+        lx.eat_ch(')');
+        try {
+            std::regex   re(pat.to_str());
+            std::string  text = str.to_str();
+            auto         beg  = std::sregex_iterator(text.begin(), text.end(), re);
+            std::string  result;
+            bool         first = true;
+            for (auto it = beg; it != std::sregex_iterator(); ++it) {
+                if (!first) result += sep;
+                result += (*it)[0].str();
+                first = false;
+            }
+            return Value(result);
+        } catch (...) {}
+        return Value(std::string(""));
+    }
+    // RESUB$(pattern$, repl$, str$) → replace first match (ECMAScript replacement syntax)
+    if (fname == "RESUB$") {
+        Value pat  = eval_expr(lx); lx.eat_ch(',');
+        Value repl = eval_expr(lx); lx.eat_ch(',');
+        Value str  = eval_expr(lx); lx.eat_ch(')');
+        try {
+            std::regex re(pat.to_str());
+            return Value(std::regex_replace(str.to_str(), re, repl.to_str(),
+                         std::regex_constants::format_first_only));
+        } catch (...) { return str; }
+    }
+    // RESUBALL$(pattern$, repl$, str$) → replace all matches
+    if (fname == "RESUBALL$") {
+        Value pat  = eval_expr(lx); lx.eat_ch(',');
+        Value repl = eval_expr(lx); lx.eat_ch(',');
+        Value str  = eval_expr(lx); lx.eat_ch(')');
+        try {
+            std::regex re(pat.to_str());
+            return Value(std::regex_replace(str.to_str(), re, repl.to_str()));
+        } catch (...) { return str; }
+    }
+    // REGROUP$(pattern$, str$, n) → nth capture group (0=whole, 1=first group...)
+    if (fname == "REGROUP$") {
+        Value pat = eval_expr(lx); lx.eat_ch(',');
+        Value str = eval_expr(lx); lx.eat_ch(',');
+        Value n   = eval_expr(lx); lx.eat_ch(')');
+        try {
+            std::regex  re(pat.to_str());
+            std::smatch m;
+            std::string s = str.to_str();
+            if (std::regex_search(s, m, re)) {
+                int idx = (int)n.to_num();
+                if (idx >= 0 && idx < (int)m.size()) return Value(m[idx].str());
+            }
+        } catch (...) {}
+        return Value(std::string(""));
+    }
+    // RECOUNT(pattern$, str$) → number of non-overlapping matches
+    if (fname == "RECOUNT") {
+        Value pat = eval_expr(lx); lx.eat_ch(',');
+        Value str = eval_expr(lx); lx.eat_ch(')');
+        try {
+            std::regex re(pat.to_str());
+            std::string text = str.to_str();
+            auto beg = std::sregex_iterator(text.begin(), text.end(), re);
+            return Value((double)std::distance(beg, std::sregex_iterator()));
+        } catch (...) {}
+        return Value(0.0);
+    }
+    // ── MAP functions (MAP_HAS, MAP_SIZE) ─────────────────────────────────────
+    if (fname == "MAP_HAS") {
+        Value nm  = eval_expr(lx); lx.eat_ch(',');
+        Value key = eval_expr(lx); lx.eat_ch(')');
+        auto  it  = maps_.find(nm.to_str());
+        return Value((it != maps_.end() && it->second.count(key.to_str())) ? 1.0 : 0.0);
+    }
+    if (fname == "MAP_SIZE") {
+        Value nm = eval_expr(lx); lx.eat_ch(')');
+        auto  it = maps_.find(nm.to_str());
+        return Value(it != maps_.end() ? (double)it->second.size() : 0.0);
+    }
+    // ── QUEUE functions (QUEUE_SIZE, QUEUE_EMPTY) ─────────────────────────────
+    if (fname == "QUEUE_SIZE") {
+        Value nm = eval_expr(lx); lx.eat_ch(')');
+        auto  it = queues_.find(nm.to_str());
+        return Value(it != queues_.end() ? (double)it->second.size() : 0.0);
+    }
+    if (fname == "QUEUE_EMPTY") {
+        Value nm = eval_expr(lx); lx.eat_ch(')');
+        auto  it = queues_.find(nm.to_str());
+        return Value((it == queues_.end() || it->second.empty()) ? 1.0 : 0.0);
+    }
+
     // User-defined FUNCTION call
     if (procs_.count(fname)) {
         std::vector<Value> args;
@@ -1256,22 +1374,98 @@ int Basic::cmd_return(int) {
 int Basic::cmd_for(Lexer& lx, int ln) {
     auto tok = lx.next_tok();
     std::string var = tok.text;
+
+    // ── FOR var$ IN src$ MATCH pat$ — regex match iterator ─────────────────
+    if (lx.eat_kw("IN")) {
+        Value src = eval_expr(lx);
+        if (!lx.eat_kw("MATCH")) {
+            log("FOR IN: expected MATCH on line " + std::to_string(ln));
+            return -1;
+        }
+        Value pat = eval_expr(lx);
+
+        // Collect all regex matches up front
+        std::vector<std::string> matches;
+        try {
+            std::regex re(pat.to_str());
+            std::string text = src.to_str();
+            auto it  = std::sregex_iterator(text.begin(), text.end(), re);
+            auto end = std::sregex_iterator();
+            for (; it != end; ++it) matches.push_back((*it)[0].str());
+        } catch (const std::regex_error& e) {
+            log("FOR IN MATCH: regex error: " + std::string(e.what()) +
+                " on line " + std::to_string(ln));
+        }
+
+        // Line immediately after this FOR statement = body start
+        auto prog_it = program_.find(ln);
+        int body = 0;
+        if (prog_it != program_.end()) {
+            ++prog_it;
+            if (prog_it != program_.end()) body = prog_it->first;
+        }
+
+        if (matches.empty()) {
+            // No matches: skip to line after NEXT
+            int nxt = find_next_line(var, ln);
+            if (nxt > 0) {
+                auto it2 = program_.upper_bound(nxt);
+                return it2 != program_.end() ? it2->first : 0;
+            }
+            return 0;
+        }
+
+        // Reuse existing frame if we somehow re-enter this FOR line
+        for (auto& f : for_stack_) {
+            if (f.var == var && f.is_match) {
+                f.matches   = std::move(matches);
+                f.match_idx = 0;
+                f.body_line = body;
+                set_var(var, Value(f.matches[0]));
+                return -1;
+            }
+        }
+
+        ForFrame fr;
+        fr.var       = var;
+        fr.to        = 0; fr.step = 0;
+        fr.body_line = body;
+        fr.is_match  = true;
+        fr.matches   = std::move(matches);
+        fr.match_idx = 0;
+        set_var(var, Value(fr.matches[0]));
+        for_stack_.push_back(std::move(fr));
+        return -1;
+    }
+
+    // ── Numeric FOR var = from TO to [STEP step] ────────────────────────────
     lx.eat_ch('=');
     Value from_v = eval_expr(lx);
     lx.eat_kw("TO");
-    Value to_v = eval_expr(lx);
-    double step = 1.0;
+    Value to_v   = eval_expr(lx);
+    double step  = 1.0;
     if (lx.eat_kw("STEP")) step = eval_expr(lx).to_num();
 
     set_var(var, from_v);
 
-    auto it = program_.find(ln); int body=0;
-    if (it!=program_.end()) { ++it; if(it!=program_.end()) body=it->first; }
+    auto it = program_.find(ln);
+    int body = 0;
+    if (it != program_.end()) { ++it; if (it != program_.end()) body = it->first; }
 
+    // Reuse existing numeric frame (e.g. re-entry from nested scope)
     for (auto& f : for_stack_) {
-        if (f.var==var) { f.to=to_v.to_num(); f.step=step; f.body_line=body; return -1; }
+        if (f.var == var && !f.is_match) {
+            f.to = to_v.to_num(); f.step = step; f.body_line = body;
+            return -1;
+        }
     }
-    ForFrame fr; fr.var=var; fr.to=to_v.to_num(); fr.step=step; fr.body_line=body;
+
+    ForFrame fr;
+    fr.var       = var;
+    fr.to        = to_v.to_num();
+    fr.step      = step;
+    fr.body_line = body;
+    fr.is_match  = false;
     for_stack_.push_back(fr);
     return -1;
 }
@@ -1279,16 +1473,29 @@ int Basic::cmd_for(Lexer& lx, int ln) {
 int Basic::cmd_next(Lexer& lx, int) {
     std::string var;
     lx.skip_ws();
-    if (!lx.at_end() && lx.peek_ch()!=':') {
+    if (!lx.at_end() && lx.peek_ch() != ':') {
         auto tok = lx.peek_tok();
-        if (tok.kind==Lexer::IDENT) { lx.next_tok(); var=tok.text; }
+        if (tok.kind == Lexer::IDENT) { lx.next_tok(); var = tok.text; }
     }
     if (for_stack_.empty()) { log("NEXT without FOR"); return -1; }
     ForFrame& fr = for_stack_.back();
-    if (!var.empty() && fr.var!=var) { log("NEXT var mismatch"); return -1; }
+    if (!var.empty() && fr.var != var) { log("NEXT var mismatch"); return -1; }
+
+    // ── Regex-match iterator NEXT ───────────────────────────────────────────
+    if (fr.is_match) {
+        ++fr.match_idx;
+        if (fr.match_idx < fr.matches.size()) {
+            set_var(fr.var, Value(fr.matches[fr.match_idx]));
+            return fr.body_line; // jump back to loop body
+        }
+        for_stack_.pop_back();
+        return -1; // fall through to line after NEXT
+    }
+
+    // ── Numeric FOR NEXT ────────────────────────────────────────────────────
     double newval = get_var(fr.var).to_num() + fr.step;
     set_var(fr.var, Value(newval));
-    bool cont = (fr.step>=0) ? (newval<=fr.to) : (newval>=fr.to);
+    bool cont = (fr.step >= 0) ? (newval <= fr.to) : (newval >= fr.to);
     if (cont) return fr.body_line;
     for_stack_.pop_back();
     return -1;
@@ -1824,6 +2031,115 @@ int Basic::cmd_send_ui(Lexer& lx, int) {
     return -1;
 }
 
+// =============================================================================
+// MAP — named string-keyed associative arrays
+// MAP_SET  mapname$, key$, value     — create or update entry
+// MAP_GET  mapname$, key$, var$      — retrieve entry into var$ (or 0/"" if missing)
+// MAP_DEL  mapname$, key$            — remove one entry
+// MAP_KEYS mapname$, var$            — write comma-joined key list into var$
+// MAP_CLEAR mapname$                 — remove all entries in named map
+// MAP_HAS(mapname$, key$) → 1/0     — test membership (expression function)
+// MAP_SIZE(mapname$)      → count   — number of entries (expression function)
+// =============================================================================
+int Basic::cmd_map_set(Lexer& lx, int) {
+    Value nm  = eval_expr(lx); lx.eat_ch(',');
+    Value key = eval_expr(lx); lx.eat_ch(',');
+    Value val = eval_expr(lx);
+    maps_[nm.to_str()][key.to_str()] = std::move(val);
+    return -1;
+}
+
+int Basic::cmd_map_get(Lexer& lx, int) {
+    Value nm  = eval_expr(lx); lx.eat_ch(',');
+    Value key = eval_expr(lx); lx.eat_ch(',');
+    auto  tok = lx.next_tok();
+    const std::string& varname = tok.text;
+    auto& m   = maps_[nm.to_str()];
+    auto  it  = m.find(key.to_str());
+    Value result = (it != m.end()) ? it->second
+                 : (is_str_var(varname) ? Value(std::string("")) : Value(0.0));
+    set_var(varname, std::move(result));
+    return -1;
+}
+
+int Basic::cmd_map_del(Lexer& lx, int) {
+    Value nm  = eval_expr(lx); lx.eat_ch(',');
+    Value key = eval_expr(lx);
+    auto  it  = maps_.find(nm.to_str());
+    if (it != maps_.end()) it->second.erase(key.to_str());
+    return -1;
+}
+
+int Basic::cmd_map_keys(Lexer& lx, int) {
+    Value nm  = eval_expr(lx); lx.eat_ch(',');
+    auto  tok = lx.next_tok();
+    auto  it  = maps_.find(nm.to_str());
+    std::string result;
+    if (it != maps_.end()) {
+        bool first = true;
+        for (auto& kv : it->second) {
+            if (!first) result += ",";
+            result += kv.first;
+            first = false;
+        }
+    }
+    set_var(tok.text, Value(result));
+    return -1;
+}
+
+int Basic::cmd_map_clear(Lexer& lx, int) {
+    Value nm = eval_expr(lx);
+    maps_.erase(nm.to_str());
+    return -1;
+}
+
+// =============================================================================
+// QUEUE — named FIFO queues
+// QUEUE_PUSH  qname$, value    — enqueue at back
+// QUEUE_POP   qname$, var$     — dequeue from front into var$ (or 0/"" if empty)
+// QUEUE_PEEK  qname$, var$     — peek at front without removing
+// QUEUE_CLEAR qname$           — discard all items
+// QUEUE_SIZE(qname$)  → count  — number of items (expression function)
+// QUEUE_EMPTY(qname$) → 1/0   — true when empty (expression function)
+// =============================================================================
+int Basic::cmd_queue_push(Lexer& lx, int) {
+    Value nm  = eval_expr(lx); lx.eat_ch(',');
+    Value val = eval_expr(lx);
+    queues_[nm.to_str()].push_back(std::move(val));
+    return -1;
+}
+
+int Basic::cmd_queue_pop(Lexer& lx, int) {
+    Value nm  = eval_expr(lx); lx.eat_ch(',');
+    auto  tok = lx.next_tok();
+    const std::string& varname = tok.text;
+    auto& q   = queues_[nm.to_str()];
+    Value result = q.empty()
+                 ? (is_str_var(varname) ? Value(std::string("")) : Value(0.0))
+                 : q.front();
+    if (!q.empty()) q.pop_front();
+    set_var(varname, std::move(result));
+    return -1;
+}
+
+int Basic::cmd_queue_peek(Lexer& lx, int) {
+    Value nm  = eval_expr(lx); lx.eat_ch(',');
+    auto  tok = lx.next_tok();
+    const std::string& varname = tok.text;
+    auto& q   = queues_[nm.to_str()];
+    Value result = q.empty()
+                 ? (is_str_var(varname) ? Value(std::string("")) : Value(0.0))
+                 : q.front();
+    set_var(varname, std::move(result));
+    return -1;
+}
+
+int Basic::cmd_queue_clear(Lexer& lx, int) {
+    Value nm = eval_expr(lx);
+    queues_.erase(nm.to_str());
+    return -1;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Statement dispatcher
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1952,6 +2268,19 @@ int Basic::exec_stmt(Lexer& lx, int linenum) {
     // ── APRS / UI ─────────────────────────────────────────────────────────
     if (kw=="SEND_APRS") { lx.next_tok(); return cmd_send_aprs(lx, linenum); }
     if (kw=="SEND_UI")   { lx.next_tok(); return cmd_send_ui(lx, linenum); }
+
+    // ── MAP ───────────────────────────────────────────────────────────────────
+    if (kw=="MAP_SET")   { lx.next_tok(); return cmd_map_set  (lx, linenum); }
+    if (kw=="MAP_GET")   { lx.next_tok(); return cmd_map_get  (lx, linenum); }
+    if (kw=="MAP_DEL")   { lx.next_tok(); return cmd_map_del  (lx, linenum); }
+    if (kw=="MAP_KEYS")  { lx.next_tok(); return cmd_map_keys (lx, linenum); }
+    if (kw=="MAP_CLEAR") { lx.next_tok(); return cmd_map_clear(lx, linenum); }
+
+    // ── QUEUE ─────────────────────────────────────────────────────────────────
+    if (kw=="QUEUE_PUSH")  { lx.next_tok(); return cmd_queue_push (lx, linenum); }
+    if (kw=="QUEUE_POP")   { lx.next_tok(); return cmd_queue_pop  (lx, linenum); }
+    if (kw=="QUEUE_PEEK")  { lx.next_tok(); return cmd_queue_peek (lx, linenum); }
+    if (kw=="QUEUE_CLEAR") { lx.next_tok(); return cmd_queue_clear(lx, linenum); }
 
     // ── Assignment without LET: VARNAME [.FIELD] = expr ──────────────────
     // (Must come before implicit SUB call so "FuncName = val" sets return value)

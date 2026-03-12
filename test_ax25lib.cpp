@@ -1302,6 +1302,295 @@ TEST(QBasic, GosubLabel) {
     EXPECT_NE(out.find("hi"), std::string::npos);
 }
 
+// =============================================================================
+// FOR IN MATCH — regex match iterator
+// =============================================================================
+
+TEST(QBasicExt, ForInMatchBasic) {
+    // Iterates over every word-token in the sentence
+    std::string out = run_basic(
+        "FOR tok$ IN \"hello world foo\" MATCH \"[a-z]+\"\n"
+        "  PRINT tok$\n"
+        "NEXT tok$\n"
+    );
+    EXPECT_NE(out.find("hello"), std::string::npos);
+    EXPECT_NE(out.find("world"), std::string::npos);
+    EXPECT_NE(out.find("foo"),   std::string::npos);
+}
+
+TEST(QBasicExt, ForInMatchNumbers) {
+    // Extract all integers from a mixed string
+    std::string out = run_basic(
+        "S$ = \"abc 10 def 20 ghi 30\"\n"
+        "SUM = 0\n"
+        "FOR n$ IN S$ MATCH \"[0-9]+\"\n"
+        "  SUM = SUM + VAL(n$)\n"
+        "NEXT n$\n"
+        "PRINT STR$(SUM)\n"
+    );
+    EXPECT_NE(out.find("60"), std::string::npos);
+}
+
+TEST(QBasicExt, ForInMatchNoMatches) {
+    // When no matches exist the body must not execute
+    std::string out = run_basic(
+        "FOR x$ IN \"hello\" MATCH \"[0-9]+\"\n"
+        "  PRINT \"match\"\n"
+        "NEXT x$\n"
+        "PRINT \"done\"\n"
+    );
+    EXPECT_EQ(out.find("match"), std::string::npos);
+    EXPECT_NE(out.find("done"),  std::string::npos);
+}
+
+TEST(QBasicExt, ForInMatchExitFor) {
+    // EXIT FOR must work inside a match iterator loop
+    std::string out = run_basic(
+        "COUNT = 0\n"
+        "FOR w$ IN \"a b c d e\" MATCH \"[a-z]\"\n"
+        "  COUNT = COUNT + 1\n"
+        "  IF COUNT = 2 THEN EXIT FOR\n"
+        "NEXT w$\n"
+        "PRINT STR$(COUNT)\n"
+    );
+    EXPECT_NE(out.find("2"), std::string::npos);
+}
+
+// =============================================================================
+// REGEX functions
+// =============================================================================
+
+TEST(QBasicExt, ReMatch) {
+    // REMATCH returns 1 when pattern is found, 0 otherwise
+    std::string out = run_basic(
+        "PRINT STR$(REMATCH(\"[0-9]+\", \"abc123\"))\n"
+        "PRINT STR$(REMATCH(\"[0-9]+\", \"abcdef\"))\n"
+    );
+    EXPECT_NE(out.find("1"), std::string::npos);
+    EXPECT_NE(out.find("0"), std::string::npos);
+}
+
+TEST(QBasicExt, ReFind) {
+    // REFIND$ returns first match, or "" when no match
+    std::string out = run_basic(
+        "PRINT REFIND$(\"[0-9]+\", \"foo 42 bar 99\")\n"
+        "PRINT REFIND$(\"[0-9]+\", \"no numbers here\")\n"
+    );
+    EXPECT_NE(out.find("42"), std::string::npos);
+}
+
+TEST(QBasicExt, ReAll) {
+    // REALL$ joins all matches with default "," separator
+    std::string out = run_basic(
+        "PRINT REALL$(\"[0-9]+\", \"a1b2c3\")\n"
+    );
+    EXPECT_NE(out.find("1,2,3"), std::string::npos);
+}
+
+TEST(QBasicExt, ReAllCustomSep) {
+    // Custom separator
+    std::string out = run_basic(
+        "PRINT REALL$(\"[a-z]+\", \"hello world\", \"-\")\n"
+    );
+    EXPECT_NE(out.find("hello-world"), std::string::npos);
+}
+
+TEST(QBasicExt, ReSub) {
+    // RESUB$ replaces only the first match
+    std::string out = run_basic(
+        "PRINT RESUB$(\"[0-9]+\", \"NUM\", \"a1b2c3\")\n"
+    );
+    // First digit run replaced, second left intact
+    EXPECT_NE(out.find("NUM"), std::string::npos);
+    EXPECT_NE(out.find("2"),   std::string::npos);
+}
+
+TEST(QBasicExt, ReSubAll) {
+    // RESUBALL$ replaces every match
+    std::string out = run_basic(
+        "PRINT RESUBALL$(\"[0-9]+\", \"X\", \"a1b2c3\")\n"
+    );
+    EXPECT_NE(out.find("aXbXcX"), std::string::npos);
+}
+
+TEST(QBasicExt, ReGroup) {
+    // REGROUP$ extracts a capture group (0 = whole match, 1 = first group)
+    std::string out = run_basic(
+        "PRINT REGROUP$(\"([0-9]+)-([a-z]+)\", \"ID:42-foo\", 1)\n"
+        "PRINT REGROUP$(\"([0-9]+)-([a-z]+)\", \"ID:42-foo\", 2)\n"
+    );
+    EXPECT_NE(out.find("42"),  std::string::npos);
+    EXPECT_NE(out.find("foo"), std::string::npos);
+}
+
+TEST(QBasicExt, ReCount) {
+    // RECOUNT returns number of non-overlapping matches
+    std::string out = run_basic(
+        "PRINT STR$(RECOUNT(\"[0-9]+\", \"1 22 333\"))\n"
+    );
+    EXPECT_NE(out.find("3"), std::string::npos);
+}
+
+// =============================================================================
+// MAP — named associative array
+// =============================================================================
+
+TEST(QBasicExt, MapSetGet) {
+    // Basic store and retrieve
+    std::string out = run_basic(
+        "MAP_SET \"cfg\", \"host\", \"localhost\"\n"
+        "MAP_SET \"cfg\", \"port\", \"8080\"\n"
+        "MAP_GET \"cfg\", \"host\", host$\n"
+        "MAP_GET \"cfg\", \"port\", port$\n"
+        "PRINT host$ + \":\" + port$\n"
+    );
+    EXPECT_NE(out.find("localhost:8080"), std::string::npos);
+}
+
+TEST(QBasicExt, MapHas) {
+    // MAP_HAS returns 1 when key present, 0 when absent
+    std::string out = run_basic(
+        "MAP_SET \"m\", \"k\", \"v\"\n"
+        "PRINT STR$(MAP_HAS(\"m\", \"k\"))\n"
+        "PRINT STR$(MAP_HAS(\"m\", \"missing\"))\n"
+    );
+    EXPECT_NE(out.find("1"), std::string::npos);
+    EXPECT_NE(out.find("0"), std::string::npos);
+}
+
+TEST(QBasicExt, MapDel) {
+    // MAP_DEL removes an entry
+    std::string out = run_basic(
+        "MAP_SET \"m\", \"x\", \"10\"\n"
+        "MAP_DEL \"m\", \"x\"\n"
+        "PRINT STR$(MAP_HAS(\"m\", \"x\"))\n"
+    );
+    EXPECT_NE(out.find("0"), std::string::npos);
+}
+
+TEST(QBasicExt, MapKeys) {
+    // MAP_KEYS produces comma-joined key list (keys are sorted by std::map)
+    std::string out = run_basic(
+        "MAP_SET \"m\", \"b\", \"2\"\n"
+        "MAP_SET \"m\", \"a\", \"1\"\n"
+        "MAP_KEYS \"m\", k$\n"
+        "PRINT k$\n"
+    );
+    EXPECT_NE(out.find("a"), std::string::npos);
+    EXPECT_NE(out.find("b"), std::string::npos);
+}
+
+TEST(QBasicExt, MapSize) {
+    // MAP_SIZE returns entry count
+    std::string out = run_basic(
+        "MAP_SET \"m\", \"one\", \"1\"\n"
+        "MAP_SET \"m\", \"two\", \"2\"\n"
+        "PRINT STR$(MAP_SIZE(\"m\"))\n"
+    );
+    EXPECT_NE(out.find("2"), std::string::npos);
+}
+
+TEST(QBasicExt, MapClear) {
+    // MAP_CLEAR removes all entries
+    std::string out = run_basic(
+        "MAP_SET \"m\", \"x\", \"1\"\n"
+        "MAP_CLEAR \"m\"\n"
+        "PRINT STR$(MAP_SIZE(\"m\"))\n"
+    );
+    EXPECT_NE(out.find("0"), std::string::npos);
+}
+
+// =============================================================================
+// QUEUE — named FIFO
+// =============================================================================
+
+TEST(QBasicExt, QueuePushPop) {
+    // Items dequeue in FIFO order
+    std::string out = run_basic(
+        "QUEUE_PUSH \"q\", \"first\"\n"
+        "QUEUE_PUSH \"q\", \"second\"\n"
+        "QUEUE_PUSH \"q\", \"third\"\n"
+        "QUEUE_POP \"q\", v$\n"
+        "PRINT v$\n"
+        "QUEUE_POP \"q\", v$\n"
+        "PRINT v$\n"
+    );
+    EXPECT_NE(out.find("first"),  std::string::npos);
+    EXPECT_NE(out.find("second"), std::string::npos);
+}
+
+TEST(QBasicExt, QueuePeek) {
+    // QUEUE_PEEK reads front without removing
+    std::string out = run_basic(
+        "QUEUE_PUSH \"q\", \"hello\"\n"
+        "QUEUE_PEEK \"q\", v$\n"
+        "PRINT v$\n"
+        "PRINT STR$(QUEUE_SIZE(\"q\"))\n"  // must still be 1
+    );
+    EXPECT_NE(out.find("hello"), std::string::npos);
+    EXPECT_NE(out.find("1"),     std::string::npos);
+}
+
+TEST(QBasicExt, QueueSize) {
+    // QUEUE_SIZE tracks count correctly
+    std::string out = run_basic(
+        "QUEUE_PUSH \"q\", \"a\"\n"
+        "QUEUE_PUSH \"q\", \"b\"\n"
+        "PRINT STR$(QUEUE_SIZE(\"q\"))\n"
+        "QUEUE_POP \"q\", v$\n"
+        "PRINT STR$(QUEUE_SIZE(\"q\"))\n"
+    );
+    EXPECT_NE(out.find("2"), std::string::npos);
+    EXPECT_NE(out.find("1"), std::string::npos);
+}
+
+TEST(QBasicExt, QueueEmpty) {
+    // QUEUE_EMPTY returns 1 when empty, 0 otherwise
+    std::string out = run_basic(
+        "PRINT STR$(QUEUE_EMPTY(\"q\"))\n"
+        "QUEUE_PUSH \"q\", \"x\"\n"
+        "PRINT STR$(QUEUE_EMPTY(\"q\"))\n"
+    );
+    EXPECT_NE(out.find("1"), std::string::npos);
+    EXPECT_NE(out.find("0"), std::string::npos);
+}
+
+TEST(QBasicExt, QueueClear) {
+    // QUEUE_CLEAR empties the queue
+    std::string out = run_basic(
+        "QUEUE_PUSH \"q\", \"a\"\n"
+        "QUEUE_PUSH \"q\", \"b\"\n"
+        "QUEUE_CLEAR \"q\"\n"
+        "PRINT STR$(QUEUE_EMPTY(\"q\"))\n"
+    );
+    EXPECT_NE(out.find("1"), std::string::npos);
+}
+
+TEST(QBasicExt, QueuePopEmpty) {
+    // QUEUE_POP on an empty queue gives "" for string vars
+    std::string out = run_basic(
+        "QUEUE_POP \"q\", v$\n"
+        "PRINT \"got:\" + v$\n"
+    );
+    EXPECT_NE(out.find("got:"), std::string::npos);
+}
+
+TEST(QBasicExt, QueueDoLoop) {
+    // Real-world pattern: process a queue with DO/LOOP
+    std::string out = run_basic(
+        "QUEUE_PUSH \"jobs\", \"compile\"\n"
+        "QUEUE_PUSH \"jobs\", \"link\"\n"
+        "QUEUE_PUSH \"jobs\", \"test\"\n"
+        "DO WHILE QUEUE_EMPTY(\"jobs\") = 0\n"
+        "  QUEUE_POP \"jobs\", job$\n"
+        "  PRINT job$\n"
+        "LOOP\n"
+    );
+    EXPECT_NE(out.find("compile"), std::string::npos);
+    EXPECT_NE(out.find("link"),    std::string::npos);
+    EXPECT_NE(out.find("test"),    std::string::npos);
+}
+
 // Main — GoogleTest entry point
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);

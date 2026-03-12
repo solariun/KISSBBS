@@ -15,6 +15,7 @@
 //               SELECT CASE / CASE / CASE ELSE / END SELECT
 //               DIM, CONST, EXIT SUB, EXIT FUNCTION, EXIT DO
 //               REM / '  (comments)
+//               FOR var$ IN src$ MATCH pat$  (regex match iterator)
 //   BBS I/O:    SEND, RECV
 //   Database:   DBOPEN, DBCLOSE, DBEXEC, DBQUERY, DBFETCHALL
 //   Network:    SOCKOPEN, SOCKCLOSE, SOCKSEND, SOCKRECV
@@ -26,6 +27,9 @@
 //               UPPER$(), LOWER$(), TRIM$(), CHR$(), ASC(), INSTR(),
 //               INT(), ABS(), SQR(), RND(), LOG(), EXP(),
 //               SIN(), COS(), TAN(), SGN(), MAX(), MIN()
+//               REMATCH(), REFIND$(), REALL$(), RESUB$(), RESUBALL$(), REGROUP$(), RECOUNT()
+//   Collections: MAP_SET, MAP_GET, MAP_HAS(), MAP_DEL, MAP_KEYS, MAP_SIZE(), MAP_CLEAR
+//               QUEUE_PUSH, QUEUE_POP, QUEUE_PEEK, QUEUE_SIZE(), QUEUE_EMPTY(), QUEUE_CLEAR
 //
 // Usage:
 //   Basic interp;
@@ -36,6 +40,7 @@
 // =============================================================================
 #pragma once
 
+#include <deque>
 #include <functional>
 #include <map>
 #include <string>
@@ -82,7 +87,15 @@ private:
     };
 
     // ── FOR loop frame ────────────────────────────────────────────────────
-    struct ForFrame { std::string var; double to, step; int body_line; };
+    struct ForFrame {
+        std::string var;
+        double      to, step;
+        int         body_line;
+        // ── Regex-match iterator variant (FOR x$ IN src$ MATCH pat$) ──────────
+        bool                     is_match  = false; // true when using IN/MATCH form
+        std::vector<std::string> matches;            // all regex matches collected at start
+        std::size_t              match_idx = 0;      // current position in matches
+    };
 
     // ── WHILE loop frame ─────────────────────────────────────────────────
     struct WhileFrame { int cond_line; };
@@ -189,6 +202,10 @@ private:
     std::map<int,int> sockets_;
     int next_sock_;
 
+    // Named collections: MAP (string→Value) and QUEUE (FIFO of Values)
+    std::map<std::string, std::map<std::string, Value>> maps_;
+    std::map<std::string, std::deque<Value>>             queues_;
+
     Basic(const Basic&);
     Basic& operator=(const Basic&);
 
@@ -276,6 +293,17 @@ private:
     int cmd_exec       (Lexer& lx, int ln);
     int cmd_send_aprs  (Lexer& lx, int ln);
     int cmd_send_ui    (Lexer& lx, int ln);
+    // ── MAP commands ─────────────────────────────────────────────────────────
+    int cmd_map_set   (Lexer& lx, int ln);
+    int cmd_map_get   (Lexer& lx, int ln);
+    int cmd_map_del   (Lexer& lx, int ln);
+    int cmd_map_keys  (Lexer& lx, int ln);
+    int cmd_map_clear (Lexer& lx, int ln);
+    // ── QUEUE commands ───────────────────────────────────────────────────────
+    int cmd_queue_push (Lexer& lx, int ln);
+    int cmd_queue_pop  (Lexer& lx, int ln);
+    int cmd_queue_peek (Lexer& lx, int ln);
+    int cmd_queue_clear(Lexer& lx, int ln);
 
     // ── Block-scan helpers ────────────────────────────────────────────────
     int find_wend_line      (int from_line);

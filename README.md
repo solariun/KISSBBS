@@ -716,9 +716,9 @@ make test
 Expected output:
 
 ```
-[==========] Running 92 tests from 12 test suites.
+[==========] Running 117 tests from 13 test suites.
 ...
-[  PASSED  ] 92 tests.
+[  PASSED  ] 117 tests.
 ```
 
 ### Test suites
@@ -736,6 +736,7 @@ Expected output:
 | `IniConfig` | 4 | Load file, missing file, inline comments, bool/double getters |
 | `BasicInterp` | 17 | PRINT, arithmetic, string concat, IF/THEN/ELSE multi-stmt, FOR/NEXT, WHILE/WEND, GOSUB/RETURN, string functions, EXEC, EXEC timeout, SEND_APRS, SEND_UI, math |
 | `QBasic` | 23 | Labels+GOTO, CONST, block IF/ELSEIF/ELSE/END IF, DO/LOOP WHILE, DO WHILE, DO/LOOP UNTIL, EXIT DO, EXIT FOR, SELECT CASE (simple/ELSE/range/IS), SUB (CALL+implicit), FUNCTION (numeric+string), nested function calls, EXIT SUB, TYPE/DIM, no-line-numbers, GOSUB to label |
+| `QBasicExt` | 25 | FOR IN MATCH (basic/numbers/no-matches/EXIT FOR), REMATCH, REFIND$, REALL$ (default+custom sep), RESUB$, RESUBALL$, REGROUP$, RECOUNT, MAP (set/get/has/del/keys/size/clear), QUEUE (push/pop/peek/size/empty/clear/pop-empty/DO WHILE loop) |
 | `TokenizeArgs` | 4 | Plain args, double-quoted args, single-quoted args, empty input |
 
 ---
@@ -1024,34 +1025,117 @@ P.Y = 20.0
 PRINT STR$(P.X) + "," + STR$(P.Y)
 ```
 
-#### Procedures
+#### Procedures — SUB and FUNCTION
+
+Procedures are the cornerstone of well-structured QBASIC code. They let you break a
+program into named, reusable building blocks that are easy to read, test, and maintain.
+
+**SUB** — performs an action, does not return a value.
 
 ```basic
-' SUB — no return value; call with CALL or bare name
+' ── Declaration ──────────────────────────────────────────────────────────────
 SUB ShowBanner(title$)
-  PRINT "=== " + title$ + " ==="
+  PRINT "╔══════════════════╗"
+  PRINT "║ " + title$ + " ║"
+  PRINT "╚══════════════════╝"
 END SUB
 
-CALL ShowBanner("My BBS")   ' explicit call
-ShowBanner "My BBS"         ' implicit call (no parens)
-
-' FUNCTION — returns a value; assign to function name to return
-FUNCTION Square(n)
-  Square = n * n
-END FUNCTION
-
-PRINT STR$(Square(5))       ' prints 25
-
-' String-returning function
-FUNCTION Greet$(call$)
-  Greet$ = "Hello, " + call$
-END FUNCTION
-
-PRINT Greet$("W1AW")
-
-EXIT SUB       ' early exit from SUB
-EXIT FUNCTION  ' early exit from FUNCTION
+' ── Calling a SUB (two equivalent forms) ──────────────────────────────────────
+CALL ShowBanner("My BBS")   ' explicit CALL keyword (always safe)
+ShowBanner "My BBS"         ' implicit bare-name call (no parentheses)
 ```
+
+Rules for SUB:
+- Parameters are **local variables**; changes inside the SUB do not affect the caller.
+- `EXIT SUB` returns immediately from anywhere inside the body.
+- A SUB cannot appear inside the `CALL` of another expression — it has no value.
+
+---
+
+**FUNCTION** — computes a value that the caller can use in an expression.
+
+The return value is set by assigning to the **function's own name**.  When the
+function ends (or hits `EXIT FUNCTION`) that value is returned to the caller.
+
+```basic
+' ── Numeric-returning FUNCTION ────────────────────────────────────────────────
+FUNCTION Square(n)
+  Square = n * n       ' assign to function name = set return value
+END FUNCTION
+
+PRINT STR$(Square(5))  ' prints 25
+x = Square(3) + 1      ' use in any expression
+
+' ── String-returning FUNCTION (name ends with $) ──────────────────────────────
+FUNCTION Greet$(call$)
+  Greet$ = "Hello, " + call$   ' string return
+END FUNCTION
+
+PRINT Greet$("W1AW")           ' prints: Hello, W1AW
+msg$ = Greet$("KD9ABC")        ' assign result to a variable
+```
+
+Rules for FUNCTION:
+- The function **name** acts as the return-value variable inside the body.
+  Assign to it to set what gets returned.
+- If you never assign to the name, the function returns `0` (numeric) or `""` (string).
+- Functions can call other functions freely.
+- `EXIT FUNCTION` exits early; the current value of the name-variable is returned.
+- FUNCTIONs can be used anywhere an expression is valid (PRINT, IF, assignment, etc.).
+
+---
+
+**Variable scope**
+
+```basic
+CONST VERSION$ = "1.0"     ' global constant — visible everywhere
+
+DIM total AS INTEGER        ' global variable — visible to main code + GOSUBs
+total = 0
+
+SUB AddScore(n)
+  DIM local_n AS INTEGER    ' local — only exists inside this SUB
+  local_n = n * 2
+  total = total + local_n   ' reads/writes the GLOBAL total
+END SUB
+
+CALL AddScore(5)
+PRINT STR$(total)           ' prints 10
+```
+
+Key rules:
+- Variables declared with **DIM inside a procedure** are **local** — they disappear when the procedure returns.
+- Variables used without DIM inside a procedure, if they already exist in the **global scope**, resolve to the global. If they don't exist globally, a new local is created.
+- **CONST** is always global; it is collected in a first-pass before execution starts.
+- Parameters are always local. Passing a variable by name does **not** give the procedure a reference — it receives a **copy**.
+
+---
+
+**Procedures and definitions placement**
+
+Procedure bodies can appear anywhere in the file — before or after the main code.
+The interpreter does a first pass to collect all `SUB`/`FUNCTION` definitions, so
+order does not matter.
+
+```basic
+' ── Main code at top — fine even though procedures are defined below ──────────
+CALL PrintVersion
+PRINT "Result: " + STR$(Add(3, 4))
+END
+
+' ── Definitions below main ────────────────────────────────────────────────────
+SUB PrintVersion
+  PRINT "KISSBBS v1.0"
+END SUB
+
+FUNCTION Add(a, b)
+  Add = a + b
+END FUNCTION
+```
+
+> **Best practice:** put the main executable code at the top and all procedure
+> definitions after `END`. This mirrors how QBASIC programs are typically written
+> and makes the entry point obvious at a glance.
 
 #### Block IF / ELSEIF / ELSE / END IF
 
@@ -1068,7 +1152,7 @@ END IF
 IF x > 5 THEN PRINT "big" ELSE PRINT "small"
 ```
 
-#### FOR / NEXT / EXIT FOR
+#### FOR / NEXT / EXIT FOR — numeric iterator
 
 ```basic
 FOR i = 1 TO 10 STEP 2
@@ -1076,6 +1160,40 @@ FOR i = 1 TO 10 STEP 2
   PRINT STR$(i)
 NEXT i
 ```
+
+#### FOR var$ IN src$ MATCH pattern$ — regex match iterator
+
+Iterates over every non-overlapping regex match of `pattern$` inside `src$`,
+assigning each match to `var$` in turn.  No matches → body is skipped entirely.
+`EXIT FOR` works normally.  The pattern uses ECMAScript (C++ `<regex>`) syntax.
+
+```basic
+' ── Print every word in a sentence ───────────────────────────────────────────
+FOR word$ IN "the quick brown fox" MATCH "[a-z]+"
+  PRINT word$
+NEXT word$
+
+' ── Sum all integers found in a string ───────────────────────────────────────
+DIM total AS INTEGER
+FOR n$ IN "price: 12, qty: 5, discount: 3" MATCH "[0-9]+"
+  total = total + VAL(n$)
+NEXT n$
+PRINT "Total: " + STR$(total)   ' 20
+
+' ── Parse comma-separated values ─────────────────────────────────────────────
+FOR field$ IN "Alice,42,W1AW" MATCH "[^,]+"
+  PRINT field$
+NEXT field$
+
+' ── Extract callsign-like tokens ─────────────────────────────────────────────
+FOR call$ IN raw_packet$ MATCH "[A-Z0-9]{3,6}(-[0-9]{1,2})?"
+  PRINT "Found call: " + call$
+NEXT call$
+```
+
+> **Best practice:** Use `FOR IN MATCH` when you need to iterate over all
+> occurrences of a pattern.  For a one-shot first-match check, prefer the
+> `REMATCH` / `REFIND$` functions instead.
 
 #### WHILE / WEND
 
@@ -1237,6 +1355,149 @@ PRINT weather$
 > **Note:** Only plain HTTP is supported (no TLS).  For HTTPS use a local
 > proxy or the EXEC command with `curl`.
 
+#### Regex — pattern matching and substitution
+
+All functions use ECMAScript regex syntax (C++ `<regex>`).  Wrap patterns in
+double quotes; backslashes need doubling: `"\\d+"` matches one or more digits.
+
+| Function | Returns | Description |
+|---|---|---|
+| `REMATCH(pat$, str$)` | `1` / `0` | `1` if `pat$` matches anywhere in `str$` |
+| `REFIND$(pat$, str$)` | string | First full match, or `""` if none |
+| `REALL$(pat$, str$ [,sep$])` | string | All matches joined by `sep$` (default `","`) |
+| `RESUB$(pat$, repl$, str$)` | string | Replace **first** match with `repl$` |
+| `RESUBALL$(pat$, repl$, str$)` | string | Replace **all** matches with `repl$` |
+| `REGROUP$(pat$, str$, n)` | string | Return capture group `n` (0=whole, 1=first…) |
+| `RECOUNT(pat$, str$)` | number | Count of non-overlapping matches |
+
+Replacement strings (`repl$`) support ECMAScript back-references: `$1` inserts
+the first capture group, `$2` the second, `$&` the whole match, etc.
+
+```basic
+' ── Test for a match ─────────────────────────────────────────────────────────
+IF REMATCH("^[A-Z]{1,2}[0-9][A-Z]{1,3}$", call$) THEN
+  PRINT call$ + " looks like a valid callsign"
+END IF
+
+' ── Extract first number from a string ───────────────────────────────────────
+num$ = REFIND$("[0-9]+", "temp: 23 C")   ' "23"
+
+' ── Get all comma-separated tokens ───────────────────────────────────────────
+all$ = REALL$("[^,]+", "Alice,Bob,Carol")  ' "Alice,Bob,Carol" (default sep)
+all$ = REALL$("[^,]+", "Alice,Bob,Carol", "|")  ' "Alice|Bob|Carol"
+
+' ── Sanitise user input ───────────────────────────────────────────────────────
+safe$ = RESUBALL$("[^A-Za-z0-9 ]", "", user_input$)   ' strip non-alphanumeric
+
+' ── Extract a capture group ──────────────────────────────────────────────────
+' Pattern: KEY=VALUE  →  group 1 = key, group 2 = value
+key$  = REGROUP$("([A-Z]+)=([0-9]+)", "POWER=100", 1)   ' "POWER"
+val$  = REGROUP$("([A-Z]+)=([0-9]+)", "POWER=100", 2)   ' "100"
+
+' ── Reformat a date ──────────────────────────────────────────────────────────
+iso$  = RESUB$("([0-9]{2})/([0-9]{2})/([0-9]{4})", "$3-$2-$1", "25/12/2025")
+' iso$ = "2025-12-25"
+```
+
+> **Best practice:** Always validate user-supplied input before inserting it
+> into SQL queries.  Use `RESUBALL$` to strip or escape dangerous characters,
+> or use parameterised SQL strings built from safe substrings.
+
+#### MAP — named associative arrays
+
+A MAP is an unordered dictionary mapping string keys to any value (string or
+number).  MAPs are identified by a string name — you can have as many as you
+need.  Keys are sorted alphabetically by the underlying `std::map`.
+
+| Statement / Function | Description |
+|---|---|
+| `MAP_SET name$, key$, value` | Create or overwrite an entry |
+| `MAP_GET name$, key$, var` | Read entry into `var` (`""` / `0` if missing) |
+| `MAP_DEL name$, key$` | Remove one entry |
+| `MAP_KEYS name$, var$` | Comma-separated list of all keys → `var$` |
+| `MAP_CLEAR name$` | Delete all entries in the named map |
+| `MAP_HAS(name$, key$)` | Returns `1` if key exists, `0` otherwise |
+| `MAP_SIZE(name$)` | Returns number of entries |
+
+```basic
+' ── Store and retrieve ────────────────────────────────────────────────────────
+MAP_SET "cfg", "host", "aprs.example.net"
+MAP_SET "cfg", "port", "14580"
+MAP_GET "cfg", "host", host$
+MAP_GET "cfg", "port", port$
+PRINT "Connecting to " + host$ + ":" + port$
+
+' ── Presence check ───────────────────────────────────────────────────────────
+IF MAP_HAS("cfg", "password") = 0 THEN
+  PRINT "No password configured — anonymous login"
+END IF
+
+' ── Iterate over all keys ─────────────────────────────────────────────────────
+MAP_KEYS "cfg", keys$
+FOR key$ IN keys$ MATCH "[^,]+"
+  MAP_GET "cfg", key$, v$
+  PRINT key$ + " = " + v$
+NEXT key$
+
+' ── Count and clean up ────────────────────────────────────────────────────────
+PRINT "Config entries: " + STR$(MAP_SIZE("cfg"))
+MAP_CLEAR "cfg"
+```
+
+> **Best practice:** Use a descriptive map name that encodes its purpose, e.g.
+> `"headers"`, `"env"`, `"cache"`.  Because maps live for the lifetime of the
+> interpreter instance, call `MAP_CLEAR` when you are done to free memory.
+
+#### QUEUE — named FIFO queues
+
+A QUEUE is a first-in / first-out list of values, identified by a string name.
+Useful for buffering lines received from a socket, scheduling jobs, or any
+producer–consumer pattern.
+
+| Statement / Function | Description |
+|---|---|
+| `QUEUE_PUSH name$, value` | Enqueue `value` at the back |
+| `QUEUE_POP  name$, var` | Dequeue the front item into `var` (`""`/`0` if empty) |
+| `QUEUE_PEEK name$, var` | Read the front item **without** removing it |
+| `QUEUE_CLEAR name$` | Discard all items |
+| `QUEUE_SIZE(name$)` | Number of items currently in the queue |
+| `QUEUE_EMPTY(name$)` | Returns `1` if empty, `0` otherwise |
+
+```basic
+' ── Producer / consumer ───────────────────────────────────────────────────────
+' Producer: buffer incoming commands
+QUEUE_PUSH "cmds", "HELP"
+QUEUE_PUSH "cmds", "LIST"
+QUEUE_PUSH "cmds", "QUIT"
+
+' Consumer: process in order
+DO WHILE QUEUE_EMPTY("cmds") = 0
+  QUEUE_POP "cmds", cmd$
+  SELECT CASE UPPER$(cmd$)
+    CASE "HELP"  : CALL ShowHelp
+    CASE "LIST"  : CALL ListMessages
+    CASE "QUIT"  : EXIT DO
+    CASE ELSE    : PRINT "Unknown: " + cmd$
+  END SELECT
+LOOP
+
+' ── Peek without consuming ───────────────────────────────────────────────────
+QUEUE_PEEK "cmds", next$
+PRINT "Next up: " + next$   ' item is still in the queue
+
+' ── Bounded buffer (keep at most 10 items) ───────────────────────────────────
+SUB Enqueue(q$, item$)
+  DO WHILE QUEUE_SIZE(q$) >= 10
+    QUEUE_POP q$, discarded$    ' drop oldest
+  LOOP
+  QUEUE_PUSH q$, item$
+END SUB
+```
+
+> **Best practice:** Always check `QUEUE_EMPTY` before `QUEUE_POP` if you need
+> to distinguish an empty-queue case from a value that happens to be `""`.
+> Use `QUEUE_CLEAR` when finished to release memory.
+
 #### String functions
 
 | Function | Returns | Example |
@@ -1378,6 +1639,114 @@ Message sent to KD9ABC.
 
 Email> QUIT
 Goodbye from BBS Email!  73 de My BBS
+```
+
+### Best practices
+
+#### Code organisation
+
+```basic
+' ── 1. CONST and TYPE declarations first ──────────────────────────────────────
+CONST MAX_RETRIES = 3
+CONST TIMEOUT_MS  = 30000
+
+TYPE Station
+  Call$ AS STRING
+  Grid$ AS STRING
+END TYPE
+
+' ── 2. Main program ───────────────────────────────────────────────────────────
+CALL Main
+END
+
+' ── 3. All SUB / FUNCTION definitions after END ───────────────────────────────
+SUB Main
+  DIM s AS Station
+  s.Call$ = callsign$
+  PRINT "Hello " + s.Call$
+END SUB
+```
+
+#### Guard clauses over deep nesting
+
+```basic
+' ✗ Avoid: triangle of doom
+SUB ProcessCmd(cmd$)
+  IF cmd$ <> "" THEN
+    IF REMATCH("^[A-Z]", cmd$) THEN
+      IF MAP_HAS("handlers", cmd$) THEN
+        ' … actual work
+      END IF
+    END IF
+  END IF
+END SUB
+
+' ✓ Better: exit early with guards
+SUB ProcessCmd(cmd$)
+  IF cmd$ = ""                       THEN EXIT SUB
+  IF REMATCH("^[A-Z]", cmd$) = 0    THEN EXIT SUB
+  IF MAP_HAS("handlers", cmd$) = 0  THEN EXIT SUB
+  ' … actual work
+END SUB
+```
+
+#### DIM all local variables
+
+```basic
+SUB ParseLine(line$)
+  ' Declare every local before use — prevents accidental globals
+  DIM parts$  AS STRING
+  DIM key$    AS STRING
+  DIM value$  AS STRING
+  DIM eqpos   AS INTEGER
+
+  eqpos = INSTR(line$, "=")
+  IF eqpos = 0 THEN EXIT SUB
+  key$   = TRIM$(LEFT$(line$, eqpos - 1))
+  value$ = TRIM$(MID$(line$, eqpos + 1))
+  MAP_SET "env", UPPER$(key$), value$
+END SUB
+```
+
+#### Use regex for input validation
+
+```basic
+' Validate AX.25 callsign before use in SQL or packet transmission
+FUNCTION ValidCall$(call$)
+  IF REMATCH("^[A-Z0-9]{3,6}(-[0-9]{1,2})?$", UPPER$(call$)) THEN
+    ValidCall$ = UPPER$(call$)
+  ELSE
+    ValidCall$ = ""
+  END IF
+END FUNCTION
+
+DIM clean$ AS STRING
+clean$ = ValidCall$(user_input$)
+IF clean$ = "" THEN
+  PRINT "Invalid callsign."
+  EXIT SUB
+END IF
+' safe to use clean$ in SQL / packet now
+```
+
+#### Named collections for state management
+
+```basic
+' Use MAPs for runtime configuration; QUEUEs for work items
+SUB LoadConfig
+  MAP_SET "cfg", "port",    "14580"
+  MAP_SET "cfg", "host",    "rotate.aprs2.net"
+  MAP_SET "cfg", "retries", STR$(MAX_RETRIES)
+END SUB
+
+SUB EnqueueWork(item$)
+  ' Enforce a maximum queue depth to prevent unbounded growth
+  DO WHILE QUEUE_SIZE("jobs") >= 20
+    QUEUE_POP "jobs", dropped$
+    PRINT "WARN: dropped " + dropped$
+  LOOP
+  QUEUE_PUSH "jobs", item$
+END SUB
 ```
 
 ### Embedding `Basic` in your own application
