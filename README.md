@@ -1174,17 +1174,17 @@ PRINT "hello"  ' inline comment
 #### I/O — AX.25 session
 
 ```basic
-10 PRINT "What is your name?"   ' sends to AX.25 connection
-20 INPUT name$                  ' waits for a line from the user
-30 SEND "Hello " + name$ + "!"  ' alias for PRINT
-40 RECV reply$, 15000           ' receive with 15-second timeout
+PRINT "What is your name?"     ' sends to AX.25 connection
+INPUT "> ", name$              ' prompt + wait for a line
+SEND "Hello " + name$ + "!"   ' alias for PRINT
+RECV reply$, 15000             ' receive with 15-second timeout
 ```
 
 #### APRS / UI — transmit over the air
 
 ```basic
-10 SEND_APRS "!1234.00N/00567.00W>Hello from BASIC"
-20 SEND_UI "APRS", "de W1BBS: status update"
+SEND_APRS "!1234.00N/00567.00W>Hello from BASIC"
+SEND_UI "APRS", "de W1BBS: status update"
 ```
 
 `SEND_APRS info$` — transmits an APRS UI frame via the router's callsign.
@@ -1193,43 +1193,45 @@ PRINT "hello"  ' inline comment
 #### System — run external commands
 
 ```basic
-10 EXEC "date", result$                    ' default 10 s timeout
-20 EXEC "ls /tmp", listing$, 5000          ' 5 s timeout
-30 EXEC "df -h", out$, 3000, 1             ' last 1 = capture stderr too
-40 PRINT out$
-
+EXEC "date", result$                  ' default 10 s timeout
+EXEC "ls /tmp", listing$, 5000        ' 5 s timeout
+EXEC "df -h", out$, 3000, 1           ' last arg = 1 → capture stderr too
+PRINT out$
 ' Process is killed with SIGKILL on timeout; result$ gets "[TIMEOUT]"
 ```
 
 #### Database — SQLite3
 
 ```basic
-10 DBOPEN "bbs.db"
-20 DBEXEC "CREATE TABLE IF NOT EXISTS msgs (id INTEGER PRIMARY KEY, txt TEXT)"
-30 DBEXEC "INSERT INTO msgs (txt) VALUES ('hello')"
-40 DBQUERY "SELECT COUNT(*) FROM msgs", count$        ' first column, first row
-50 PRINT "Total messages: " + count$
-55 DBFETCHALL "SELECT id, txt FROM msgs", all$        ' tab-cols, newline-rows
-56 DBFETCHALL "SELECT id, txt FROM msgs", all$, "|", "~" ' custom separators
-60 DBCLOSE
+DBOPEN "bbs.db"
+DBEXEC "CREATE TABLE IF NOT EXISTS msgs (id INTEGER PRIMARY KEY, txt TEXT)"
+DBEXEC "INSERT INTO msgs (txt) VALUES ('hello')"
+DBQUERY "SELECT COUNT(*) FROM msgs", count$          ' first column, first row
+PRINT "Total messages: " + count$
+DBFETCHALL "SELECT id, txt FROM msgs", all$          ' tab-cols, newline-rows
+DBFETCHALL "SELECT id, txt FROM msgs", all$, "|", "~"  ' custom separators
+DBCLOSE
 ```
 
 #### Network — raw TCP sockets
 
 ```basic
-10 SOCKOPEN "towncrier.aprs.net", 10152, sock%
-20 IF sock% < 0 THEN PRINT "connect failed" : END
-30 SOCKSEND sock%, "user N0CALL pass -1 vers KISSBBS 1.0\r\n"
-40 SOCKRECV sock%, line$, 5000     ' 5 s timeout
-50 PRINT line$
-60 SOCKCLOSE sock%
+SOCKOPEN "towncrier.aprs.net", 10152, sock%
+IF sock% < 0 THEN
+    PRINT "connect failed"
+    END
+END IF
+SOCKSEND sock%, "user N0CALL pass -1 vers KISSBBS 1.0\r\n"
+SOCKRECV sock%, line$, 5000      ' 5 s timeout
+PRINT line$
+SOCKCLOSE sock%
 ```
 
 #### Web — HTTP GET
 
 ```basic
-10 HTTPGET "http://wttr.in/?format=3", weather$
-20 PRINT weather$
+HTTPGET "http://wttr.in/?format=3", weather$
+PRINT weather$
 ```
 
 > **Note:** Only plain HTTP is supported (no TLS).  For HTTPS use a local
@@ -1248,7 +1250,7 @@ PRINT "hello"  ' inline comment
 | `TRIM$(s$)` | strip whitespace | `TRIM$("  x  ")` → `"x"` |
 | `STR$(n)` | number→string | `STR$(42)` → `"42"` |
 | `VAL(s$)` | string→number | `VAL("3.14")` → `3.14` |
-| `INSTR(s$, f$)` | position (1-based, −1=not found) | `INSTR("HELLO", "LL")` → `3` |
+| `INSTR(s$, f$)` | position (1-based, 0=not found) | `INSTR("HELLO", "LL")` → `3` |
 | `CHR$(n)` | character from ASCII code | `CHR$(65)` → `"A"` |
 | `ASC(s$)` | ASCII code of first char | `ASC("A")` → `65` |
 
@@ -1334,13 +1336,22 @@ email = email.bas
 User session example:
 
 ```
-Email> LIST
- Messages for W1AW-7: 3 total, 1 unread
-  ID  N  FROM         DATE              SUBJECT
- ----+--+------------+-----------------+---------------------
-   3  *  KD9ABC       2026-03-10 14:22  73 from the field
-   2     W1BBS        2026-03-09 09:10  Re: Test message
-   1     N0CALL       2026-03-08 17:00  Welcome!
+=== My BBS Email System ===
+User: W1AW-7
+Messages for W1AW-7: 3 total, 1 unread
+ ID  N  FROM         DATE              SUBJECT
+----+--+------------+-----------------+---------------------
+  3  *  KD9ABC       2026-03-10 14:22  73 from the field
+  2     W1BBS        2026-03-09 09:10  Re: Test message
+  1     N0CALL       2026-03-08 17:00  Welcome!
+
+Email commands:
+  LIST               List your messages
+  READ <id>          Read a message
+  COMPOSE <to> <subj>  Write a new message
+  REPLY <id>         Reply to a message
+  DELETE <id>        Delete a message
+  QUIT / BYE / Q     Exit email
 
 Email> READ 3
 --- Message #3 ---
@@ -1351,15 +1362,22 @@ Subject: 73 from the field
 Hi there!  Hope all is well.  73 de KD9ABC
 ---
 
-Email> COMPOSE W5XYZ "ARDF this weekend?"
+Email> COMPOSE W5XYZ ARDF this weekend?
 Composing to W5XYZ / Subject: ARDF this weekend?
 Enter body (. alone to send, CANCEL to abort):
 > Let me know if you're joining us Saturday.
 > .
 Message sent to W5XYZ.
 
+Email> REPLY 3
+Composing to KD9ABC / Subject: Re: 73 from the field
+Enter body (. alone to send, CANCEL to abort):
+> Thanks!  73 de W1AW
+> .
+Message sent to KD9ABC.
+
 Email> QUIT
-Goodbye from BBS Email!
+Goodbye from BBS Email!  73 de My BBS
 ```
 
 ### Embedding `Basic` in your own application
