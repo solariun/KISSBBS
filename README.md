@@ -4,9 +4,9 @@
 
 A self-contained C++11 library implementing the AX.25 amateur-radio link-layer
 protocol over KISS-mode TNCs.  Includes a full-featured BBS with INI config,
-a Tiny BASIC scripting engine (SQLite · TCP sockets · HTTP GET · shell exec),
+a QBASIC-style scripting engine (functions, structs, DO/LOOP, SELECT CASE, SQLite · TCP · HTTP),
 a complete TNC terminal client (`ax25client`), remote shell access, an
-interactive KISS terminal, and a 69-test GoogleTest suite.
+interactive KISS terminal, and a 92-test GoogleTest suite.
 
 ---
 
@@ -716,9 +716,9 @@ make test
 Expected output:
 
 ```
-[==========] Running 69 tests from 11 test suites.
+[==========] Running 92 tests from 12 test suites.
 ...
-[  PASSED  ] 69 tests.
+[  PASSED  ] 92 tests.
 ```
 
 ### Test suites
@@ -735,6 +735,7 @@ Expected output:
 | `Timers` | 1 | T1 retransmit leading to link failure after N2 retries |
 | `IniConfig` | 4 | Load file, missing file, inline comments, bool/double getters |
 | `BasicInterp` | 17 | PRINT, arithmetic, string concat, IF/THEN/ELSE multi-stmt, FOR/NEXT, WHILE/WEND, GOSUB/RETURN, string functions, EXEC, EXEC timeout, SEND_APRS, SEND_UI, math |
+| `QBasic` | 23 | Labels+GOTO, CONST, block IF/ELSEIF/ELSE/END IF, DO/LOOP WHILE, DO WHILE, DO/LOOP UNTIL, EXIT DO, EXIT FOR, SELECT CASE (simple/ELSE/range/IS), SUB (CALL+implicit), FUNCTION (numeric+string), nested function calls, EXIT SUB, TYPE/DIM, no-line-numbers, GOSUB to label |
 | `TokenizeArgs` | 4 | Plain args, double-quoted args, single-quoted args, empty input |
 
 ---
@@ -817,7 +818,7 @@ external shell command line.  Arguments typed by the user are appended
 
 ```ini
 [commands]
-; Scripts run under the Tiny BASIC interpreter.
+; Scripts run under the QBASIC-style interpreter.
 ; stdin/stdout are wired to the AX.25 session.
 welcome = welcome.bas      ; called automatically on connect
 email   = email.bas        ; BBS email system
@@ -969,8 +970,11 @@ for (auto& kv : cfg.section("ax25")) {
 
 ## 13. BASIC Scripting
 
-The BBS ships a **Tiny BASIC interpreter** (`basic.hpp` / `basic.cpp`) that lets
+The BBS ships a **QBASIC-style interpreter** (`basic.hpp` / `basic.cpp`) that lets
 you write BBS welcome screens, menus, and automated services without recompiling.
+The dialect supports named procedures (`FUNCTION` / `SUB`), user-defined types
+(`TYPE`), block control structures (`DO/LOOP`, `SELECT CASE`, block `IF/END IF`),
+labels, `CONST`, `DIM`, and all legacy line-numbered code — fully backward-compatible.
 
 ### How it fits in
 
@@ -987,37 +991,184 @@ bbs.ini → welcome_script = welcome.bas
 
 ### Language quick reference
 
-#### Variables
-
-| Name pattern | Type | Example |
-|---|---|---|
-| `NAME$` | String | `A$ = "hello"` |
-| `NAME` or `NAME%` | Number (double) | `X = 42` |
-
-#### Flow control
+#### Variables and types
 
 ```basic
-10 IF X > 5 THEN PRINT "big" ELSE PRINT "small"
-20 IF A$ = "BYE" THEN GOTO 999
-25 IF X = 1 THEN A = 1 : B = 2 : C = 3   ' multiple colon-separated stmts in THEN
+' String variable (suffix $)
+name$ = "W1AW"
 
-30 GOSUB 500         : REM call subroutine at line 500
+' Numeric variable (double, optional % suffix)
+count  = 42
+score% = 100
 
-40 FOR I = 1 TO 10 STEP 2
-50   PRINT I
-60 NEXT I
+' Declare with DIM (optional, initialises to 0/"")
+DIM msg$ AS STRING
+DIM n    AS INTEGER
 
-65 DONE = 0
-70 WHILE DONE = 0      ' WHILE / WEND loop (nested WHILE supported)
-80   RECV cmd$, 60000
-90   IF UPPER$(cmd$) = "QUIT" THEN DONE = 1
-100  IF DONE = 0 THEN PRINT "You said: " + cmd$
-110 WEND
+' Named constant
+CONST MAX_MSG = 100
+CONST GREETING$ = "Hello"
+```
 
-120 END
-500 PRINT "in sub"
-510 RETURN
-999 PRINT "bye!" : END
+#### User-defined types (struct)
+
+```basic
+TYPE Point
+  X AS DOUBLE
+  Y AS DOUBLE
+END TYPE
+
+DIM P AS Point
+P.X = 10.5
+P.Y = 20.0
+PRINT STR$(P.X) + "," + STR$(P.Y)
+```
+
+#### Procedures
+
+```basic
+' SUB — no return value; call with CALL or bare name
+SUB ShowBanner(title$)
+  PRINT "=== " + title$ + " ==="
+END SUB
+
+CALL ShowBanner("My BBS")   ' explicit call
+ShowBanner "My BBS"         ' implicit call (no parens)
+
+' FUNCTION — returns a value; assign to function name to return
+FUNCTION Square(n)
+  Square = n * n
+END FUNCTION
+
+PRINT STR$(Square(5))       ' prints 25
+
+' String-returning function
+FUNCTION Greet$(call$)
+  Greet$ = "Hello, " + call$
+END FUNCTION
+
+PRINT Greet$("W1AW")
+
+EXIT SUB       ' early exit from SUB
+EXIT FUNCTION  ' early exit from FUNCTION
+```
+
+#### Block IF / ELSEIF / ELSE / END IF
+
+```basic
+IF score > 90 THEN
+  PRINT "Excellent"
+ELSEIF score > 70 THEN
+  PRINT "Good"
+ELSE
+  PRINT "Keep trying"
+END IF
+
+' Single-line IF still works:
+IF x > 5 THEN PRINT "big" ELSE PRINT "small"
+```
+
+#### FOR / NEXT / EXIT FOR
+
+```basic
+FOR i = 1 TO 10 STEP 2
+  IF i = 7 THEN EXIT FOR
+  PRINT STR$(i)
+NEXT i
+```
+
+#### WHILE / WEND
+
+```basic
+WHILE x > 0
+  x = x - 1
+WEND
+```
+
+#### DO / LOOP
+
+```basic
+' Pre-condition (WHILE or UNTIL)
+DO WHILE i < 10
+  i = i + 1
+LOOP
+
+DO UNTIL i >= 10
+  i = i + 1
+LOOP
+
+' Post-condition
+DO
+  i = i + 1
+LOOP WHILE i < 10
+
+DO
+  i = i + 1
+LOOP UNTIL i >= 10
+
+' Infinite with EXIT DO
+DO
+  RECV cmd$, 60000
+  IF cmd$ = "QUIT" THEN EXIT DO
+LOOP
+```
+
+#### SELECT CASE
+
+```basic
+SELECT CASE score
+  CASE 90 TO 100
+    PRINT "A"
+  CASE 80 TO 89
+    PRINT "B"
+  CASE IS < 60
+    PRINT "F"
+  CASE ELSE
+    PRINT "C/D"
+END SELECT
+
+' String matching
+SELECT CASE cmd$
+  CASE "HELP", "H", "?"
+    PRINT "help text"
+  CASE "QUIT", "BYE"
+    END
+  CASE ELSE
+    PRINT "Unknown: " + cmd$
+END SELECT
+```
+
+#### GOTO / GOSUB — line numbers or labels
+
+```basic
+GOTO MainMenu         ' jump to label
+GOSUB PrintFooter     ' call label as subroutine
+
+MainMenu:
+  PRINT "1) Messages"
+  INPUT "> ", choice$
+  IF choice$ = "Q" THEN GOTO Done
+  GOTO MainMenu
+
+PrintFooter:
+  PRINT "73 de BBS"
+  RETURN
+
+Done:
+  END
+
+' Old-style line numbers still work
+10 GOTO 40
+20 PRINT "skipped"
+40 PRINT "here"
+```
+
+#### Comments
+
+```basic
+' This is a comment
+REM This is also a comment
+PRINT "hello"  ' inline comment
 ```
 
 #### I/O — AX.25 session
@@ -1123,38 +1274,51 @@ Scripts can receive user-supplied arguments.  Example: if `bbs.ini` has
 `[commands] hello = hello.bas` and the user types `HELLO W1AW greetings`,
 then `arg0$ = "HELLO"`, `arg1$ = "W1AW"`, `arg2$ = "greetings"`, `argc = 3`.
 
-### Complete BBS script example
+### Complete BBS script example (QBASIC style)
 
 ```basic
-10  REM ── Welcome banner ────────────────────────────────────────────
-20  PRINT "*** " + bbs_name$ + " AX.25 BBS ***"
-30  PRINT "Welcome " + callsign$ + "!"
-40  PRINT ""
+' ── Welcome banner ────────────────────────────────────────────────────
+PRINT "*** " + bbs_name$ + " AX.25 BBS ***"
+PRINT "Welcome " + callsign$ + "!"
+PRINT ""
 
-50  REM ── Fetch weather (non-blocking, 8 s timeout) ─────────────────
-60  HTTPGET "http://wttr.in/?format=3", wx$
-70  IF wx$ <> "" THEN PRINT "Weather: " + wx$
-80  PRINT ""
+' ── Fetch weather ─────────────────────────────────────────────────────
+HTTPGET "http://wttr.in/?format=3", wx$
+IF wx$ <> "" THEN PRINT "Weather: " + wx$
+PRINT ""
 
-90  REM ── Message count from database ───────────────────────────────
-100 DBOPEN db_path$
-110 DBEXEC "CREATE TABLE IF NOT EXISTS msgs (id INTEGER PRIMARY KEY, call TEXT, txt TEXT)"
-120 DBQUERY "SELECT COUNT(*) FROM msgs", cnt$
-130 PRINT "Messages in database: " + cnt$
-140 DBCLOSE
-150 PRINT ""
+' ── Message count ─────────────────────────────────────────────────────
+DBOPEN db_path$
+DBEXEC "CREATE TABLE IF NOT EXISTS msgs (id INTEGER PRIMARY KEY, call TEXT, txt TEXT)"
+DBQUERY "SELECT COUNT(*) FROM msgs", cnt$
+PRINT "Messages in database: " + cnt$
+DBCLOSE
+PRINT ""
 
-160 REM ── Interactive menu ──────────────────────────────────────────
-170 PRINT "Commands: H=Help  BYE=Quit"
-180 INPUT "> ", cmd$
-190 cmd$ = UPPER$(TRIM$(cmd$))
-200 IF cmd$ = "BYE" THEN PRINT "73 de " + bbs_name$ : END
-210 IF cmd$ = "H"   THEN GOSUB 900
-220 GOTO 180
+' ── Interactive menu ──────────────────────────────────────────────────
+DO
+  PRINT "Commands: H=Help  BYE=Quit"
+  INPUT "> ", cmd$
+  cmd$ = UPPER$(TRIM$(cmd$))
 
-900 PRINT "H    This help"
-910 PRINT "BYE  Disconnect"
-920 RETURN
+  SELECT CASE cmd$
+    CASE "H", "HELP", "?"
+      CALL ShowHelp
+    CASE "BYE", "QUIT"
+      PRINT "73 de " + bbs_name$
+      EXIT DO
+    CASE ELSE
+      PRINT "Unknown command: " + cmd$
+  END SELECT
+LOOP
+
+END
+
+' ── Subroutines ───────────────────────────────────────────────────────
+SUB ShowHelp
+  PRINT "H    This help"
+  PRINT "BYE  Disconnect"
+END SUB
 ```
 
 ### BBS Email system (`email.bas`)
@@ -1236,8 +1400,8 @@ if (interp.load_file("menu.bas")) {
 
 // Or load from a string literal (useful for unit tests)
 interp.load_string(
-    "10 PRINT \"Hello \" + callsign$\n"
-    "20 END\n"
+    "PRINT \"Hello \" + callsign$\n"
+    "END\n"
 );
 interp.run();
 ```

@@ -978,6 +978,330 @@ TEST(BasicInterp, MultiStmtIfElse) {
     EXPECT_NE(out.find("small"), std::string::npos);
 }
 
+// =============================================================================
+// QBASIC dialect tests
+// =============================================================================
+
+// ── Labels and GOTO label ────────────────────────────────────────────────────
+TEST(QBasic, LabelGoto) {
+    std::string out = run_basic(
+        "X = 1\n"
+        "GOTO Done\n"
+        "X = 99\n"
+        "Done:\n"
+        "PRINT STR$(X)\n"
+    );
+    EXPECT_NE(out.find("1"), std::string::npos);
+    EXPECT_EQ(out.find("99"), std::string::npos);
+}
+
+// ── CONST ────────────────────────────────────────────────────────────────────
+TEST(QBasic, Const) {
+    std::string out = run_basic(
+        "CONST PI = 3\n"
+        "CONST GREETING$ = \"Hi\"\n"
+        "PRINT STR$(PI)\n"
+        "PRINT GREETING$\n"
+    );
+    EXPECT_NE(out.find("3"), std::string::npos);
+    EXPECT_NE(out.find("Hi"), std::string::npos);
+}
+
+// ── Block IF / ELSEIF / ELSE / END IF ────────────────────────────────────────
+TEST(QBasic, BlockIfElseIf) {
+    std::string out = run_basic(
+        "X = 5\n"
+        "IF X > 10 THEN\n"
+        "  PRINT \"big\"\n"
+        "ELSEIF X > 3 THEN\n"
+        "  PRINT \"medium\"\n"
+        "ELSE\n"
+        "  PRINT \"small\"\n"
+        "END IF\n"
+    );
+    EXPECT_NE(out.find("medium"), std::string::npos);
+    EXPECT_EQ(out.find("big"),   std::string::npos);
+    EXPECT_EQ(out.find("small"), std::string::npos);
+}
+
+TEST(QBasic, BlockIfFalseElse) {
+    std::string out = run_basic(
+        "X = 1\n"
+        "IF X > 10 THEN\n"
+        "  PRINT \"big\"\n"
+        "ELSE\n"
+        "  PRINT \"small\"\n"
+        "END IF\n"
+    );
+    EXPECT_NE(out.find("small"), std::string::npos);
+    EXPECT_EQ(out.find("big"),   std::string::npos);
+}
+
+// ── DO / LOOP WHILE ──────────────────────────────────────────────────────────
+TEST(QBasic, DoLoopWhile) {
+    std::string out = run_basic(
+        "I = 1\n"
+        "DO\n"
+        "  PRINT STR$(I)\n"
+        "  I = I + 1\n"
+        "LOOP WHILE I <= 3\n"
+    );
+    EXPECT_NE(out.find("1"), std::string::npos);
+    EXPECT_NE(out.find("2"), std::string::npos);
+    EXPECT_NE(out.find("3"), std::string::npos);
+    EXPECT_EQ(out.find("4"), std::string::npos);
+}
+
+// ── DO WHILE / LOOP (pre-condition, zero iterations) ─────────────────────────
+TEST(QBasic, DoWhileZeroIter) {
+    std::string out = run_basic(
+        "I = 10\n"
+        "DO WHILE I < 3\n"
+        "  PRINT \"body\"\n"
+        "LOOP\n"
+    );
+    EXPECT_EQ(out.find("body"), std::string::npos);
+}
+
+// ── DO / LOOP UNTIL ───────────────────────────────────────────────────────────
+TEST(QBasic, DoLoopUntil) {
+    std::string out = run_basic(
+        "I = 0\n"
+        "DO\n"
+        "  I = I + 1\n"
+        "LOOP UNTIL I >= 3\n"
+        "PRINT STR$(I)\n"
+    );
+    EXPECT_NE(out.find("3"), std::string::npos);
+}
+
+// ── EXIT DO ───────────────────────────────────────────────────────────────────
+TEST(QBasic, ExitDo) {
+    std::string out = run_basic(
+        "I = 0\n"
+        "DO\n"
+        "  I = I + 1\n"
+        "  IF I = 3 THEN EXIT DO\n"
+        "LOOP WHILE I < 10\n"
+        "PRINT STR$(I)\n"
+    );
+    EXPECT_NE(out.find("3"), std::string::npos);
+    EXPECT_EQ(out.find("10"), std::string::npos);
+}
+
+// ── EXIT FOR ─────────────────────────────────────────────────────────────────
+TEST(QBasic, ExitFor) {
+    std::string out = run_basic(
+        "FOR I = 1 TO 10\n"
+        "  IF I = 4 THEN EXIT FOR\n"
+        "  PRINT STR$(I)\n"
+        "NEXT I\n"
+        "PRINT \"done\"\n"
+    );
+    EXPECT_NE(out.find("3"), std::string::npos);
+    EXPECT_EQ(out.find("4"), std::string::npos);
+    EXPECT_NE(out.find("done"), std::string::npos);
+}
+
+// ── SELECT CASE ───────────────────────────────────────────────────────────────
+TEST(QBasic, SelectCaseSimple) {
+    std::string out = run_basic(
+        "X = 2\n"
+        "SELECT CASE X\n"
+        "  CASE 1\n"
+        "    PRINT \"one\"\n"
+        "  CASE 2\n"
+        "    PRINT \"two\"\n"
+        "  CASE ELSE\n"
+        "    PRINT \"other\"\n"
+        "END SELECT\n"
+    );
+    EXPECT_NE(out.find("two"),   std::string::npos);
+    EXPECT_EQ(out.find("one"),   std::string::npos);
+    EXPECT_EQ(out.find("other"), std::string::npos);
+}
+
+TEST(QBasic, SelectCaseElse) {
+    std::string out = run_basic(
+        "X = 99\n"
+        "SELECT CASE X\n"
+        "  CASE 1\n"
+        "    PRINT \"one\"\n"
+        "  CASE ELSE\n"
+        "    PRINT \"other\"\n"
+        "END SELECT\n"
+    );
+    EXPECT_NE(out.find("other"), std::string::npos);
+    EXPECT_EQ(out.find("one"),   std::string::npos);
+}
+
+TEST(QBasic, SelectCaseRange) {
+    std::string out = run_basic(
+        "X = 5\n"
+        "SELECT CASE X\n"
+        "  CASE 1 TO 3\n"
+        "    PRINT \"low\"\n"
+        "  CASE 4 TO 6\n"
+        "    PRINT \"mid\"\n"
+        "  CASE ELSE\n"
+        "    PRINT \"high\"\n"
+        "END SELECT\n"
+    );
+    EXPECT_NE(out.find("mid"),  std::string::npos);
+    EXPECT_EQ(out.find("low"),  std::string::npos);
+    EXPECT_EQ(out.find("high"), std::string::npos);
+}
+
+TEST(QBasic, SelectCaseIs) {
+    std::string out = run_basic(
+        "X = 15\n"
+        "SELECT CASE X\n"
+        "  CASE IS < 10\n"
+        "    PRINT \"small\"\n"
+        "  CASE IS >= 10\n"
+        "    PRINT \"large\"\n"
+        "END SELECT\n"
+    );
+    EXPECT_NE(out.find("large"), std::string::npos);
+    EXPECT_EQ(out.find("small"), std::string::npos);
+}
+
+// ── SUB (no return value) ─────────────────────────────────────────────────────
+TEST(QBasic, Sub) {
+    std::string out = run_basic(
+        "CALL Greet(\"World\")\n"
+        "END\n"
+        "\n"
+        "SUB Greet(name$)\n"
+        "  PRINT \"Hello, \" + name$\n"
+        "END SUB\n"
+    );
+    EXPECT_NE(out.find("Hello, World"), std::string::npos);
+}
+
+TEST(QBasic, SubImplicitCall) {
+    std::string out = run_basic(
+        "Greet \"Alice\"\n"
+        "END\n"
+        "\n"
+        "SUB Greet(name$)\n"
+        "  PRINT \"Hi \" + name$\n"
+        "END SUB\n"
+    );
+    EXPECT_NE(out.find("Hi Alice"), std::string::npos);
+}
+
+// ── FUNCTION (returns value) ──────────────────────────────────────────────────
+TEST(QBasic, Function) {
+    std::string out = run_basic(
+        "PRINT STR$(Square(4))\n"
+        "END\n"
+        "\n"
+        "FUNCTION Square(n)\n"
+        "  Square = n * n\n"
+        "END FUNCTION\n"
+    );
+    EXPECT_NE(out.find("16"), std::string::npos);
+}
+
+TEST(QBasic, FunctionString) {
+    std::string out = run_basic(
+        "PRINT Greet$(\"Bob\")\n"
+        "END\n"
+        "\n"
+        "FUNCTION Greet$(name$)\n"
+        "  Greet$ = \"Hello, \" + name$\n"
+        "END FUNCTION\n"
+    );
+    EXPECT_NE(out.find("Hello, Bob"), std::string::npos);
+}
+
+// ── FUNCTION calling FUNCTION ─────────────────────────────────────────────────
+TEST(QBasic, FunctionCallsFunction) {
+    std::string out = run_basic(
+        "PRINT STR$(Double(Triple(2)))\n"
+        "END\n"
+        "\n"
+        "FUNCTION Double(n)\n"
+        "  Double = n * 2\n"
+        "END FUNCTION\n"
+        "\n"
+        "FUNCTION Triple(n)\n"
+        "  Triple = n * 3\n"
+        "END FUNCTION\n"
+    );
+    EXPECT_NE(out.find("12"), std::string::npos); // 2*3=6, 6*2=12
+}
+
+// ── EXIT SUB ─────────────────────────────────────────────────────────────────
+TEST(QBasic, ExitSub) {
+    std::string out = run_basic(
+        "CALL Test\n"
+        "END\n"
+        "\n"
+        "SUB Test\n"
+        "  PRINT \"before\"\n"
+        "  EXIT SUB\n"
+        "  PRINT \"after\"\n"
+        "END SUB\n"
+    );
+    EXPECT_NE(out.find("before"), std::string::npos);
+    EXPECT_EQ(out.find("after"),  std::string::npos);
+}
+
+// ── TYPE (struct) ─────────────────────────────────────────────────────────────
+TEST(QBasic, TypeStruct) {
+    std::string out = run_basic(
+        "TYPE Point\n"
+        "  X AS DOUBLE\n"
+        "  Y AS DOUBLE\n"
+        "END TYPE\n"
+        "\n"
+        "DIM P AS Point\n"
+        "P.X = 10\n"
+        "P.Y = 20\n"
+        "PRINT STR$(P.X) + \",\" + STR$(P.Y)\n"
+    );
+    EXPECT_NE(out.find("10"), std::string::npos);
+    EXPECT_NE(out.find("20"), std::string::npos);
+}
+
+// ── DIM variable ─────────────────────────────────────────────────────────────
+TEST(QBasic, DimVariable) {
+    std::string out = run_basic(
+        "DIM N AS INTEGER\n"
+        "DIM S$ AS STRING\n"
+        "N = 42\n"
+        "S$ = \"hello\"\n"
+        "PRINT STR$(N) + \" \" + S$\n"
+    );
+    EXPECT_NE(out.find("42"),    std::string::npos);
+    EXPECT_NE(out.find("hello"), std::string::npos);
+}
+
+// ── No line numbers (pure QBASIC style) ──────────────────────────────────────
+TEST(QBasic, NoLineNumbers) {
+    std::string out = run_basic(
+        "A = 10\n"
+        "B = 20\n"
+        "PRINT STR$(A + B)\n"
+    );
+    EXPECT_NE(out.find("30"), std::string::npos);
+}
+
+// ── GOSUB to label ───────────────────────────────────────────────────────────
+TEST(QBasic, GosubLabel) {
+    std::string out = run_basic(
+        "GOSUB PrintHi\n"
+        "GOTO Done\n"
+        "PrintHi:\n"
+        "  PRINT \"hi\"\n"
+        "  RETURN\n"
+        "Done:\n"
+    );
+    EXPECT_NE(out.find("hi"), std::string::npos);
+}
+
 // Main — GoogleTest entry point
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
