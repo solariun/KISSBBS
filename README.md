@@ -2063,6 +2063,7 @@ Tilde escapes are processed only when `~` is the very first character of a line:
 | `~s` | Show connection status and traffic statistics |
 | `~m` | Toggle frame monitor on/off |
 | `~r` | Redraw current line (useful after unsolicited data scrolled the screen) |
+| `~x FILE` | Run a BASIC script on the live connection; return to interactive mode when done |
 | `~?` | Show tilde-escape help |
 
 ### Line terminator convention

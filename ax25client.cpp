@@ -41,11 +41,12 @@
 //   -h              Show this help
 //
 // Tilde-escape commands (connect mode only, entered at the start of a line):
-//   ~.   disconnect and exit
-//   ~s   show connection status / statistics
-//   ~m   toggle monitor mode on/off
-//   ~r   redisplay prompt
-//   ~?   show tilde-escape help
+//   ~.        disconnect and exit
+//   ~s        show connection status / statistics
+//   ~m        toggle monitor mode on/off
+//   ~r        redisplay prompt
+//   ~x FILE   run BASIC script while staying connected; return to interactive after
+//   ~?        show tilde-escape help
 // =============================================================================
 
 #include "ax25lib.hpp"
@@ -161,10 +162,11 @@ static void print_usage(const char* prog) {
         << "  --ka SECS    App-level keep-alive: send CR every N seconds when idle (default: 60, 0=off)\n"
         << "  -h           Show this help\n\n"
         << "Tilde escapes (connect mode):\n"
-        << "  ~.  disconnect and exit\n"
-        << "  ~s  show status / statistics\n"
-        << "  ~m  toggle frame monitor\n"
-        << "  ~?  show this help\n";
+        << "  ~.        disconnect and exit\n"
+        << "  ~s        show status / statistics\n"
+        << "  ~m        toggle frame monitor\n"
+        << "  ~x FILE   run BASIC script (stay connected after)\n"
+        << "  ~?        show this help\n";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -580,13 +582,78 @@ static int run_connect(Kiss& kiss, Router& router, const AppCfg& cfg) {
                 // Redraw prompt (useful after unsolicited data scrolled the line)
                 std::cout << std::flush;
                 break;
+            case 'x': {
+                // Run a BASIC script without disconnecting; return to interactive after
+                std::string fname = (line.size() > 2) ? line.substr(2) : "";
+                while (!fname.empty() && (fname.front() == ' ' || fname.front() == '\t'))
+                    fname.erase(fname.begin());
+                if (fname.empty()) {
+                    std::cout << RED() << "[Usage: ~x <script.bas>]"
+                              << RESET() << "\n" << std::flush;
+                    break;
+                }
+                if (!conn || !conn->connected()) {
+                    std::cout << RED() << "[Not connected — cannot run script]"
+                              << RESET() << "\n" << std::flush;
+                    break;
+                }
+                std::cout << DIM() << "[Running script: " << fname << "]"
+                          << RESET() << "\n" << std::flush;
+                {
+                    Basic interp;
+                    interp.on_send = [&](const std::string& s) {
+                        if (!conn) return;
+                        if (conn->send(s)) {
+                            last_tx = Clock::now();
+                            st.bytes_tx += s.size();
+                            ++st.frames_tx;
+                        }
+                    };
+                    interp.on_recv = [&](int tmo) -> std::string {
+                        if (!rx_lines.empty()) {
+                            std::string l = rx_lines.front(); rx_lines.pop_front();
+                            return l;
+                        }
+                        auto deadline = Clock::now() + std::chrono::milliseconds(tmo);
+                        while (!g_quit && !done) {
+                            struct timeval tv{ 0, 20000 };
+                            fd_set fds; FD_ZERO(&fds); FD_SET(ser_fd, &fds);
+                            select(ser_fd + 1, &fds, nullptr, nullptr, &tv);
+                            router.poll();
+                            if (!rx_lines.empty()) {
+                                std::string l = rx_lines.front(); rx_lines.pop_front();
+                                return l;
+                            }
+                            if (Clock::now() >= deadline) break;
+                        }
+                        return "";
+                    };
+                    interp.on_log = [](const std::string& msg) {
+                        std::cerr << "[BASIC] " << msg << "\n";
+                    };
+                    interp.set_str("REMOTE$",   cfg.remote);
+                    interp.set_str("LOCAL$",    cfg.ax25.mycall.str());
+                    interp.set_str("CALLSIGN$", cfg.remote);
+                    if (!interp.load_file(fname)) {
+                        std::cout << RED() << "[Error: cannot open: " << fname << "]"
+                                  << RESET() << "\n" << std::flush;
+                    } else {
+                        interp.run();
+                        std::cout << DIM() << "[Script finished]"
+                                  << RESET() << "\n" << std::flush;
+                    }
+                }
+                last_tx = Clock::now();   // reset keep-alive clock after script
+                break;
+            }
             case '?':
                 std::cout << "\nTilde escapes:\n"
-                          << "  ~.   disconnect and exit\n"
-                          << "  ~s   show status / statistics (incl. keep-alive setting)\n"
-                          << "  ~m   toggle monitor\n"
-                          << "  ~r   redraw\n"
-                          << "  ~?   this help\n\n" << std::flush;
+                          << "  ~.        disconnect and exit\n"
+                          << "  ~s        show status / statistics\n"
+                          << "  ~m        toggle monitor\n"
+                          << "  ~r        redraw\n"
+                          << "  ~x FILE   run BASIC script (stay connected after)\n"
+                          << "  ~?        this help\n\n" << std::flush;
                 break;
             default:
                 std::cout << DIM() << "[Unknown escape: ~" << esc
