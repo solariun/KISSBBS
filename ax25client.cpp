@@ -477,7 +477,6 @@ static int run_connect(Kiss& kiss, Router& router, const AppCfg& cfg) {
             if (conn->send(s)) {
                 st.bytes_tx += s.size();
                 ++st.frames_tx;
-                std::cout << s.substr(0, s.size()>80?80:s.size()) << "\n" << std::flush;
             }
         };
 
@@ -612,8 +611,6 @@ static int run_connect(Kiss& kiss, Router& router, const AppCfg& cfg) {
             last_tx = Clock::now();
             st.bytes_tx += payload.size();
             ++st.frames_tx;
-            // Echo locally
-            std::cout << line << "\n" << std::flush;
         } else {
             std::cout << RED() << "[Send failed — connection may have dropped]"
                       << RESET() << "\n" << std::flush;
