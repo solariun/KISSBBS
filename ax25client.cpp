@@ -37,7 +37,7 @@
 //   --pid HEX       PID for UI frames in hex (default: F0)
 //   -s FILE         Run BASIC script after connect (connect mode only)
 //                   Pre-set vars: remote$, local$, callsign$
-//   --ka SECS       App-level keep-alive: send CR every N seconds while idle (0=off)
+//   --ka SECS       App-level keep-alive: send CR every N seconds while idle (default: 180, 0=off)
 //   -h              Show this help
 //
 // Tilde-escape commands (connect mode only, entered at the start of a line):
@@ -130,7 +130,7 @@ struct AppCfg {
     Config      ax25;                     // ax25lib Config (mycall, mtu, etc.)
     int         baud     = 9600;
     std::string script;                   // path to BASIC script (-s); empty = interactive
-    int         ka_ms    = 0;             // app-level keep-alive interval ms (0=off)
+    int         ka_ms    = 180000;        // app-level keep-alive interval ms (0=off)
 };
 
 static void print_usage(const char* prog) {
@@ -158,7 +158,7 @@ static void print_usage(const char* prog) {
         << "  --txdelay N  KISS TX delay ms (default: 300)\n"
         << "  --pid HEX    PID for UI frames (default: F0)\n"
         << "  -s FILE      BASIC script to run after connect\n"
-        << "  --ka SECS    App-level keep-alive: send CR every N seconds when idle (0=off)\n"
+        << "  --ka SECS    App-level keep-alive: send CR every N seconds when idle (default: 180, 0=off)\n"
         << "  -h           Show this help\n\n"
         << "Tilde escapes (connect mode):\n"
         << "  ~.  disconnect and exit\n"

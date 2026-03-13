@@ -2049,7 +2049,7 @@ Options:
   --txdelay MS  KISS TX delay ms (default: 300)
   --pid HEX     PID for UI frames (default: F0)
   -s FILE       BASIC script to run after connecting (connect mode only)
-  --ka SECS     App-level keep-alive: send CR every N seconds while idle (0=off)
+  --ka SECS     App-level keep-alive: send CR every N seconds while idle (default: 180, 0=off)
   -h            Show help
 ```
 
@@ -2106,15 +2106,19 @@ Use `--ka <seconds>` to have `ax25client` automatically send a bare CR to the
 remote station whenever no data has been transmitted for that many seconds:
 
 ```
-# Connect to BBS with a 3-minute application keep-alive
-ax25client -c W1AW -r W1BBS-1 --ka 180 /dev/ttyUSB0
+# Default: keep-alive fires every 180 s (always on out of the box)
+ax25client -c W1AW -r W1BBS-1 /dev/ttyUSB0
+
+# Override to 60 s, or disable entirely
+ax25client -c W1AW -r W1BBS-1 --ka 60  /dev/ttyUSB0
+ax25client -c W1AW -r W1BBS-1 --ka 0   /dev/ttyUSB0
 ```
 
 When a keep-alive fires, a dimmed `[keep-alive]` annotation is printed on
 the local terminal so you can distinguish it from your own typed input.
 
 The `~s` status display reports the configured interval (e.g. `KA=180s`) or
-`KA=off` when disabled.  The default is `0` (disabled).
+`KA=off` when disabled.  The default is **180 s** (always on).
 
 ### Session transcript example
 
