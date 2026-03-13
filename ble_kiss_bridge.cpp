@@ -483,7 +483,7 @@ static std::optional<SimpleBLE::Peripheral>
 find_peripheral(SimpleBLE::Adapter& adapter,
                 const std::string& address,
                 int timeout_ms,
-                const std::string& service_uuid = "")
+                [[maybe_unused]] const std::string& service_uuid = "")
 {
     std::string target = lower(address);
     std::optional<SimpleBLE::Peripheral> found;

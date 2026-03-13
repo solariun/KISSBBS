@@ -61,9 +61,9 @@ SIMPLEBLE_GEN := $(shell find $(SIMPLEBLE_DIR)/build -name 'export.h' -path '*/s
 # kvn_bytearray.h — submodule, lives somewhere under the source tree
 SIMPLEBLE_KVN := $(shell find $(SIMPLEBLE_DIR) -name 'kvn_bytearray.h' 2>/dev/null \
                    | sed 's|/kvn/kvn_bytearray.h||' | head -1)
-SIMPLEBLE_INC = -I$(SIMPLEBLE_DIR)/simpleble/include \
-                $(if $(SIMPLEBLE_GEN),-I$(SIMPLEBLE_GEN),-I$(SIMPLEBLE_DIR)/build/export) \
-                $(if $(SIMPLEBLE_KVN),-I$(SIMPLEBLE_KVN))
+SIMPLEBLE_INC = -isystem $(SIMPLEBLE_DIR)/simpleble/include \
+                $(if $(SIMPLEBLE_GEN),-isystem $(SIMPLEBLE_GEN),-isystem $(SIMPLEBLE_DIR)/build/export) \
+                $(if $(SIMPLEBLE_KVN),-isystem $(SIMPLEBLE_KVN))
 
 ifeq ($(UNAME), Linux)
     DBUS_CFLAGS := $(shell pkg-config --cflags dbus-1 2>/dev/null)
@@ -72,7 +72,8 @@ ifeq ($(UNAME), Linux)
     SIMPLEBLE_INC += $(DBUS_CFLAGS)
 else
     DBUS_CFLAGS :=
-    SIMPLEBLE_SYS = -framework CoreBluetooth -framework Foundation -lpthread
+    SIMPLEBLE_SYS = -framework CoreBluetooth -framework Foundation \
+                    -framework IOKit -framework IOBluetooth -lpthread
 endif
 
 NPROC := $(shell nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
