@@ -290,16 +290,9 @@ async def bridge(address: str, service_uuid: str,
     print(f"  Connecting to BLE…")
 
     async with BleakClient(address) as client:
-        # Request MTU (bleak 0.21+ on Linux; silently ignored on macOS/Windows)
-        if requested_mtu != client.mtu_size:
-            try:
-                await client.request_mtu(requested_mtu)
-            except AttributeError:
-                pass  # backend does not support request_mtu (macOS, Windows)
-            except Exception as e:
-                print(f"  MTU request note: {e}")
-
-        mtu        = client.mtu_size
+        # BLE MTU is negotiated by the OS/stack during connection.
+        # We use the negotiated value, capped by --mtu to limit chunk size.
+        mtu        = min(client.mtu_size, requested_mtu)
         chunk_size = max(1, mtu - 3)   # ATT overhead = 3 bytes
 
         # Resolve characteristic objects immediately after connect so
@@ -316,7 +309,7 @@ async def bridge(address: str, service_uuid: str,
         # Prefer write-without-response for throughput (KISS TNC standard)
         use_response = "write-without-response" not in write_char.properties
 
-        print(f"  Connected.  MTU requested={requested_mtu}  negotiated={mtu}  chunk={chunk_size}b")
+        print(f"  Connected.  MTU negotiated={client.mtu_size}  cap={requested_mtu}  chunk={chunk_size}b")
         print(f"  Write char : {write_char.uuid}  props=[{', '.join(write_char.properties)}]  response={use_response}")
         print(f"  Monitoring traffic.  Ctrl-C to stop.\n")
 
@@ -431,7 +424,7 @@ def main() -> None:
     p.add_argument("--timeout", type=float, default=10.0,
                    help="Scan timeout in seconds (default: 10)")
     p.add_argument("--mtu", type=int, default=517,
-                   help="Request BLE ATT MTU size (default: 517; device negotiates the actual value)")
+                   help="Max chunk size cap in bytes (default: 517; actual MTU is negotiated by the OS)")
     p.add_argument("--service", metavar="UUID",
                    help="GATT service UUID")
     p.add_argument("--write",   metavar="UUID",
