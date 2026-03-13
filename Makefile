@@ -55,11 +55,15 @@ BASIC_OBJ = basic.o
 
 # ── SimpleBLE (vendor build) ──────────────────────────────────────────────────
 SIMPLEBLE_DIR = vendor/simpleble
-# Source headers + CMake-generated export.h (may live in build/export or build/include)
+# CMake-generated export.h (build/export or build/include)
 SIMPLEBLE_GEN := $(shell find $(SIMPLEBLE_DIR)/build -name 'export.h' -path '*/simpleble/*' 2>/dev/null \
                    | sed 's|/simpleble/export.h||' | head -1)
+# kvn_bytearray.h — submodule, lives somewhere under the source tree
+SIMPLEBLE_KVN := $(shell find $(SIMPLEBLE_DIR) -name 'kvn_bytearray.h' 2>/dev/null \
+                   | sed 's|/kvn/kvn_bytearray.h||' | head -1)
 SIMPLEBLE_INC = -I$(SIMPLEBLE_DIR)/simpleble/include \
-                $(if $(SIMPLEBLE_GEN),-I$(SIMPLEBLE_GEN),-I$(SIMPLEBLE_DIR)/build/export)
+                $(if $(SIMPLEBLE_GEN),-I$(SIMPLEBLE_GEN),-I$(SIMPLEBLE_DIR)/build/export) \
+                $(if $(SIMPLEBLE_KVN),-I$(SIMPLEBLE_KVN))
 
 ifeq ($(UNAME), Linux)
     SIMPLEBLE_SYS = $(shell pkg-config --libs dbus-1 2>/dev/null || echo "-ldbus-1") -lpthread
@@ -102,7 +106,8 @@ ble-deps:
 	    echo "SimpleBLE already present at $(SIMPLEBLE_DIR)."; \
 	else \
 	    echo "Cloning SimpleBLE..."; \
-	    git clone --depth 1 https://github.com/OpenBluetoothToolbox/SimpleBLE $(SIMPLEBLE_DIR); \
+	    git clone --depth 1 --recurse-submodules --shallow-submodules \
+	        https://github.com/OpenBluetoothToolbox/SimpleBLE $(SIMPLEBLE_DIR); \
 	fi
 	@echo "Building SimpleBLE (static)..."
 	cmake -S $(SIMPLEBLE_DIR)/simpleble \
