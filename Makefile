@@ -55,7 +55,11 @@ BASIC_OBJ = basic.o
 
 # ── SimpleBLE (vendor build) ──────────────────────────────────────────────────
 SIMPLEBLE_DIR = vendor/simpleble
-SIMPLEBLE_INC = $(SIMPLEBLE_DIR)/simpleble/include
+# Source headers + CMake-generated export.h (may live in build/export or build/include)
+SIMPLEBLE_GEN := $(shell find $(SIMPLEBLE_DIR)/build -name 'export.h' -path '*/simpleble/*' 2>/dev/null \
+                   | sed 's|/simpleble/export.h||' | head -1)
+SIMPLEBLE_INC = -I$(SIMPLEBLE_DIR)/simpleble/include \
+                $(if $(SIMPLEBLE_GEN),-I$(SIMPLEBLE_GEN),-I$(SIMPLEBLE_DIR)/build/export)
 
 ifeq ($(UNAME), Linux)
     SIMPLEBLE_SYS = $(shell pkg-config --libs dbus-1 2>/dev/null || echo "-ldbus-1") -lpthread
@@ -115,7 +119,7 @@ ble_kiss_bridge: ble_kiss_bridge.cpp
 	@if [ -z "$(BLE_LIB)" ]; then \
 	    echo "ERROR: SimpleBLE library not found.  Run: make ble-deps"; exit 1; fi
 	$(CXX) -std=c++17 -O2 -Wall -Wextra \
-	    -I$(SIMPLEBLE_INC) \
+	    $(SIMPLEBLE_INC) \
 	    -o $@ ble_kiss_bridge.cpp \
 	    $(BLE_LIB) $(SIMPLEBLE_SYS)
 	@echo "Built: ble_kiss_bridge"
