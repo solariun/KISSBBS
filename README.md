@@ -6,7 +6,7 @@ A self-contained C++11 library implementing the AX.25 amateur-radio link-layer
 protocol over KISS-mode TNCs.  Includes a full-featured BBS with INI config,
 a QBASIC-style scripting engine (functions, structs, DO/LOOP, SELECT CASE, SQLite · TCP · HTTP),
 a complete TNC terminal client (`ax25client`), remote shell access, an
-interactive KISS terminal, and a 92-test GoogleTest suite.
+interactive KISS terminal, and a 131-test GoogleTest suite.
 
 ---
 
@@ -391,6 +391,7 @@ stateDiagram-v2
 
     DISCONNECTED --> CONNECTED  : rcv SABM (listening)\nsend UA\nfire on_accept then on_connect
     DISCONNECTED --> DISCONNECTED : rcv SABM (not listening)\nsend DM
+    DISCONNECTED --> DISCONNECTED : rcv non-SABM (no connection)\nsend DM (AX.25 §4.3.3)
 ```
 
 ---
@@ -724,9 +725,9 @@ make test
 Expected output:
 
 ```
-[==========] Running 127 tests from 13 test suites.
+[==========] Running 131 tests from 14 test suites.
 ...
-[  PASSED  ] 127 tests.
+[  PASSED  ] 131 tests.
 ```
 
 ### Test suites
@@ -738,7 +739,7 @@ Expected output:
 | `KissEncode` | 4 | FEND wrapping, command byte, FEND/FESC byte-stuffing |
 | `KissDecode` | 5 | Simple frame, byte-stuff round-trip, split byte-by-byte, multi-frame stream, empty frame skip |
 | `AX25Frame` | 10 | UI/SABM/UA/DISC/DM/RR/I-frame type detection, N(S)/N(R) encoding, digipeaters, too-short guard |
-| `RouterConnection` | 6 | Full connect+disconnect, data transfer, bidirectional data, large data chunked, DM rejection, address assignment |
+| `RouterConnection` | 7 | Full connect+disconnect, data transfer, bidirectional data, large data chunked, DM rejection, address assignment, **DM for orphan non-SABM frames** |
 | `RouterUI` | 2 | UI send/receive, APRS broadcast (fires on_ui regardless of dest) |
 | `Timers` | 1 | T1 retransmit leading to link failure after N2 retries |
 | `IniConfig` | 4 | Load file, missing file, inline comments, bool/double getters |
@@ -746,6 +747,7 @@ Expected output:
 | `QBasic` | 23 | Labels+GOTO, CONST, block IF/ELSEIF/ELSE/END IF, DO/LOOP WHILE, DO WHILE, DO/LOOP UNTIL, EXIT DO, EXIT FOR, SELECT CASE (simple/ELSE/range/IS), SUB (CALL+implicit), FUNCTION (numeric+string), nested function calls, EXIT SUB, TYPE/DIM, no-line-numbers, GOSUB to label |
 | `QBasicExt` | 35 | FOR IN MATCH (basic/numbers/no-matches/EXIT FOR), REMATCH, REFIND$, REALL$ (default+custom sep), RESUB$, RESUBALL$, REGROUP$, RECOUNT, MAP (set/get/has/del/keys/size/clear), QUEUE (push/pop/peek/size/empty/clear/pop-empty/DO WHILE loop), ARRAY (DIM/read/write/numeric/auto-declare/assoc-key/size/FOR IN order/empty/function-return) |
 | `TokenizeArgs` | 4 | Plain args, double-quoted args, single-quoted args, empty input |
+| `LineTerminator` | 3 | Data delivery unchanged for CR-only (`\r`), LF-only (`\n`), and CRLF (`\r\n`) — confirms ax25lib passes bytes verbatim |
 
 ---
 
@@ -2062,6 +2064,36 @@ Tilde escapes are processed only when `~` is the very first character of a line:
 | `~r` | Redraw current line (useful after unsolicited data scrolled the screen) |
 | `~?` | Show tilde-escape help |
 
+### Line terminator convention
+
+`ax25client` sends **CR-only (`\r`)** as the line terminator, which is the
+universal packet-radio convention.  Sending `\r\n` caused remote BBS stations
+to receive a stray `\n` that corrupted subsequent commands (e.g. `//H` arriving
+as `//H<CR><LF>` instead of `//H<CR>`).
+
+`stdin_readline()` also strips any trailing `\r` or `\n` that `std::getline`
+may leave when the local terminal sends `\r\n`, so the wire always carries
+exactly one `\r` per line.
+
+The BBS (`bbs.cpp`) accepts `\r`, `\n`, or `\r\n` interchangeably — a second
+trigger with an empty buffer is silently filtered — making it compatible with
+any client regardless of its line-ending convention.
+
+### Self-callsign guard
+
+`ax25client` rejects a connect request when `-r REMOTE` matches the local
+callsign (`-c CALL`):
+
+```
+$ ax25client -c W1AW -r W1AW /dev/ttyUSB0
+Error: remote callsign (-r W1AW) cannot be the same as your own callsign (-c W1AW).
+       A SABM addressed to yourself will never receive a UA reply.
+```
+
+A SABM sent to your own callsign is delivered back to your own Router, which
+has no listening connection for it and replies with DM — causing immediate
+disconnect.  The guard catches this common mistake before it reaches the wire.
+
 ### Session transcript example
 
 ```
@@ -2296,15 +2328,19 @@ wraps **BlueZ** on Linux and **CoreBluetooth** on macOS.
 ### Build
 
 ```bash
-# 1 — install cmake (once)
+# 1 — install cmake + dbus dev headers (once)
 #   macOS : brew install cmake
 #   Ubuntu: sudo apt-get install cmake libdbus-1-dev
+#   Fedora: sudo dnf install cmake dbus-devel
 
-# 2 — clone and build SimpleBLE (once, stored in vendor/simpleble)
+# 2 — clone and build SimpleBLE into vendor/simpleble (once)
 make ble-deps
 
 # 3 — compile
 make ble_kiss_bridge
+
+# 4 — (optional) install to /usr/local/bin alongside the other tools
+sudo make install
 ```
 
 ### Three operating modes
@@ -2343,9 +2379,36 @@ ax25client -c W1AW -r W1BBS-1 /dev/pts/3
 | `--write-with-response` | off | Force write-with-response (auto-detected by default) |
 | `--timeout S` | 10 | Scan / connect timeout in seconds |
 
+### UUID name resolution
+
+`--inspect` and `--device` modes display human-readable names for well-known
+Bluetooth service and characteristic UUIDs (SDP, RFCOMM, Serial Port, UART,
+Characteristic User Description, CCCD, etc.).  Unknown UUIDs are shown as-is.
+
+Example inspect output:
+
+```
+Service : 00000001-ba2a-46c9-ae49-01b0961f68bb  [SDP]
+  Characteristic: 00000003-ba2a-46c9-ae49-01b0961f68bb  [RFCOMM]
+                  read | notify
+  Characteristic: 00000002-ba2a-46c9-ae49-01b0961f68bb  [Unknown]
+                  write | write-without-response
+```
+
+### Device discovery (Linux)
+
+On Linux, `--device` passes the `--service` UUID to BlueZ's `SetDiscoveryFilter`
+D-Bus call before starting the scan.  This forces BlueZ to perform an **active
+scan** specifically for devices advertising that service UUID — identical to what
+`ble-serial` does internally.  Without the filter, BlueZ may use a passive scan
+and miss devices that are already known to the adapter from a previous session.
+
+If `--service` is omitted (inspect / scan modes) a generic active scan is used.
+
 ### Notes
 
 - **macOS**: CoreBluetooth handles MTU negotiation automatically; `--mtu` acts as a chunk-size cap.
-- **Linux**: BlueZ negotiates MTU during connect; `--mtu` also acts as a cap.
+- **Linux**: BlueZ negotiates MTU during connect; `--mtu` also acts as a cap.  BlueZ requires `libdbus-1-dev` at build time for the `SetDiscoveryFilter` integration.
 - The tool auto-detects write mode: prefers *write-without-response* when the characteristic supports it; falls back to *write-with-response*; use `--write-with-response` to override.
 - `vendor/simpleble` is excluded from git (`.gitignore`).
+- `make install` / `make uninstall` install/remove all built binaries (`bbs`, `ax25kiss`, `ax25client`, `ble_kiss_bridge`) under `$(PREFIX)` (default `/usr/local/bin`).

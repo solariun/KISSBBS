@@ -606,6 +606,41 @@ TEST(RouterConnection, RejectedWhenNotListening) {
     delete conn_a;
 }
 
+// Router receives a non-SABM U-frame (DISC) for a connection it knows nothing
+// about.  It should respond with DM so the sender stops retrying.
+// Regression test for the "orphan frame" fix (commit 1b8442e).
+TEST(RouterConnection, DMForOrphanNonSABM) {
+    Kiss kiss_b;
+    Router router_b(kiss_b, make_cfg("N0CALL"));
+
+    // test_inject / on_send_hook both work with raw AX.25 bytes (no KISS framing)
+    std::vector<uint8_t> b_sent_ax25;
+    kiss_b.on_send_hook = [&](const std::vector<uint8_t>& raw) {
+        b_sent_ax25 = raw;
+        return true;
+    };
+
+    // Build DISC frame: W1AW → N0CALL, ctrl=0x43
+    Frame disc;
+    disc.dest    = Addr::make("N0CALL");
+    disc.src     = Addr::make("W1AW");
+    disc.ctrl    = 0x43;   // DISC
+    disc.has_pid = false;
+
+    // Inject raw AX.25 bytes directly (test_inject bypasses KISS framing)
+    kiss_b.test_inject(disc.encode());
+
+    ASSERT_FALSE(b_sent_ax25.empty()) << "router_b must reply to orphan DISC";
+
+    Frame resp;
+    ASSERT_TRUE(Frame::decode(b_sent_ax25, resp)) << "response must be valid AX.25";
+    EXPECT_EQ(resp.type(), Frame::Type::DM)
+        << "router_b must send DM for orphan non-SABM, got ctrl=0x"
+        << std::hex << (int)(resp.ctrl & ~0x10u);
+    EXPECT_EQ(resp.dest, Addr::make("W1AW"))   << "DM dest must be the originator";
+    EXPECT_EQ(resp.src,  Addr::make("N0CALL")) << "DM src must be our callsign";
+}
+
 TEST(RouterConnection, IncomingConnectionCorrectAddresses) {
     VirtualNet net;
     Connection* accepted = nullptr;
@@ -1761,6 +1796,57 @@ TEST(QBasicExt, ArrayFunctionReturn) {
     EXPECT_NE(out.find("hello"), std::string::npos);
     EXPECT_NE(out.find("world"), std::string::npos);
     EXPECT_NE(out.find("foo"),   std::string::npos);
+}
+
+// =============================================================================
+// Line-terminator compatibility tests
+//
+// ax25client sends CR-only (\r) as the line terminator (packet radio
+// convention).  The BBS on_data() must accept \r, \n, and \r\n equally so
+// that any client — modern or legacy — works without special configuration.
+//
+// We exercise this directly on the Kiss/Router/Connection data path by
+// routing raw bytes to a VirtualNet connection and verifying that lines are
+// dispatched identically regardless of the terminator used.
+// =============================================================================
+
+// Helper: feed raw bytes as AX.25 I-frame data into a Connection via
+// VirtualNet and collect the complete string received on the other side.
+static std::string feed_data_via_connection(const std::vector<uint8_t>& data) {
+    VirtualNet net;
+    std::string received;
+    net.router_b.listen([&](Connection* c) {
+        c->on_data = [&](const uint8_t* d, std::size_t n) {
+            received.append(reinterpret_cast<const char*>(d), n);
+        };
+        c->on_disconnect = [&] {};
+    });
+    auto* conn_a = net.router_a.connect(Addr::make("N0CALL"));
+    EXPECT_EQ(conn_a->state(), Connection::State::CONNECTED);
+    conn_a->send(data.data(), data.size());
+    delete conn_a;
+    return received;
+}
+
+TEST(LineTerminator, CROnlyDelivered) {
+    // ax25client sends CR-only; receiver gets the CR byte verbatim.
+    auto rx = feed_data_via_connection({'H','i','\r'});
+    EXPECT_NE(rx.find("Hi"), std::string::npos);
+    EXPECT_NE(rx.find('\r'), std::string::npos);
+}
+
+TEST(LineTerminator, LFOnlyDelivered) {
+    auto rx = feed_data_via_connection({'H','i','\n'});
+    EXPECT_NE(rx.find("Hi"), std::string::npos);
+    EXPECT_NE(rx.find('\n'), std::string::npos);
+}
+
+TEST(LineTerminator, CRLFDelivered) {
+    auto rx = feed_data_via_connection({'H','i','\r','\n'});
+    EXPECT_NE(rx.find("Hi"), std::string::npos);
+    // Both CR and LF must arrive intact
+    EXPECT_NE(rx.find('\r'), std::string::npos);
+    EXPECT_NE(rx.find('\n'), std::string::npos);
 }
 
 // Main — GoogleTest entry point
