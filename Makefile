@@ -78,7 +78,10 @@ endif
 NPROC := $(shell nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
 
 # ── Targets ───────────────────────────────────────────────────────────────────
-.PHONY: all clean test install-deps ble-deps ble_kiss_bridge
+PREFIX    ?= /usr/local
+BINDIR     = $(PREFIX)/bin
+
+.PHONY: all clean test install uninstall install-deps ble-deps ble_kiss_bridge
 
 all: bbs ax25kiss ax25client
 
@@ -135,6 +138,33 @@ ble_kiss_bridge: ble_kiss_bridge.cpp
 
 clean:
 	rm -f $(LIB_OBJ) $(BASIC_OBJ) bbs ax25kiss ax25client test_ax25lib ble_kiss_bridge
+
+# ── Install / Uninstall ───────────────────────────────────────────────────────
+# Installs all built binaries to $(PREFIX)/bin  (default: /usr/local/bin).
+# ble_kiss_bridge is installed only if already built.
+# Override prefix:  make install PREFIX=/usr
+install:
+	@echo "Installing to $(BINDIR) ..."
+	install -d $(BINDIR)
+	install -m 755 bbs      $(BINDIR)/bbs
+	install -m 755 ax25kiss $(BINDIR)/ax25kiss
+	install -m 755 ax25client $(BINDIR)/ax25client
+	@if [ -f ble_kiss_bridge ]; then \
+	    install -m 755 ble_kiss_bridge $(BINDIR)/ble_kiss_bridge; \
+	    echo "  installed: $(BINDIR)/ble_kiss_bridge"; \
+	else \
+	    echo "  skipped  : ble_kiss_bridge (not built — run: make ble-deps && make ble_kiss_bridge)"; \
+	fi
+	@echo "Done.  Binaries in $(BINDIR):"
+	@echo "  bbs  ax25kiss  ax25client  ble_kiss_bridge"
+
+uninstall:
+	@echo "Removing from $(BINDIR) ..."
+	rm -f $(BINDIR)/bbs \
+	      $(BINDIR)/ax25kiss \
+	      $(BINDIR)/ax25client \
+	      $(BINDIR)/ble_kiss_bridge
+	@echo "Done."
 
 install-deps:
 	@echo "Install dependencies:"
