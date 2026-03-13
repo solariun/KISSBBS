@@ -622,9 +622,24 @@ static int run_connect(Kiss& kiss, Router& router, const AppCfg& cfg) {
     }
 
     // ── Cleanup ──────────────────────────────────────────────────────────────
-    if (conn && conn->connected()) conn->disconnect();
-    // Let the router tick once to send DISC
-    router.poll();
+    if (conn && conn->connected()) {
+        if (g_quit)
+            std::cout << "\n" << YELLOW() << "Signal received — disconnecting…"
+                      << RESET() << "\n" << std::flush;
+        conn->disconnect();
+        // Poll until DISC is acknowledged (UA received) or 1 s elapses.
+        // A single poll() is not enough: serial I/O only happens inside poll().
+        auto t0 = std::chrono::steady_clock::now();
+        while (conn->state() != Connection::State::DISCONNECTED) {
+            struct timeval tv{ 0, 20000 };
+            fd_set fds; FD_ZERO(&fds); FD_SET(ser_fd, &fds);
+            select(ser_fd + 1, &fds, nullptr, nullptr, &tv);
+            router.poll();
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - t0).count();
+            if (ms >= 1000) break;   // give up after 1 s
+        }
+    }
 
     std::cout << "\nSession summary:\n"
               << "  TX: " << st.frames_tx << " frames / " << st.bytes_tx << " bytes\n"
