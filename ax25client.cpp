@@ -294,6 +294,9 @@ static bool stdin_readline(std::string& line, int timeout_ms) {
     int r = select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv);
     if (r <= 0) return false;
     if (!std::getline(std::cin, line)) { g_quit = 1; return false; }
+    // getline strips \n but leaves \r if the terminal sends \r\n
+    while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
+        line.pop_back();
     return true;
 }
 
@@ -363,7 +366,7 @@ static int run_unproto(Kiss& kiss, Router& router, const AppCfg& cfg) {
         if (stdin_readline(line, 0)) {
             if (line == "/quit" || line == "/exit") break;
             if (line.empty()) continue;
-            std::string payload = line + "\r\n";
+            std::string payload = line + "\r";   // CR only — packet radio convention
             router.send_ui(dest, cfg.pid, payload, cfg.ax25.digis);
             ++st.frames_tx;
             st.bytes_tx += payload.size();
@@ -582,7 +585,7 @@ static int run_connect(Kiss& kiss, Router& router, const AppCfg& cfg) {
             continue;
         }
 
-        std::string payload = line + "\r\n";
+        std::string payload = line + "\r";   // CR only — packet radio convention
         if (conn->send(payload)) {
             st.bytes_tx += payload.size();
             ++st.frames_tx;
