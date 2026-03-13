@@ -37,6 +37,7 @@
 //   --pid HEX       PID for UI frames in hex (default: F0)
 //   -s FILE         Run BASIC script after connect (connect mode only)
 //                   Pre-set vars: remote$, local$, callsign$
+//   --ka SECS       App-level keep-alive: send CR every N seconds while idle (0=off)
 //   -h              Show this help
 //
 // Tilde-escape commands (connect mode only, entered at the start of a line):
@@ -129,6 +130,7 @@ struct AppCfg {
     Config      ax25;                     // ax25lib Config (mycall, mtu, etc.)
     int         baud     = 9600;
     std::string script;                   // path to BASIC script (-s); empty = interactive
+    int         ka_ms    = 0;             // app-level keep-alive interval ms (0=off)
 };
 
 static void print_usage(const char* prog) {
@@ -156,6 +158,7 @@ static void print_usage(const char* prog) {
         << "  --txdelay N  KISS TX delay ms (default: 300)\n"
         << "  --pid HEX    PID for UI frames (default: F0)\n"
         << "  -s FILE      BASIC script to run after connect\n"
+        << "  --ka SECS    App-level keep-alive: send CR every N seconds when idle (0=off)\n"
         << "  -h           Show this help\n\n"
         << "Tilde escapes (connect mode):\n"
         << "  ~.  disconnect and exit\n"
@@ -174,6 +177,7 @@ static bool parse_args(int argc, char* argv[], AppCfg& cfg) {
         {"txdelay", required_argument, nullptr, 1002},
         {"pid",     required_argument, nullptr, 1003},
         {"script",  required_argument, nullptr, 's'},
+        {"ka",      required_argument, nullptr, 1004},
         {nullptr, 0, nullptr, 0}
     };
 
@@ -201,6 +205,7 @@ static bool parse_args(int argc, char* argv[], AppCfg& cfg) {
         case 1002: cfg.txdelay    = std::atoi(optarg); break;
         case 1003: cfg.pid        = static_cast<uint8_t>(std::strtoul(optarg, nullptr, 16)); break;
         case 's':  cfg.script     = optarg; break;
+        case 1004: cfg.ka_ms     = std::atoi(optarg) * 1000; break;
         case 'h':  print_usage(argv[0]); return false;
         default:   print_usage(argv[0]); return false;
         }
@@ -276,7 +281,9 @@ static void show_status(const AppCfg& cfg, const Connection* conn, const Stats& 
               << "  Window    : " << cfg.ax25.window
               << "  MTU=" << cfg.ax25.mtu
               << "  T1=" << cfg.ax25.t1_ms << "ms"
-              << "  T3=" << cfg.ax25.t3_ms << "ms\n\n"
+              << "  T3=" << cfg.ax25.t3_ms << "ms"
+              << "  KA=" << (cfg.ka_ms > 0 ? std::to_string(cfg.ka_ms / 1000) + "s" : "off")
+              << "\n\n"
               << std::flush;
 }
 
@@ -522,6 +529,9 @@ static int run_connect(Kiss& kiss, Router& router, const AppCfg& cfg) {
     // ═════════════════════════════════════════════════════════════════════════
     // ── Interactive mode ─────────────────────────────────────────────────────
     // ═════════════════════════════════════════════════════════════════════════
+    using Clock   = std::chrono::steady_clock;
+    auto last_tx  = Clock::now();   // tracks time of last user/keep-alive send
+
     while (!g_quit && !done) {
         // Poll serial port (20 ms) then tick timers
         {
@@ -530,6 +540,19 @@ static int run_connect(Kiss& kiss, Router& router, const AppCfg& cfg) {
             select(ser_fd + 1, &fds, nullptr, nullptr, &tv);
         }
         router.poll();
+
+        // ── App-level keep-alive ─────────────────────────────────────────────
+        if (cfg.ka_ms > 0 && conn && conn->connected()) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               Clock::now() - last_tx).count();
+            if (elapsed >= cfg.ka_ms) {
+                if (conn->send("\r")) {
+                    last_tx = Clock::now();
+                    std::cout << DIM() << "[keep-alive]" << RESET() << "\n" << std::flush;
+                    ++st.frames_tx;
+                }
+            }
+        }
 
         // Non-blocking stdin read
         std::string line;
@@ -562,7 +585,7 @@ static int run_connect(Kiss& kiss, Router& router, const AppCfg& cfg) {
             case '?':
                 std::cout << "\nTilde escapes:\n"
                           << "  ~.   disconnect and exit\n"
-                          << "  ~s   show status\n"
+                          << "  ~s   show status / statistics (incl. keep-alive setting)\n"
                           << "  ~m   toggle monitor\n"
                           << "  ~r   redraw\n"
                           << "  ~?   this help\n\n" << std::flush;
@@ -587,6 +610,7 @@ static int run_connect(Kiss& kiss, Router& router, const AppCfg& cfg) {
 
         std::string payload = line + "\r";   // CR only — packet radio convention
         if (conn->send(payload)) {
+            last_tx = Clock::now();
             st.bytes_tx += payload.size();
             ++st.frames_tx;
             // Echo locally

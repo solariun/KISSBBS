@@ -2049,6 +2049,7 @@ Options:
   --txdelay MS  KISS TX delay ms (default: 300)
   --pid HEX     PID for UI frames (default: F0)
   -s FILE       BASIC script to run after connecting (connect mode only)
+  --ka SECS     App-level keep-alive: send CR every N seconds while idle (0=off)
   -h            Show help
 ```
 
@@ -2093,6 +2094,27 @@ Error: remote callsign (-r W1AW) cannot be the same as your own callsign (-c W1A
 A SABM sent to your own callsign is delivered back to your own Router, which
 has no listening connection for it and replies with DM — causing immediate
 disconnect.  The guard catches this common mistake before it reaches the wire.
+
+### Application-level keep-alive (`--ka`)
+
+Many packet BBS systems impose their own inactivity timer that is only reset
+by received **data** (I-frames carrying application payload).  The AX.25
+protocol-level keep-alive (T3 / RR poll) satisfies the radio link but not
+the BBS application layer, which may silently disconnect an idle session.
+
+Use `--ka <seconds>` to have `ax25client` automatically send a bare CR to the
+remote station whenever no data has been transmitted for that many seconds:
+
+```
+# Connect to BBS with a 3-minute application keep-alive
+ax25client -c W1AW -r W1BBS-1 --ka 180 /dev/ttyUSB0
+```
+
+When a keep-alive fires, a dimmed `[keep-alive]` annotation is printed on
+the local terminal so you can distinguish it from your own typed input.
+
+The `~s` status display reports the configured interval (e.g. `KA=180s`) or
+`KA=off` when disabled.  The default is `0` (disabled).
 
 ### Session transcript example
 
