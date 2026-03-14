@@ -678,33 +678,51 @@ struct BridgeConfig {
 };
 
 static void do_bridge(const BridgeConfig& cfg) {
+    // ── PTY is created only when NOT in TCP-server mode ───────────────────
     int master_fd = -1, slave_fd = -1;
     std::string slave_path;
-    if (!open_pty(master_fd, slave_fd, slave_path)) return;
 
-    // ── Symlink PTY slave to a stable path ───────────────────────────────
-    if (!cfg.link_path.empty()) {
-        ::unlink(cfg.link_path.c_str());  // remove stale link
-        if (::symlink(slave_path.c_str(), cfg.link_path.c_str()) < 0)
-            std::cerr << "Warning: symlink " << cfg.link_path
-                      << ": " << strerror(errno) << "\n";
+    const bool tcp_mode = (cfg.server_port > 0);
+
+    if (!tcp_mode) {
+        if (!open_pty(master_fd, slave_fd, slave_path)) return;
+
+        // Symlink PTY slave to a stable path
+        if (!cfg.link_path.empty()) {
+            ::unlink(cfg.link_path.c_str());  // remove stale link
+            if (::symlink(slave_path.c_str(), cfg.link_path.c_str()) < 0)
+                std::cerr << "Warning: symlink " << cfg.link_path
+                          << ": " << strerror(errno) << "\n";
+        }
     }
+
     std::string display_path = (!cfg.link_path.empty()) ? cfg.link_path : slave_path;
 
     std::cout << hr('=') << "\n";
-    std::cout << "  BLE KISS Serial Bridge"
-              << (cfg.monitor ? " + AX.25 Monitor" : "") << "\n";
+    if (tcp_mode)
+        std::cout << "  BLE KISS TCP Server Bridge"
+                  << (cfg.monitor ? " + AX.25 Monitor" : "") << "\n";
+    else
+        std::cout << "  BLE KISS Serial Bridge"
+                  << (cfg.monitor ? " + AX.25 Monitor" : "") << "\n";
     std::cout << hr('=') << "\n";
     std::cout << "  Device     : " << cfg.address << "\n";
     std::cout << "  Service    : " << cfg.service_uuid << "\n";
-    std::cout << "  Read char  : " << cfg.read_uuid << "  (notify -> PTY)\n";
-    std::cout << "  Write char : " << cfg.write_uuid << "  (PTY -> BLE)\n";
+    if (tcp_mode) {
+        std::cout << "  Read char  : " << cfg.read_uuid << "  (notify -> TCP clients)\n";
+        std::cout << "  Write char : " << cfg.write_uuid << "  (TCP clients -> BLE)\n";
+    } else {
+        std::cout << "  Read char  : " << cfg.read_uuid << "  (notify -> PTY)\n";
+        std::cout << "  Write char : " << cfg.write_uuid << "  (PTY -> BLE)\n";
+    }
     std::cout << hr() << "\n";
-    std::cout << "  PTY device : " << slave_path << "\n";
-    if (!cfg.link_path.empty())
-        std::cout << "  Symlink    : " << cfg.link_path << "  -> " << slave_path << "\n";
-    std::cout << "\n";
-    std::cout << "  Example:\n      ax25client -c W1AW -r W1BBS-1 " << display_path << "\n";
+    if (!tcp_mode) {
+        std::cout << "  PTY device : " << slave_path << "\n";
+        if (!cfg.link_path.empty())
+            std::cout << "  Symlink    : " << cfg.link_path << "  -> " << slave_path << "\n";
+        std::cout << "\n";
+        std::cout << "  Example:\n      ax25client -c W1AW -r W1BBS-1 " << display_path << "\n";
+    }
     std::cout << hr() << "\n  Connecting to BLE...\n";
     std::cout.flush();
 
@@ -753,6 +771,8 @@ static void do_bridge(const BridgeConfig& cfg) {
               << "  response=" << (use_response ? "yes" : "no") << "\n";
     if (cfg.ble_ka_ms > 0)
         std::cout << "  BLE keep-alive: " << cfg.ble_ka_ms / 1000 << "s  (KISS null writes)\n";
+    if (tcp_mode)
+        std::cout << "  Mode       : TCP server only (no PTY)\n";
     std::cout << (cfg.monitor ? "  Monitor on.  Ctrl-C to stop.\n"
                               : "  Running.     Ctrl-C to stop.\n");
     std::cout << "\n";
@@ -831,7 +851,7 @@ static void do_bridge(const BridgeConfig& cfg) {
         g_running = false;
     });
 
-    // ── BLE -> PTY + TCP clients ─────────────────────────────────────────
+    // ── BLE -> PTY (serial mode) + TCP clients ───────────────────────────
     peripheral.notify(cfg.service_uuid, cfg.read_uuid,
         [&](SimpleBLE::ByteArray raw) {
             const uint8_t* d = raw.data();
@@ -839,8 +859,8 @@ static void do_bridge(const BridgeConfig& cfg) {
 
             std::lock_guard<std::mutex> lk(mx);
 
-            // Write raw bytes to PTY master
-            if (::write(master_fd, d, n) < 0)
+            // Write raw bytes to PTY master (serial mode only)
+            if (master_fd >= 0 && ::write(master_fd, d, n) < 0)
                 std::cerr << "  PTY write error: " << strerror(errno) << "\n";
 
             // Fan-out to all TCP clients; remove dead ones
@@ -910,11 +930,14 @@ static void do_bridge(const BridgeConfig& cfg) {
     };
 
     while (g_running && peripheral.is_connected()) {
-        // ── Build fd_set: PTY + TCP server + TCP clients ──────────────────
+        // ── Build fd_set: PTY (serial mode) + TCP server + TCP clients ────
         fd_set rfds;
         FD_ZERO(&rfds);
-        FD_SET(master_fd, &rfds);
-        int max_fd = master_fd;
+        int max_fd = 0;
+        if (master_fd >= 0) {
+            FD_SET(master_fd, &rfds);
+            max_fd = master_fd;
+        }
 
         if (server_sock >= 0) {
             FD_SET(server_sock, &rfds);
@@ -1018,8 +1041,8 @@ static void do_bridge(const BridgeConfig& cfg) {
             }
         }
 
-        // ── Read from PTY → BLE ───────────────────────────────────────────
-        if (!FD_ISSET(master_fd, &rfds)) continue;
+        // ── Read from PTY → BLE (serial mode only) ───────────────────────
+        if (master_fd < 0 || !FD_ISSET(master_fd, &rfds)) continue;
 
         uint8_t buf[4096];
         ssize_t nr = ::read(master_fd, buf, sizeof(buf));
@@ -1055,9 +1078,9 @@ static void do_bridge(const BridgeConfig& cfg) {
         tcp_clients.clear();
     }
 
-    ::close(master_fd);
-    ::close(slave_fd);
-    if (!cfg.link_path.empty()) ::unlink(cfg.link_path.c_str());
+    if (master_fd >= 0) ::close(master_fd);
+    if (slave_fd  >= 0) ::close(slave_fd);
+    if (!tcp_mode && !cfg.link_path.empty()) ::unlink(cfg.link_path.c_str());
 
     std::cout << "\n" << hr() << "\n";
     std::cout << "  Session ended.  RX frames: " << rx_frames.load()
@@ -1070,33 +1093,47 @@ static void do_bridge(const BridgeConfig& cfg) {
 // ─────────────────────────────────────────────────────────────────────────────
 static void usage(const char* prog) {
     std::cerr <<
-        "BLE KISS TNC serial bridge + AX.25 monitor\n\n"
+        "BLE KISS TNC bridge + AX.25 monitor\n\n"
         "Usage:\n"
         "  " << prog << " --scan [--timeout <s>]\n"
         "  " << prog << " --inspect <ADDRESS>\n"
         "  " << prog << " --device <ADDRESS>\n"
         "             --service <UUID> --write <UUID> --read <UUID>\n"
-        "             [--mtu <bytes>] [--write-with-response]\n"
-        "             [--link <path>] [--monitor]\n\n"
+        "             [--mtu <bytes>] [--write-with-response] [--monitor]\n"
+        "             [--ble-ka <secs>]\n"
+        "             PTY mode  : [--link <path>]          (default)\n"
+        "             TCP mode  : --server-port <port> [--server-host <host>]\n\n"
+        "Transport modes (mutually exclusive):\n"
+        "  PTY mode (default)     A virtual serial port is created; connect with:\n"
+        "                           ax25client -c W1AW -r W1BBS-1 /tmp/kiss\n"
+        "  TCP mode               --server-port enables a TCP KISS server;\n"
+        "                         NO PTY is created.  Connect with:\n"
+        "                           ax25client -c W1AW -r W1BBS-1 localhost:<port>\n\n"
         "Options (device mode):\n"
-        "  --link <path>          Symlink created pointing to the PTY slave\n"
+        "  --link <path>          (PTY mode) symlink pointing to the PTY slave\n"
         "                         Default: /tmp/kiss  (use --link '' to disable)\n"
+        "  --server-port <port>   (TCP mode) listen for KISS-over-TCP clients;\n"
+        "                         disables PTY creation entirely\n"
+        "  --server-host <host>   (TCP mode) bind to this address (default: all)\n"
         "  --ble-ka <secs>        BLE keep-alive: send KISS null every N seconds\n"
         "                         when idle to prevent TNC inactivity disconnect\n"
         "                         Default: 5  (use 0 to disable)\n"
-        "  --server-port <port>   Start a TCP server; KISS data is bridged between\n"
-        "                         BLE and all connected TCP clients simultaneously\n"
-        "  --server-host <host>   Bind TCP server to this address (default: all)\n"
-        "  --monitor              Print per-frame hex + AX.25 decode to stdout\n"
-        "                         (silent by default — only connection info shown)\n\n"
+        "  --monitor              Print per-frame hex + AX.25 decode to stdout\n\n"
         "Examples:\n"
         "  " << prog << " --scan --timeout 15\n"
         "  " << prog << " --inspect AA:BB:CC:DD:EE:FF\n"
+        "  # PTY mode (serial bridge)\n"
         "  " << prog << " --device AA:BB:CC:DD:EE:FF \\\n"
         "             --service 00000001-ba2a-46c9-ae49-01b0961f68bb \\\n"
         "             --write   00000003-ba2a-46c9-ae49-01b0961f68bb \\\n"
         "             --read    00000002-ba2a-46c9-ae49-01b0961f68bb \\\n"
-        "             --link /tmp/kiss --monitor\n\n"
+        "             --link /tmp/kiss --monitor\n"
+        "  # TCP mode (no PTY)\n"
+        "  " << prog << " --device AA:BB:CC:DD:EE:FF \\\n"
+        "             --service 00000001-ba2a-46c9-ae49-01b0961f68bb \\\n"
+        "             --write   00000003-ba2a-46c9-ae49-01b0961f68bb \\\n"
+        "             --read    00000002-ba2a-46c9-ae49-01b0961f68bb \\\n"
+        "             --server-port 8001 --monitor\n\n"
         "Build:\n"
         "  make ble-deps        # clone + build SimpleBLE (one time)\n"
         "  make ble_kiss_bridge\n";
@@ -1132,6 +1169,11 @@ int main(int argc, char* argv[]) {
     if (mode == "device" &&
         (cfg.service_uuid.empty() || cfg.write_uuid.empty() || cfg.read_uuid.empty())) {
         std::cerr << "--device requires --service, --write, and --read\n";
+        return 1;
+    }
+    if (mode == "device" && cfg.server_port > 0 && !cfg.link_path.empty()) {
+        std::cerr << "Error: --server-port (TCP mode) and --link (PTY mode) are mutually exclusive.\n"
+                     "       TCP mode does not create a PTY.  Drop --link or drop --server-port.\n";
         return 1;
     }
 
