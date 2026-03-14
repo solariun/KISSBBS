@@ -78,13 +78,17 @@ endif
 
 NPROC := $(shell nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
 
+# Canonical output path of the SimpleBLE static library (cmake default).
+# Used as a real-file target so ble-deps only builds once.
+BLE_LIB = $(SIMPLEBLE_DIR)/build/lib/libsimpleble.a
+
 # ── Targets ───────────────────────────────────────────────────────────────────
 PREFIX    ?= /usr/local
 BINDIR     = $(PREFIX)/bin
 
-.PHONY: all clean test install uninstall install-deps ble-deps ble_kiss_bridge
+.PHONY: all clean test install uninstall install-deps ble-deps
 
-all: bbs ax25kiss ax25client
+all: bbs ax25kiss ax25client ble_kiss_bridge
 
 $(LIB_OBJ): $(LIB_SRC) ax25lib.hpp
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
@@ -109,10 +113,12 @@ test_ax25lib: test_ax25lib.cpp $(LIB_OBJ) $(BASIC_OBJ) ax25lib.hpp basic.hpp ini
 test: test_ax25lib
 	./test_ax25lib --gtest_color=yes
 
-ble-deps:
-	@if [ -d $(SIMPLEBLE_DIR)/simpleble/include/simpleble ]; then \
-	    echo "SimpleBLE already present at $(SIMPLEBLE_DIR)."; \
-	else \
+# ble-deps: phony convenience alias — the real work is the library file target.
+ble-deps: $(BLE_LIB)
+
+# Build SimpleBLE only when the library doesn't exist yet.
+$(BLE_LIB):
+	@if [ ! -d $(SIMPLEBLE_DIR)/simpleble/include/simpleble ]; then \
 	    echo "Cloning SimpleBLE..."; \
 	    git clone --depth 1 --recurse-submodules --shallow-submodules \
 	        https://github.com/OpenBluetoothToolbox/SimpleBLE $(SIMPLEBLE_DIR); \
@@ -124,13 +130,9 @@ ble-deps:
 	      -DSIMPLEBLE_BUILD_SHARED_LIBS=OFF \
 	      -DCMAKE_POSITION_INDEPENDENT_CODE=ON
 	cmake --build $(SIMPLEBLE_DIR)/build --config Release -j$(NPROC)
-	@echo ""
-	@echo "SimpleBLE ready.  Now run:  make ble_kiss_bridge"
+	@echo "SimpleBLE ready."
 
-ble_kiss_bridge: ble_kiss_bridge.cpp
-	$(eval BLE_LIB := $(shell find $(SIMPLEBLE_DIR)/build -name 'libsimpleble*.a' 2>/dev/null | head -1))
-	@if [ -z "$(BLE_LIB)" ]; then \
-	    echo "ERROR: SimpleBLE library not found.  Run: make ble-deps"; exit 1; fi
+ble_kiss_bridge: ble_kiss_bridge.cpp $(BLE_LIB)
 	$(CXX) -std=c++17 -O2 -Wall -Wextra \
 	    $(SIMPLEBLE_INC) \
 	    -o $@ ble_kiss_bridge.cpp \
