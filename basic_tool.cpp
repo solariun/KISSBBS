@@ -208,6 +208,40 @@ static void apply_queues(Basic& b, const std::vector<QueueSpec>& queues) {
 }
 
 // =============================================================================
+// Default variable values
+//
+// BBS scripts expect certain variables to be pre-set by the host.  When the
+// user does not supply -v overrides for these, sensible defaults are used so
+// scripts run without extra arguments during offline testing.
+//
+// Defaults (can all be overridden with -v NAME=VALUE):
+//   CALLSIGN$  = "N0CALL"   — the connecting user's callsign
+//   LOCAL$     = "N0CALL"   — alias for the local station callsign
+//   REMOTE$    = ""         — remote station (empty in offline mode)
+//   BBS_NAME$  = "MyBBS"    — BBS name shown in banners
+//   DB_PATH$   = "bbs.db"   — SQLite database path
+// =============================================================================
+static void apply_default_vars(Basic& b, const std::vector<VarSpec>& user_vars) {
+    // Build set of names already supplied by the user (uppercased)
+    std::set<std::string> user_names;
+    for (const auto& v : user_vars) {
+        std::string n = v.name;
+        for (auto& c : n) c = (char)std::toupper((unsigned char)c);
+        user_names.insert(n);
+    }
+
+    auto set_default = [&](const std::string& uname, const std::string& val) {
+        if (!user_names.count(uname)) b.set_str(uname, val);
+    };
+
+    set_default("CALLSIGN$", "N0CALL");
+    set_default("LOCAL$",    "N0CALL");
+    set_default("REMOTE$",   "");
+    set_default("BBS_NAME$", "MyBBS");
+    set_default("DB_PATH$",  "bbs.db");
+}
+
+// =============================================================================
 // Configure and run a Basic instance — shared between run-mode and REPL RUN
 // =============================================================================
 static void configure_interp(Basic& b, bool trace) {
@@ -492,8 +526,9 @@ static void repl(const std::vector<VarSpec>&   vars,
 
             Basic b;
             g_interp = &b;
-            prog.load_into(b);      // calls b.clear() internally
-            apply_vars(b, vars);    // apply after clear so data survives
+            prog.load_into(b);           // calls b.clear() internally
+            apply_default_vars(b, vars); // defaults first
+            apply_vars(b, vars);         // user overrides
             apply_maps(b, maps);
             apply_queues(b, queues);
             configure_interp(b, trace);
@@ -628,6 +663,7 @@ int main(int argc, char** argv) {
 
         // Apply data after load_file: load_file calls clear() internally,
         // which would wipe any variables / maps / queues set before loading.
+        apply_default_vars(b, vars); // defaults first, user -v flags override
         apply_vars(b, vars);
         apply_maps(b, maps);
         apply_queues(b, queues);

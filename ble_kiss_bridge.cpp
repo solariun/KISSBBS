@@ -80,6 +80,7 @@
 // Global state
 // ─────────────────────────────────────────────────────────────────────────────
 static std::atomic<bool> g_running{true};
+static std::atomic<bool> g_ble_disc{false}; // set by BLE disconnect callback
 static void sigint_handler(int) { g_running = false; }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -757,64 +758,17 @@ static void do_bridge(const BridgeConfig& cfg) {
     std::cout << hr() << "\n  Connecting to BLE...\n";
     std::cout.flush();
 
-    auto opt = get_adapter();
-    if (!opt) { close(master_fd); close(slave_fd); return; }
-    auto& adapter = *opt;
+    // ── Signal handlers ────────────────────────────────────────────────────
+    signal(SIGINT,  sigint_handler);
+    signal(SIGTERM, sigint_handler);
 
-    auto popt = find_peripheral(adapter, cfg.address, (int)(cfg.timeout * 1000),
-                               cfg.service_uuid);
-    if (!popt) {
-        std::cerr << "Device " << cfg.address << " not found.\n";
-        close(master_fd); close(slave_fd); return;
-    }
-    auto& peripheral = *popt;
-
-    try { peripheral.connect(); }
-    catch (const std::exception& e) {
-        std::cerr << "Connect failed: " << e.what() << "\n";
-        close(master_fd); close(slave_fd); return;
-    }
-
-    // Capability check on write characteristic
-    bool can_wwr = false, can_wr = false;
-    for (auto& svc : peripheral.services()) {
-        if (lower(svc.uuid()) != lower(cfg.service_uuid)) continue;
-        for (auto& chr : svc.characteristics()) {
-            if (lower(chr.uuid()) != lower(cfg.write_uuid)) continue;
-            can_wwr = chr.can_write_command();
-            can_wr  = chr.can_write_request();
-        }
-    }
-
-    bool use_response = cfg.force_response.has_value()
-                      ? *cfg.force_response
-                      : (!can_wwr && can_wr);  // prefer write-without-response
-
-    uint16_t mtu_val = 23;
-    try { mtu_val = peripheral.mtu(); } catch (...) {}
-    if (mtu_val < 23) mtu_val = 23;
-
-    int chunk_size = std::max(1, std::min(cfg.mtu, (int)mtu_val) - 3);
-
-    std::cout << "  Connected.  MTU=" << mtu_val
-              << "  chunk=" << chunk_size << "b"
-              << "  wwr=" << (can_wwr ? "yes" : "no")
-              << "  response=" << (use_response ? "yes" : "no") << "\n";
-    if (cfg.ble_ka_ms > 0)
-        std::cout << "  BLE keep-alive: " << cfg.ble_ka_ms / 1000 << "s  (KISS null writes)\n";
-    if (tcp_mode)
-        std::cout << "  Mode       : TCP server only (no PTY)\n";
-    std::cout << (cfg.monitor ? "  Monitor on.  Ctrl-C to stop.\n"
-                              : "  Running.     Ctrl-C to stop.\n");
-    std::cout << "\n";
-    std::cout.flush();
-
-    // ── TCP server (optional) ──────────────────────────────────────────────
+    // ── TCP server setup (once — survives BLE reconnects) ─────────────────
     int server_sock = -1;
-    std::vector<int> tcp_clients;         // protected by mx
+    std::vector<int> tcp_clients;
+    std::mutex mx;
+    std::atomic<int> rx_frames{0}, tx_frames{0};
 
     if (cfg.server_port > 0) {
-        // Try IPv6 dual-stack first, fall back to IPv4
         server_sock = ::socket(AF_INET6, SOCK_STREAM, 0);
         bool bound = false;
 
@@ -831,7 +785,7 @@ static void do_bridge(const BridgeConfig& cfg) {
                 a.sin6_addr = in6addr_any;
             } else {
                 if (::inet_pton(AF_INET6, cfg.server_host.c_str(), &a.sin6_addr) <= 0)
-                    a.sin6_addr = in6addr_any;   // fallback if host is IPv4
+                    a.sin6_addr = in6addr_any;
             }
             bound = (::bind(server_sock, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0);
         }
@@ -857,7 +811,6 @@ static void do_bridge(const BridgeConfig& cfg) {
 
         if (server_sock >= 0 && bound) {
             ::listen(server_sock, 8);
-            // Non-blocking accept
             int fl = ::fcntl(server_sock, F_GETFL, 0);
             ::fcntl(server_sock, F_SETFL, fl | O_NONBLOCK);
             std::cout << "  TCP server : "
@@ -870,214 +823,328 @@ static void do_bridge(const BridgeConfig& cfg) {
         }
     }
 
-    KissDecoder decoder;      // RX: BLE → PTY/TCP  (persistent across BLE notify chunks)
-    KissDecoder tx_decoder;  // TX: PTY/TCP → BLE  (persistent across read() calls)
-    std::mutex mx;           // protects both decoders + stdout + tcp_clients
-    std::atomic<int> rx_frames{0}, tx_frames{0};
+    // ── Reconnect loop ─────────────────────────────────────────────────────
+    // Up to MAX_RECONNECTS re-attempts after an unexpected BLE disconnect.
+    // PTY, symlink and TCP server remain open so clients do not need to
+    // restart.  Ctrl-C (SIGINT) breaks the loop immediately.
+    static constexpr int MAX_RECONNECTS  = 10;
+    static constexpr int RECONNECT_PAUSE = 5000; // ms between attempts
 
-    // Disconnect callback
-    peripheral.set_callback_on_disconnected([&]() {
-        std::lock_guard<std::mutex> lk(mx);
-        std::cout << "\n  [BLE disconnected]\n";
+    for (int attempt = 0; attempt <= MAX_RECONNECTS && g_running; ++attempt) {
+
+        if (attempt > 0) {
+            std::cout << "\n[" << ts() << "]  BLE reconnect "
+                      << attempt << "/" << MAX_RECONNECTS
+                      << " — waiting " << RECONNECT_PAUSE / 1000 << " s...\n";
+            std::cout.flush();
+            // Interruptible sleep — wakes immediately on SIGINT
+            for (int i = 0; i < RECONNECT_PAUSE / 100 && g_running; ++i)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (!g_running) break;
+            std::cout << "[" << ts() << "]  Scanning for " << cfg.address << "...\n";
+            std::cout.flush();
+        } else {
+            std::cout << "  Connecting to BLE...\n";
+            std::cout.flush();
+        }
+
+        g_ble_disc = false;   // reset for this session
+
+        // ── Find adapter and peripheral ───────────────────────────────────
+        auto opt = get_adapter();
+        if (!opt) {
+            std::cerr << "  No Bluetooth adapter available.\n";
+            break;   // no point retrying without an adapter
+        }
+        auto& adapter = *opt;
+
+        auto popt = find_peripheral(adapter, cfg.address,
+                                    (int)(cfg.timeout * 1000), cfg.service_uuid);
+        if (!popt) {
+            std::cerr << "[" << ts() << "]  Device " << cfg.address
+                      << " not found.\n";
+            continue;   // retry
+        }
+        auto& peripheral = *popt;
+
+        try { peripheral.connect(); }
+        catch (const std::exception& e) {
+            std::cerr << "[" << ts() << "]  Connect failed: " << e.what() << "\n";
+            continue;   // retry
+        }
+
+        // ── Capability check ──────────────────────────────────────────────
+        bool can_wwr = false, can_wr = false;
+        for (auto& svc : peripheral.services()) {
+            if (lower(svc.uuid()) != lower(cfg.service_uuid)) continue;
+            for (auto& chr : svc.characteristics()) {
+                if (lower(chr.uuid()) != lower(cfg.write_uuid)) continue;
+                can_wwr = chr.can_write_command();
+                can_wr  = chr.can_write_request();
+            }
+        }
+        bool use_response = cfg.force_response.has_value()
+                          ? *cfg.force_response
+                          : (!can_wwr && can_wr);
+
+        uint16_t mtu_val = 23;
+        try { mtu_val = peripheral.mtu(); } catch (...) {}
+        if (mtu_val < 23) mtu_val = 23;
+        int chunk_size = std::max(1, std::min(cfg.mtu, (int)mtu_val) - 3);
+
+        std::cout << "  Connected.  MTU=" << mtu_val
+                  << "  chunk=" << chunk_size << "b"
+                  << "  wwr=" << (can_wwr ? "yes" : "no")
+                  << "  response=" << (use_response ? "yes" : "no") << "\n";
+        if (cfg.ble_ka_ms > 0)
+            std::cout << "  BLE keep-alive: " << cfg.ble_ka_ms / 1000
+                      << "s  (KISS null writes)\n";
+        if (tcp_mode)
+            std::cout << "  Mode       : TCP server only (no PTY)\n";
+        std::cout << (cfg.monitor ? "  Monitor on.  Ctrl-C to stop.\n"
+                                  : "  Running.     Ctrl-C to stop.\n");
         std::cout.flush();
-        g_running = false;
-    });
 
-    // ── BLE -> PTY (serial mode) + TCP clients ───────────────────────────
-    peripheral.notify(cfg.service_uuid, cfg.read_uuid,
-        [&](SimpleBLE::ByteArray raw) {
-            const uint8_t* d = raw.data();
-            size_t n = raw.size();
+        // ── Per-session KISS decoders (reset each reconnect) ──────────────
+        KissDecoder decoder;
+        KissDecoder tx_decoder;
 
+        // ── Disconnect callback ───────────────────────────────────────────
+        // Sets g_ble_disc (NOT g_running) so the outer loop can retry.
+        peripheral.set_callback_on_disconnected([&]() {
             std::lock_guard<std::mutex> lk(mx);
-
-            // Write raw bytes to PTY master (serial mode only)
-            if (master_fd >= 0 && ::write(master_fd, d, n) < 0)
-                std::cerr << "  PTY write error: " << strerror(errno) << "\n";
-
-            // Fan-out to all TCP clients; remove dead ones
-            std::vector<int> dead;
-            for (int fd : tcp_clients) {
-                if (::write(fd, d, n) < 0) dead.push_back(fd);
-            }
-            for (int fd : dead) {
-                tcp_clients.erase(
-                    std::remove(tcp_clients.begin(), tcp_clients.end(), fd),
-                    tcp_clients.end());
-                ::close(fd);
-                if (cfg.monitor)
-                    std::cout << "[" << ts() << "]  TCP client fd=" << fd
-                              << " removed (write error)\n";
-            }
-
-            ++rx_frames;
-
-            if (cfg.monitor) {
-                std::string t = ts();
-                auto frames = decoder.feed(d, n);
-
-                if (frames.empty()) {
-                    // Fragment: no complete KISS frame yet — show raw in dim
-                    std::cout << DIM() << "[" << t << "]  <- BLE  "
-                              << n << " bytes (buffering)\n"
-                              << hex_dump(d, n, "           ") << RESET();
-                }
-                for (auto& kf : frames) {
-                    if (kf.type == 0 && !kf.payload.empty()) {
-                        auto ax = decode_ax25(kf.payload.data(), kf.payload.size());
-                        std::cout << "[" << t << "]  <- BLE  " << ax.summary << "\n";
-                        print_frame_detail(ax, kf.payload.data(), kf.payload.size());
-                    } else {
-                        static constexpr const char* cmd_names[] =
-                            {"DATA","TXDELAY","P","SLOTTIME","TXTAIL",
-                             "FULLDUPLEX","SETHW","?","?","?","?","?","?","?","?","RETURN"};
-                        std::cout << DIM() << "[" << t << "]  <- BLE  KISS cmd="
-                                  << cmd_names[kf.type & 0xF] << " port=" << kf.port
-                                  << "  " << kf.payload.size() << " bytes\n";
-                        if (!kf.payload.empty())
-                            std::cout << hex_dump(kf.payload.data(), kf.payload.size(), "           ");
-                        std::cout << RESET();
-                    }
-                }
-                std::cout.flush();
-            }
+            std::cout << "\n  [BLE disconnected]\n";
+            std::cout.flush();
+            g_ble_disc = true;
         });
 
-    // ── PTY -> BLE main loop ──────────────────────────────────────────────
-    signal(SIGINT,  sigint_handler);
-    signal(SIGTERM, sigint_handler);
+        // ── BLE → PTY + TCP clients ───────────────────────────────────────
+        peripheral.notify(cfg.service_uuid, cfg.read_uuid,
+            [&](SimpleBLE::ByteArray raw) {
+                const uint8_t* d = raw.data();
+                size_t n = raw.size();
 
-    using SteadyClock = std::chrono::steady_clock;
-    auto last_ble_write = SteadyClock::now();
+                std::lock_guard<std::mutex> lk(mx);
 
-    // Helper: write chunks to BLE; updates last_ble_write on success
-    auto ble_write = [&](const uint8_t* data, int len) {
-        for (int i = 0; i < len; i += chunk_size) {
-            int clen = std::min(chunk_size, len - i);
-            SimpleBLE::ByteArray chunk(data + i, data + i + clen);
-            if (use_response)
-                peripheral.write_request(cfg.service_uuid, cfg.write_uuid, chunk);
-            else
-                peripheral.write_command(cfg.service_uuid, cfg.write_uuid, chunk);
-        }
-        last_ble_write = SteadyClock::now();
-    };
+                if (master_fd >= 0 && ::write(master_fd, d, n) < 0)
+                    std::cerr << "  PTY write error: " << strerror(errno) << "\n";
 
-    while (g_running && peripheral.is_connected()) {
-        // ── Build fd_set: PTY (serial mode) + TCP server + TCP clients ────
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        int max_fd = 0;
-        if (master_fd >= 0) {
-            FD_SET(master_fd, &rfds);
-            max_fd = master_fd;
-        }
-
-        if (server_sock >= 0) {
-            FD_SET(server_sock, &rfds);
-            max_fd = std::max(max_fd, server_sock);
-        }
-
-        // Snapshot client list to avoid holding mx during select()
-        std::vector<int> clients_snap;
-        {
-            std::lock_guard<std::mutex> lk(mx);
-            clients_snap = tcp_clients;
-        }
-        for (int fd : clients_snap) {
-            FD_SET(fd, &rfds);
-            max_fd = std::max(max_fd, fd);
-        }
-
-        struct timeval tv{0, 100000};  // 100 ms
-        bool got_any = select(max_fd + 1, &rfds, nullptr, nullptr, &tv) > 0;
-
-        // ── BLE keep-alive: send KISS null (0xC0 0xC0) when idle ─────────
-        // Two consecutive FENDs are a valid KISS no-op every KISS decoder
-        // discards, but the BLE write resets the TNC's inactivity timer.
-        if (cfg.ble_ka_ms > 0) {
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                               SteadyClock::now() - last_ble_write).count();
-            if (elapsed >= cfg.ble_ka_ms) {
-                try {
-                    static const uint8_t kiss_null[] = {0xC0, 0xC0};
-                    ble_write(kiss_null, 2);
-                    if (cfg.monitor) {
-                        std::lock_guard<std::mutex> lk(mx);
-                        std::cout << "\n" << hr() << "\n";
-                        std::cout << "[" << ts() << "]  BLE keep-alive  (KISS null)\n";
-                        std::cout.flush();
-                    }
-                } catch (...) {}
-            }
-        }
-
-        if (!got_any) continue;
-
-        // ── Accept new TCP client ─────────────────────────────────────────
-        if (server_sock >= 0 && FD_ISSET(server_sock, &rfds)) {
-            int cli = ::accept(server_sock, nullptr, nullptr);
-            if (cli >= 0) {
-                int one = 1;
-                ::setsockopt(cli, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-                int fl = ::fcntl(cli, F_GETFL, 0);
-                ::fcntl(cli, F_SETFL, fl | O_NONBLOCK);
-                {
-                    std::lock_guard<std::mutex> lk(mx);
-                    tcp_clients.push_back(cli);
-                    if (cfg.monitor) {
-                        std::cout << "\n" << hr() << "\n";
-                        std::cout << "[" << ts() << "]  TCP client connected  fd="
-                                  << cli << "\n";
-                        std::cout.flush();
-                    }
+                std::vector<int> dead;
+                for (int fd : tcp_clients) {
+                    if (::write(fd, d, n) < 0) dead.push_back(fd);
                 }
-            }
-        }
-
-        // ── Read from TCP clients → BLE ───────────────────────────────────
-        for (int fd : clients_snap) {
-            if (!FD_ISSET(fd, &rfds)) continue;
-            uint8_t tbuf[4096];
-            ssize_t tn = ::read(fd, tbuf, sizeof(tbuf));
-            if (tn <= 0) {
-                // Client disconnected or error
-                ::close(fd);
-                {
-                    std::lock_guard<std::mutex> lk(mx);
+                for (int fd : dead) {
                     tcp_clients.erase(
                         std::remove(tcp_clients.begin(), tcp_clients.end(), fd),
                         tcp_clients.end());
-                    if (cfg.monitor) {
-                        std::cout << "\n" << hr() << "\n";
-                        std::cout << "[" << ts() << "]  TCP client disconnected  fd="
-                                  << fd << "\n";
-                        std::cout.flush();
+                    ::close(fd);
+                    if (cfg.monitor)
+                        std::cout << "[" << ts() << "]  TCP client fd=" << fd
+                                  << " removed (write error)\n";
+                }
+
+                ++rx_frames;
+
+                if (cfg.monitor) {
+                    std::string t = ts();
+                    auto frames = decoder.feed(d, n);
+
+                    if (frames.empty()) {
+                        std::cout << DIM() << "[" << t << "]  <- BLE  "
+                                  << n << " bytes (buffering)\n"
+                                  << hex_dump(d, n, "           ") << RESET();
+                    }
+                    for (auto& kf : frames) {
+                        if (kf.type == 0 && !kf.payload.empty()) {
+                            auto ax = decode_ax25(kf.payload.data(), kf.payload.size());
+                            std::cout << "[" << t << "]  <- BLE  " << ax.summary << "\n";
+                            print_frame_detail(ax, kf.payload.data(), kf.payload.size());
+                        } else {
+                            static constexpr const char* cmd_names[] =
+                                {"DATA","TXDELAY","P","SLOTTIME","TXTAIL",
+                                 "FULLDUPLEX","SETHW","?","?","?","?","?","?","?","?","RETURN"};
+                            std::cout << DIM() << "[" << t << "]  <- BLE  KISS cmd="
+                                      << cmd_names[kf.type & 0xF] << " port=" << kf.port
+                                      << "  " << kf.payload.size() << " bytes\n";
+                            if (!kf.payload.empty())
+                                std::cout << hex_dump(kf.payload.data(), kf.payload.size(), "           ");
+                            std::cout << RESET();
+                        }
+                    }
+                    std::cout.flush();
+                }
+            });
+
+        using SteadyClock = std::chrono::steady_clock;
+        auto last_ble_write = SteadyClock::now();
+
+        auto ble_write = [&](const uint8_t* data, int len) {
+            for (int i = 0; i < len; i += chunk_size) {
+                int clen = std::min(chunk_size, len - i);
+                SimpleBLE::ByteArray chunk(data + i, data + i + clen);
+                if (use_response)
+                    peripheral.write_request(cfg.service_uuid, cfg.write_uuid, chunk);
+                else
+                    peripheral.write_command(cfg.service_uuid, cfg.write_uuid, chunk);
+            }
+            last_ble_write = SteadyClock::now();
+        };
+
+        // ── PTY → BLE session loop ────────────────────────────────────────
+        while (g_running && !g_ble_disc && peripheral.is_connected()) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            int max_fd = 0;
+            if (master_fd >= 0) {
+                FD_SET(master_fd, &rfds);
+                max_fd = master_fd;
+            }
+            if (server_sock >= 0) {
+                FD_SET(server_sock, &rfds);
+                max_fd = std::max(max_fd, server_sock);
+            }
+
+            std::vector<int> clients_snap;
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                clients_snap = tcp_clients;
+            }
+            for (int fd : clients_snap) {
+                FD_SET(fd, &rfds);
+                max_fd = std::max(max_fd, fd);
+            }
+
+            struct timeval tv{0, 100000};  // 100 ms
+            bool got_any = select(max_fd + 1, &rfds, nullptr, nullptr, &tv) > 0;
+
+            // BLE keep-alive
+            if (cfg.ble_ka_ms > 0) {
+                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   SteadyClock::now() - last_ble_write).count();
+                if (elapsed >= cfg.ble_ka_ms) {
+                    try {
+                        static const uint8_t kiss_null[] = {0xC0, 0xC0};
+                        ble_write(kiss_null, 2);
+                        if (cfg.monitor) {
+                            std::lock_guard<std::mutex> lk(mx);
+                            std::cout << "\n" << hr() << "\n";
+                            std::cout << "[" << ts() << "]  BLE keep-alive  (KISS null)\n";
+                            std::cout.flush();
+                        }
+                    } catch (...) {}
+                }
+            }
+
+            if (!got_any) continue;
+
+            // Accept new TCP client
+            if (server_sock >= 0 && FD_ISSET(server_sock, &rfds)) {
+                int cli = ::accept(server_sock, nullptr, nullptr);
+                if (cli >= 0) {
+                    int one = 1;
+                    ::setsockopt(cli, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+                    int fl = ::fcntl(cli, F_GETFL, 0);
+                    ::fcntl(cli, F_SETFL, fl | O_NONBLOCK);
+                    {
+                        std::lock_guard<std::mutex> lk(mx);
+                        tcp_clients.push_back(cli);
+                        if (cfg.monitor) {
+                            std::cout << "\n" << hr() << "\n";
+                            std::cout << "[" << ts() << "]  TCP client connected  fd="
+                                      << cli << "\n";
+                            std::cout.flush();
+                        }
                     }
                 }
-                continue;
             }
+
+            // Read from TCP clients → BLE
+            for (int fd : clients_snap) {
+                if (!FD_ISSET(fd, &rfds)) continue;
+                uint8_t tbuf[4096];
+                ssize_t tn = ::read(fd, tbuf, sizeof(tbuf));
+                if (tn <= 0) {
+                    ::close(fd);
+                    {
+                        std::lock_guard<std::mutex> lk(mx);
+                        tcp_clients.erase(
+                            std::remove(tcp_clients.begin(), tcp_clients.end(), fd),
+                            tcp_clients.end());
+                        if (cfg.monitor) {
+                            std::cout << "\n" << hr() << "\n";
+                            std::cout << "[" << ts() << "]  TCP client disconnected  fd="
+                                      << fd << "\n";
+                            std::cout.flush();
+                        }
+                    }
+                    continue;
+                }
+
+                ++tx_frames;
+                if (cfg.monitor) {
+                    std::lock_guard<std::mutex> lk(mx);
+                    std::string t = ts();
+                    auto frames = tx_decoder.feed(tbuf, (size_t)tn);
+                    if (frames.empty()) {
+                        std::cout << DIM() << "[" << t << "]  -> TCP  "
+                                  << tn << " bytes (buffering)\n"
+                                  << hex_dump(tbuf, (size_t)tn, "           ") << RESET();
+                    }
+                    for (auto& kf : frames) {
+                        if (kf.type == 0 && !kf.payload.empty()) {
+                            auto ax = decode_ax25(kf.payload.data(), kf.payload.size());
+                            std::cout << "[" << t << "]  -> TCP  " << ax.summary << "\n";
+                            print_frame_detail(ax, kf.payload.data(), kf.payload.size());
+                        } else {
+                            static constexpr const char* cmd_names[] =
+                                {"DATA","TXDELAY","P","SLOTTIME","TXTAIL",
+                                 "FULLDUPLEX","SETHW","?","?","?","?","?","?","?","?","RETURN"};
+                            std::cout << DIM() << "[" << t << "]  -> TCP  KISS cmd="
+                                      << cmd_names[kf.type & 0xF] << " port=" << kf.port
+                                      << "  " << kf.payload.size() << " bytes\n";
+                            if (!kf.payload.empty())
+                                std::cout << hex_dump(kf.payload.data(), kf.payload.size(), "           ");
+                            std::cout << RESET();
+                        }
+                    }
+                    std::cout.flush();
+                }
+                try {
+                    ble_write(tbuf, (int)tn);
+                } catch (const std::exception& e) {
+                    std::lock_guard<std::mutex> lk(mx);
+                    std::cout << "  BLE write error (TCP->BLE): " << e.what() << "\n";
+                    std::cout.flush();
+                }
+            }
+
+            // Read from PTY → BLE (serial mode only)
+            if (master_fd < 0 || !FD_ISSET(master_fd, &rfds)) continue;
+
+            uint8_t buf[4096];
+            ssize_t nr = ::read(master_fd, buf, sizeof(buf));
+            if (nr <= 0) continue;
 
             ++tx_frames;
             if (cfg.monitor) {
                 std::lock_guard<std::mutex> lk(mx);
                 std::string t = ts();
-                auto frames = tx_decoder.feed(tbuf, (size_t)tn);
+                auto frames = tx_decoder.feed(buf, (size_t)nr);
                 if (frames.empty()) {
-                    std::cout << DIM() << "[" << t << "]  -> TCP  "
-                              << tn << " bytes (buffering)\n"
-                              << hex_dump(tbuf, (size_t)tn, "           ") << RESET();
+                    std::cout << DIM() << "[" << t << "]  -> PTY  "
+                              << nr << " bytes (buffering)\n"
+                              << hex_dump(buf, (size_t)nr, "           ") << RESET();
                 }
                 for (auto& kf : frames) {
                     if (kf.type == 0 && !kf.payload.empty()) {
                         auto ax = decode_ax25(kf.payload.data(), kf.payload.size());
-                        std::cout << "[" << t << "]  -> TCP  " << ax.summary << "\n";
+                        std::cout << "[" << t << "]  -> PTY  " << ax.summary << "\n";
                         print_frame_detail(ax, kf.payload.data(), kf.payload.size());
                     } else {
                         static constexpr const char* cmd_names[] =
                             {"DATA","TXDELAY","P","SLOTTIME","TXTAIL",
                              "FULLDUPLEX","SETHW","?","?","?","?","?","?","?","?","RETURN"};
-                        std::cout << DIM() << "[" << t << "]  -> TCP  KISS cmd="
+                        std::cout << DIM() << "[" << t << "]  -> PTY  KISS cmd="
                                   << cmd_names[kf.type & 0xF] << " port=" << kf.port
                                   << "  " << kf.payload.size() << " bytes\n";
                         if (!kf.payload.empty())
@@ -1088,65 +1155,29 @@ static void do_bridge(const BridgeConfig& cfg) {
                 std::cout.flush();
             }
             try {
-                ble_write(tbuf, (int)tn);
+                ble_write(buf, (int)nr);
             } catch (const std::exception& e) {
                 std::lock_guard<std::mutex> lk(mx);
-                std::cout << "  BLE write error (TCP->BLE): " << e.what() << "\n";
+                std::cout << "  BLE write error (PTY->BLE): " << e.what() << "\n";
                 std::cout.flush();
             }
+        }  // end session main loop
+
+        // ── Per-session BLE cleanup ───────────────────────────────────────
+        try { peripheral.unsubscribe(cfg.service_uuid, cfg.read_uuid); } catch (...) {}
+        try { peripheral.disconnect(); } catch (...) {}
+
+        if (!g_running) break;   // SIGINT — stop immediately
+
+        // g_ble_disc is true here: outer for-loop will retry if attempts remain
+        if (attempt == MAX_RECONNECTS) {
+            std::cout << "[" << ts()
+                      << "]  Max reconnect attempts reached.  Giving up.\n";
         }
 
-        // ── Read from PTY → BLE (serial mode only) ───────────────────────
-        if (master_fd < 0 || !FD_ISSET(master_fd, &rfds)) continue;
+    }  // end reconnect loop
 
-        uint8_t buf[4096];
-        ssize_t nr = ::read(master_fd, buf, sizeof(buf));
-        if (nr <= 0) continue;
-
-        ++tx_frames;
-        if (cfg.monitor) {
-            std::lock_guard<std::mutex> lk(mx);
-            std::string t = ts();
-            auto frames = tx_decoder.feed(buf, (size_t)nr);
-            if (frames.empty()) {
-                std::cout << DIM() << "[" << t << "]  -> PTY  "
-                          << nr << " bytes (buffering)\n"
-                          << hex_dump(buf, (size_t)nr, "           ") << RESET();
-            }
-            for (auto& kf : frames) {
-                if (kf.type == 0 && !kf.payload.empty()) {
-                    auto ax = decode_ax25(kf.payload.data(), kf.payload.size());
-                    std::cout << "[" << t << "]  -> PTY  " << ax.summary << "\n";
-                    print_frame_detail(ax, kf.payload.data(), kf.payload.size());
-                } else {
-                    static constexpr const char* cmd_names[] =
-                        {"DATA","TXDELAY","P","SLOTTIME","TXTAIL",
-                         "FULLDUPLEX","SETHW","?","?","?","?","?","?","?","?","RETURN"};
-                    std::cout << DIM() << "[" << t << "]  -> PTY  KISS cmd="
-                              << cmd_names[kf.type & 0xF] << " port=" << kf.port
-                              << "  " << kf.payload.size() << " bytes\n";
-                    if (!kf.payload.empty())
-                        std::cout << hex_dump(kf.payload.data(), kf.payload.size(), "           ");
-                    std::cout << RESET();
-                }
-            }
-            std::cout.flush();
-        }
-
-        try {
-            ble_write(buf, (int)nr);
-        } catch (const std::exception& e) {
-            std::lock_guard<std::mutex> lk(mx);
-            std::cout << "  BLE write error (PTY->BLE): " << e.what() << "\n";
-            std::cout.flush();
-        }
-    }
-
-    // ── Cleanup ───────────────────────────────────────────────────────────
-    try { peripheral.unsubscribe(cfg.service_uuid, cfg.read_uuid); } catch (...) {}
-    try { peripheral.disconnect(); } catch (...) {}
-
-    // Close TCP server and all clients
+    // ── Final cleanup (TCP server, PTY) ──────────────────────────────────
     if (server_sock >= 0) { ::close(server_sock); }
     {
         std::lock_guard<std::mutex> lk(mx);
