@@ -48,7 +48,7 @@ jobs:
           sudo find build -name 'libgtest*.a' -exec cp {} /usr/lib/ \;
 
       - name: Build core apps
-        run: make bbs ax25kiss ax25client
+        run: make bbs ax25kiss ax25client basic_tool
 
       - name: Build ble_kiss_bridge
         continue-on-error: true
@@ -62,7 +62,7 @@ jobs:
           REF="${{ github.ref_name || inputs.version }}"
           PKG="ax25-${REF}-linux-x86_64"
           mkdir -p "$PKG"
-          cp bbs ax25kiss ax25client "$PKG"/
+          cp bbs ax25kiss ax25client basic_tool "$PKG"/
           [ -f ble_kiss_bridge ] && cp ble_kiss_bridge "$PKG"/ || true
           cp README.md LICENSE "$PKG"/ 2>/dev/null || true
           tar czf "${PKG}.tar.gz" "$PKG"
@@ -97,7 +97,7 @@ jobs:
           sudo find build -name 'libgtest*.a' -exec cp {} /usr/lib/ \;
 
       - name: Build core apps
-        run: make bbs ax25kiss ax25client
+        run: make bbs ax25kiss ax25client basic_tool
 
       - name: Build ble_kiss_bridge
         continue-on-error: true
@@ -111,7 +111,7 @@ jobs:
           REF="${{ github.ref_name || inputs.version }}"
           PKG="ax25-${REF}-linux-arm64"
           mkdir -p "$PKG"
-          cp bbs ax25kiss ax25client "$PKG"/
+          cp bbs ax25kiss ax25client basic_tool "$PKG"/
           [ -f ble_kiss_bridge ] && cp ble_kiss_bridge "$PKG"/ || true
           cp README.md LICENSE "$PKG"/ 2>/dev/null || true
           tar czf "${PKG}.tar.gz" "$PKG"
@@ -169,7 +169,7 @@ jobs:
 
       - name: Build core apps (cross)
         run: |
-          make bbs ax25kiss ax25client \
+          make bbs ax25kiss ax25client basic_tool \
             CXX=arm-linux-gnueabihf-g++ \
             PKG_CONFIG_PATH=/usr/lib/arm-linux-gnueabihf/pkgconfig
 
@@ -180,7 +180,7 @@ jobs:
           REF="${{ github.ref_name || inputs.version }}"
           PKG="ax25-${REF}-linux-armhf"
           mkdir -p "$PKG"
-          cp bbs ax25kiss ax25client "$PKG"/
+          cp bbs ax25kiss ax25client basic_tool "$PKG"/
           cp README.md LICENSE "$PKG"/ 2>/dev/null || true
           tar czf "${PKG}.tar.gz" "$PKG"
 
@@ -206,7 +206,7 @@ jobs:
         run: brew install googletest sqlite cmake
 
       - name: Build core apps
-        run: make bbs ax25kiss ax25client
+        run: make bbs ax25kiss ax25client basic_tool
 
       - name: Build ble_kiss_bridge
         run: make ble_kiss_bridge
@@ -219,7 +219,7 @@ jobs:
           REF="${{ github.ref_name || inputs.version }}"
           PKG="ax25-${REF}-macos-arm64"
           mkdir -p "$PKG"
-          cp bbs ax25kiss ax25client ble_kiss_bridge "$PKG"/
+          cp bbs ax25kiss ax25client basic_tool ble_kiss_bridge "$PKG"/
           cp README.md LICENSE "$PKG"/ 2>/dev/null || true
           tar czf "${PKG}.tar.gz" "$PKG"
 
@@ -231,6 +231,7 @@ jobs:
             bbs
             ax25kiss
             ax25client
+            basic_tool
             ble_kiss_bridge
           retention-days: 7
 
@@ -275,12 +276,12 @@ jobs:
           # Use the macOS system libsqlite3 (universal dylib) instead of the
           # brew arm64-only build so the cross-compile link succeeds.
           make clean
-          make bbs ax25kiss ax25client \
+          make bbs ax25kiss ax25client basic_tool \
             CXXFLAGS="-std=c++11 -O2 -Wall -Wextra -Wpedantic -arch x86_64" \
             SQLITE_FLAGS="-DHAVE_SQLITE3" \
             SQLITE_LIBS="-lsqlite3"
           mkdir -p bins/x86_64
-          cp bbs ax25kiss ax25client bins/x86_64/
+          cp bbs ax25kiss ax25client basic_tool bins/x86_64/
 
       - name: Build ble_kiss_bridge x86_64 (best-effort)
         continue-on-error: true
@@ -304,7 +305,7 @@ jobs:
           PKG="ax25-${REF}-macos-universal"
           mkdir -p "$PKG"
           chmod +x bins/arm64/* bins/x86_64/* 2>/dev/null || true
-          for BIN in bbs ax25kiss ax25client ble_kiss_bridge; do
+          for BIN in bbs ax25kiss ax25client basic_tool ble_kiss_bridge; do
             ARM="bins/arm64/$BIN"
             X86="bins/x86_64/$BIN"
             if [ -f "$ARM" ] && [ -f "$X86" ]; then

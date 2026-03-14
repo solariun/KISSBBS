@@ -88,7 +88,7 @@ BINDIR     = $(PREFIX)/bin
 
 .PHONY: all clean test install uninstall install-deps ble-deps
 
-all: bbs ax25kiss ax25client ble_kiss_bridge
+all: bbs ax25kiss ax25client basic_tool ble_kiss_bridge
 
 $(LIB_OBJ): $(LIB_SRC) ax25lib.hpp
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
@@ -104,6 +104,9 @@ ax25kiss: ax25kiss.cpp
 
 ax25client: ax25client.cpp $(LIB_OBJ) $(BASIC_OBJ) ax25lib.hpp basic.hpp
 	$(CXX) $(CXXFLAGS) $(SQLITE_FLAGS) -o $@ ax25client.cpp $(LIB_OBJ) $(BASIC_OBJ) $(SQLITE_LIBS)
+
+basic_tool: basic_tool.cpp $(BASIC_OBJ) basic.hpp
+	$(CXX) $(CXXFLAGS) $(SQLITE_FLAGS) -o $@ basic_tool.cpp $(BASIC_OBJ) $(SQLITE_LIBS)
 
 test_ax25lib: test_ax25lib.cpp $(LIB_OBJ) $(BASIC_OBJ) ax25lib.hpp basic.hpp ini.hpp
 	$(CXX) -std=c++17 $(GTEST_CFLAGS) $(SQLITE_FLAGS) \
@@ -137,7 +140,7 @@ ble_kiss_bridge: ble_kiss_bridge.cpp $(BLE_LIB)
 	@echo "Built: ble_kiss_bridge"
 
 clean:
-	rm -f $(LIB_OBJ) $(BASIC_OBJ) bbs ax25kiss ax25client test_ax25lib ble_kiss_bridge
+	rm -f $(LIB_OBJ) $(BASIC_OBJ) bbs ax25kiss ax25client basic_tool test_ax25lib ble_kiss_bridge
 
 # ── Install / Uninstall ───────────────────────────────────────────────────────
 # Installs all built binaries to $(PREFIX)/bin  (default: /usr/local/bin).
@@ -146,9 +149,10 @@ clean:
 install:
 	@echo "Installing to $(BINDIR) ..."
 	install -d $(BINDIR)
-	install -m 755 bbs      $(BINDIR)/bbs
-	install -m 755 ax25kiss $(BINDIR)/ax25kiss
+	install -m 755 bbs        $(BINDIR)/bbs
+	install -m 755 ax25kiss   $(BINDIR)/ax25kiss
 	install -m 755 ax25client $(BINDIR)/ax25client
+	install -m 755 basic_tool $(BINDIR)/basic_tool
 	@if [ -f ble_kiss_bridge ]; then \
 	    install -m 755 ble_kiss_bridge $(BINDIR)/ble_kiss_bridge; \
 	    echo "  installed: $(BINDIR)/ble_kiss_bridge"; \
@@ -156,13 +160,14 @@ install:
 	    echo "  skipped  : ble_kiss_bridge (not built — run: make ble-deps && make ble_kiss_bridge)"; \
 	fi
 	@echo "Done.  Binaries in $(BINDIR):"
-	@echo "  bbs  ax25kiss  ax25client  ble_kiss_bridge"
+	@echo "  bbs  ax25kiss  ax25client  basic_tool  ble_kiss_bridge"
 
 uninstall:
 	@echo "Removing from $(BINDIR) ..."
 	rm -f $(BINDIR)/bbs \
 	      $(BINDIR)/ax25kiss \
 	      $(BINDIR)/ax25client \
+	      $(BINDIR)/basic_tool \
 	      $(BINDIR)/ble_kiss_bridge
 	@echo "Done."
 

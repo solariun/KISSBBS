@@ -62,6 +62,8 @@ public:
     std::function<void(const std::string&)>              on_send_aprs; // SEND_APRS info$
     std::function<void(const std::string&,               // SEND_UI dest$, text$
                        const std::string&)>              on_send_ui;
+    std::function<void(int linenum,                      // trace: called before each line
+                       const std::string& src)>          on_trace;
 
     // ── Pre-defined variables ─────────────────────────────────────────────
     void set_str(const std::string& name, const std::string& val);

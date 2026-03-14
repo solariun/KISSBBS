@@ -2447,6 +2447,7 @@ int Basic::exec_stmt(Lexer& lx, int linenum) {
 }
 
 int Basic::exec_line(int linenum, const std::string& src) {
+    if (on_trace) on_trace(linenum, src);
     Lexer lx(src);
     int jmp = -1;
     for (;;) {
