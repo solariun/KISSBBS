@@ -10,8 +10,38 @@ interactive KISS terminal, and a 131-test GoogleTest suite.
 
 ---
 
+## Quick Start
+
+```bash
+# 1. Clone with submodules (SimpleBLE is vendored)
+git clone --recurse-submodules https://github.com/solariun/KISSBBS
+cd KISSBBS
+
+# 2. Install build dependencies
+#    macOS
+brew install googletest sqlite cmake
+#    Ubuntu / Debian
+sudo apt-get install libgtest-dev libsqlite3-dev cmake libdbus-1-dev pkg-config
+
+# 3. Build core apps + run tests
+make          # builds: bbs  ax25kiss  ax25client  ble_kiss_bridge
+make test     # runs 131 tests — must all pass
+
+# 4. (Optional) BLE bridge — macOS & Linux with BlueZ
+make ble-deps          # compiles SimpleBLE once from vendor/simpleble
+make ble_kiss_bridge   # links ble_kiss_bridge
+```
+
+> **First clone on an existing checkout?**
+> ```bash
+> git submodule update --init --recursive
+> ```
+
+---
+
 ## Table of Contents
 
+0. [Quick Start](#quick-start)
 1. [Background — AX.25 and KISS](#1-background--ax25-and-kiss)
 2. [Architecture Overview](#2-architecture-overview)
 3. [Object Relationship Diagram](#3-object-relationship-diagram)
