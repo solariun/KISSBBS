@@ -5,8 +5,8 @@
 A self-contained C++11 library implementing the AX.25 amateur-radio link-layer
 protocol over KISS-mode TNCs.  Includes a full-featured BBS with INI config,
 a QBASIC-style scripting engine (functions, structs, DO/LOOP, SELECT CASE, SQLite · TCP · HTTP),
-a complete TNC terminal client (`ax25client`), remote shell access, an
-interactive KISS terminal, and a 131-test GoogleTest suite.
+a complete TNC terminal client (`ax25client`), an offline BASIC debugger (`basic_tool`),
+remote shell access, an interactive KISS terminal, and a 156-test GoogleTest suite.
 
 ---
 
@@ -24,8 +24,8 @@ brew install googletest sqlite cmake
 sudo apt-get install libgtest-dev libsqlite3-dev cmake libdbus-1-dev pkg-config
 
 # 3. Build core apps + run tests
-make          # builds: bbs  ax25kiss  ax25client  ble_kiss_bridge
-make test     # runs 131 tests — must all pass
+make          # builds: bbs  ax25kiss  ax25client  basic_tool  ble_kiss_bridge
+make test     # runs 156 tests — must all pass
 
 # 4. (Optional) BLE bridge — macOS & Linux with BlueZ
 make ble-deps          # compiles SimpleBLE once from vendor/simpleble
@@ -59,6 +59,7 @@ make ble_kiss_bridge   # links ble_kiss_bridge
 15. [ax25client — TNC Terminal Client](#15-ax25client--tnc-terminal-client)
 16. [ble_kiss_monitor.py — BLE KISS Scanner & AX.25 Monitor](#16-ble_kiss_monitorpy--ble-kiss-scanner--ax25-monitor)
 17. [ble_kiss_bridge — C++ BLE KISS Bridge](#17-ble_kiss_bridge--c-ble-kiss-bridge)
+18. [basic_tool — Offline BASIC Interpreter / REPL Debugger](#18-basic_tool--offline-basic-interpreter--repl-debugger)
 
 ---
 
@@ -1059,6 +1060,12 @@ bbs.ini → welcome_script = welcome.bas
           interp.load_file("welcome.bas");
           interp.run();
 ```
+
+> **Offline testing:** Use [`basic_tool`](#18-basic_tool--offline-basic-interpreter--repl-debugger)
+> to run and debug `.bas` scripts from the command line without a TNC or BLE connection.
+> ```bash
+> basic_tool --trace -v callsign\$=W1ABC -v bbs_name\$=MyBBS welcome.bas
+> ```
 
 ### Language quick reference
 
@@ -2585,6 +2592,181 @@ If `--service` is omitted (inspect / scan modes) a generic active scan is used.
 - **Linux**: BlueZ negotiates MTU during connect; `--mtu` also acts as a cap.  BlueZ requires `libdbus-1-dev` at build time for the `SetDiscoveryFilter` integration.
 - The tool auto-detects write mode: prefers *write-without-response* when the characteristic supports it; falls back to *write-with-response*; use `--write-with-response` to override.
 - `vendor/simpleble` is excluded from git (`.gitignore`).  `make` clones and builds it automatically on first run; subsequent builds skip this step because the library file is used as a real-file Makefile target.
-- `make install` / `make uninstall` install/remove all built binaries (`bbs`, `ax25kiss`, `ax25client`, `ble_kiss_bridge`) under `$(PREFIX)` (default `/usr/local/bin`).
+- `make install` / `make uninstall` install/remove all built binaries (`bbs`, `ax25kiss`, `ax25client`, `basic_tool`, `ble_kiss_bridge`) under `$(PREFIX)` (default `/usr/local/bin`).
 - The BLE keep-alive (`--ble-ka`, default 5 s) writes a KISS null frame to reset the TNC's inactivity timer without affecting AX.25 traffic.
 - The TCP server uses a dual-stack IPv6 socket (`IPV6_V6ONLY=0`) accepting both IPv4 and IPv6 clients, with automatic IPv4-only fallback.
+
+---
+
+## 18. basic_tool — Offline BASIC Interpreter / REPL Debugger
+
+`basic_tool` is a standalone CLI that runs and debugs `.bas` BBS scripts offline —
+no TNC, no BLE, no radio link required.  It wraps the same `Basic` engine used
+by the BBS (`basic.hpp` / `basic.cpp`) and exposes it as either a one-shot
+script runner or an interactive QBASIC-style REPL.
+
+### Build
+
+```bash
+make basic_tool        # or just: make  (included in the default all target)
+```
+
+No extra dependencies beyond what the BBS already needs.
+
+### Two modes
+
+#### Run mode — execute a .bas file
+
+```bash
+basic_tool [options] <file.bas>
+```
+
+Loads the file and runs it to completion.  `PRINT` / `SEND` goes to stdout;
+`INPUT` / `RECV` reads from stdin; errors go to stderr.
+
+```bash
+# Plain run
+basic_tool welcome.bas
+
+# With pre-set variables (same as the BBS injects at runtime)
+basic_tool -v callsign\$=W1ABC -v bbs_name\$=MyBBS -v db_path\$=bbs.db welcome.bas
+
+# With line-by-line trace to stderr
+basic_tool --trace email.bas
+
+# Run then drop into the REPL editor for inspection / tweaking
+basic_tool --repl welcome.bas
+```
+
+#### REPL mode — interactive QBASIC editor
+
+```bash
+basic_tool [options]
+```
+
+Starts an interactive session with a stored program editor:
+
+```
+BASIC> 10 PRINT "Hello, " + callsign$
+BASIC> 20 FOR i = 1 TO 3
+BASIC> 30   PRINT "  line " + STR$(i)
+BASIC> 40 NEXT i
+BASIC> RUN
+Hello, W1ABC
+  line 1
+  line 2
+  line 3
+
+--- program ended OK ---
+BASIC> LIST
+10  PRINT "Hello, " + callsign$
+20  FOR i = 1 TO 3
+30    PRINT "  line " + STR$(i)
+40  NEXT i
+BASIC> SAVE /tmp/test.bas
+Saved 4 lines to /tmp/test.bas
+BASIC> QUIT
+73!
+```
+
+Lines starting with a number are stored in the editor; all other lines are
+executed immediately as one-liners:
+
+```
+BASIC> PRINT 6 * 7
+42
+BASIC> PRINT LEFT$("hello world", 5)
+hello
+```
+
+### Options
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--trace` | `-t` | Print `>> linenum: source` to stderr before each executed line |
+| `--var NAME=VAL` | `-v` | Pre-set a variable (`$` suffix → string; otherwise numeric) |
+| `--repl` | `-r` | Open REPL after running a file |
+| `--no-color` | | Disable ANSI colour output |
+| `--help` | `-h` | Print usage |
+
+### REPL commands
+
+| Command | Description |
+|---------|-------------|
+| `<linenum> <stmt>` | Add or replace a stored line |
+| `<linenum>` | Delete that line (empty body) |
+| `RUN` | Execute the stored program |
+| `LIST [from[-to]]` | List all stored lines or a range (e.g. `LIST 10-50`) |
+| `NEW` | Clear the stored program |
+| `LOAD <file>` | Load a `.bas` file into the editor |
+| `SAVE <file>` | Save the stored program to a file |
+| `HELP` / `?` | Show in-tool command reference |
+| `QUIT` / `EXIT` / `BYE` | Exit |
+
+### Pre-set variables (`--var`)
+
+The BBS injects several variables into every script before running it.  Use
+`--var` to replicate that in offline testing:
+
+```bash
+basic_tool \
+  -v callsign\$=W1ABC    \   # logged-in station (string)
+  -v bbs_name\$=TestBBS  \   # BBS name shown in banners
+  -v db_path\$=bbs.db    \   # SQLite database path
+  welcome.bas
+```
+
+Variable names are case-insensitive (`callsign$`, `CALLSIGN$`, `Callsign$` are
+all equivalent — the interpreter uppercases all identifiers internally).
+
+### Trace output format
+
+With `--trace`, each executed line is printed to **stderr** in dim cyan before
+it runs, while program output goes to **stdout** as normal.  This lets you
+redirect them independently:
+
+```bash
+# Show only output (suppress trace)
+basic_tool --trace welcome.bas 2>/dev/null
+
+# Show only trace (suppress output)
+basic_tool --trace welcome.bas 1>/dev/null
+
+# Save both to separate files
+basic_tool --trace welcome.bas >output.txt 2>trace.txt
+```
+
+Trace format:
+```
+  >> 1: PRINT "Welcome, " + callsign$
+  >> 2: FOR i = 1 TO 3
+  >> 3:   PRINT "  item " + STR$(i)
+  >> 4: NEXT i
+  ...
+```
+
+### on_trace callback
+
+The trace hook is exposed as a public callback on `Basic` so host applications
+can integrate it directly:
+
+```cpp
+Basic interp;
+interp.on_trace = [](int linenum, const std::string& src) {
+    std::cerr << "[" << linenum << "] " << src << "\n";
+};
+interp.load_file("script.bas");
+interp.run();
+```
+
+### Notes
+
+- `SEND` / `RECV` work exactly as in the BBS; `SEND` writes to stdout, `RECV`
+  reads a line from stdin.  `INPUT` also reads from stdin.
+- `DBOPEN` / `DBEXEC` / `DBQUERY` work with real SQLite files — use a test
+  database to avoid touching production data.
+- `HTTPGET`, `SOCKOPEN`, `EXEC` work normally; be mindful of network/shell
+  access in automated test pipelines.
+- `SEND_APRS` and `SEND_UI` do nothing by default (callbacks are not set);
+  assign `on_send_aprs` / `on_send_ui` if you need them.
+- Ctrl-C calls `interrupt()` on the running interpreter for a clean stop.
