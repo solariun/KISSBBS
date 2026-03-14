@@ -47,6 +47,8 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 
+#include "ax25dump.hpp"
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Global state
 // ─────────────────────────────────────────────────────────────────────────────
@@ -84,6 +86,9 @@ static std::string lower(std::string s) {
 static std::string hr(char c = '-', int n = 68) {
     return std::string(n, c);
 }
+
+static const char* DIM()   { static bool t = ::isatty(STDOUT_FILENO); return t ? "\033[2m" : ""; }
+static const char* RESET() { static bool t = ::isatty(STDOUT_FILENO); return t ? "\033[0m" : ""; }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // KISS decoder
@@ -131,6 +136,7 @@ struct Ax25Info {
     std::string dest, src, type, ctrl_hex, summary;
     std::vector<std::string> via;
     std::vector<uint8_t> info;
+    uint8_t ctrl_byte = 0;   // raw control byte for ctrl_detail()
 };
 
 static std::pair<std::string, bool> decode_addr(const uint8_t* d, int off) {
@@ -171,6 +177,7 @@ static Ax25Info decode_ax25(const uint8_t* d, size_t n) {
     }
 
     uint8_t ctrl = d[off];
+    r.ctrl_byte = ctrl;
     {
         std::ostringstream ss;
         ss << "0x" << std::hex << std::setw(2) << std::setfill('0') << (int)ctrl;
@@ -178,11 +185,15 @@ static Ax25Info decode_ax25(const uint8_t* d, size_t n) {
     }
     bool pf = (ctrl & 0x10) != 0;
 
+    // Build via string for use in all frame type summaries
+    std::string via_pfx;
+    for (auto& v : r.via) via_pfx += " via " + v;
+
     if ((ctrl & 0x01) == 0) {                               // I-frame
         int ns = (ctrl >> 1) & 7, nr = (ctrl >> 5) & 7;
         r.type = "I";
         if ((size_t)(off + 2) < n) r.info = {d + off + 2, d + n};
-        r.summary = src + " -> " + dest + "  [I(NS=" + std::to_string(ns)
+        r.summary = src + " -> " + dest + via_pfx + "  [I(NS=" + std::to_string(ns)
                   + ",NR=" + std::to_string(nr) + (pf ? "P" : "") + ")]";
     } else if ((ctrl & 0x03) == 0x01) {                    // S-frame
         int nr = (ctrl >> 5) & 7;
@@ -191,7 +202,7 @@ static Ax25Info decode_ax25(const uint8_t* d, size_t n) {
         const char* stype = "S?";
         for (auto& [v, n] : st) if ((ctrl & 0xF) == v) { stype = n; break; }
         r.type = stype;
-        r.summary = src + " -> " + dest + "  [" + stype
+        r.summary = src + " -> " + dest + via_pfx + "  [" + stype
                   + "(NR=" + std::to_string(nr) + (pf ? "P/F" : "") + ")]";
     } else {                                                 // U-frame
         uint8_t base = ctrl & ~0x10u;
@@ -213,22 +224,15 @@ static Ax25Info decode_ax25(const uint8_t* d, size_t n) {
     return r;
 }
 
-static void print_ax25(const Ax25Info& ax) {
-    std::cout << "  +- " << ax.summary << "\n";
-    std::cout << "  |  ctrl=" << ax.ctrl_hex << "  type=" << ax.type << "\n";
-    if (!ax.via.empty()) {
-        std::cout << "  |  via:";
-        for (auto& v : ax.via) std::cout << " " << v;
-        std::cout << "\n";
-    }
-    if (!ax.info.empty()) {
-        std::string txt(ax.info.begin(), ax.info.end());
-        for (auto& c : txt)
-            if ((unsigned char)c < 0x20 || (unsigned char)c > 0x7E) c = '.';
-        std::cout << "  +- info (" << ax.info.size() << "b): \"" << txt << "\"\n";
-    } else {
-        std::cout << "  +-\n";
-    }
+// Print the rich frame detail block (ctrl + hexdump-C) in dim.
+// payload is the raw AX.25 frame bytes (after KISS unwrapping).
+static void print_frame_detail(const Ax25Info& ax,
+                                const uint8_t* payload, size_t payload_len)
+{
+    std::cout << DIM()
+              << "           " << ctrl_detail(ax.ctrl_byte, payload_len) << "\n"
+              << hex_dump(payload, payload_len, "           ")
+              << RESET();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -839,8 +843,9 @@ static void do_bridge(const BridgeConfig& cfg) {
         }
     }
 
-    KissDecoder decoder;
-    std::mutex mx;                        // protects decoder + stdout + tcp_clients
+    KissDecoder decoder;      // RX: BLE → PTY/TCP  (persistent across BLE notify chunks)
+    KissDecoder tx_decoder;  // TX: PTY/TCP → BLE  (persistent across read() calls)
+    std::mutex mx;           // protects both decoders + stdout + tcp_clients
     std::atomic<int> rx_frames{0}, tx_frames{0};
 
     // Disconnect callback
@@ -884,25 +889,27 @@ static void do_bridge(const BridgeConfig& cfg) {
                 std::string t = ts();
                 auto frames = decoder.feed(d, n);
 
-                std::cout << "\n" << hr() << "\n";
-                std::cout << "[" << t << "]  <- BLE->PTY  " << n
-                          << " bytes  raw: " << hexdump(d, n) << "\n";
-
                 if (frames.empty()) {
-                    std::cout << "  (buffering - no complete KISS frame yet)\n";
+                    // Fragment: no complete KISS frame yet — show raw in dim
+                    std::cout << DIM() << "[" << t << "]  <- BLE  "
+                              << n << " bytes (buffering)\n"
+                              << hex_dump(d, n, "           ") << RESET();
                 }
                 for (auto& kf : frames) {
-                    const char* cmd_names[] = {"DATA","TXDELAY","P","SLOTTIME",
-                                               "TXTAIL","FULLDUPLEX","SETHW","?","?",
-                                               "?","?","?","?","?","?","RETURN"};
-                    std::cout << "  KISS  port=" << kf.port
-                              << "  type=" << kf.type
-                              << "(" << cmd_names[kf.type & 0xF] << ")\n";
-                    std::cout << "  AX25  payload (" << kf.payload.size() << "b): "
-                              << hexdump(kf.payload.data(), kf.payload.size()) << "\n";
                     if (kf.type == 0 && !kf.payload.empty()) {
                         auto ax = decode_ax25(kf.payload.data(), kf.payload.size());
-                        print_ax25(ax);
+                        std::cout << "[" << t << "]  <- BLE  " << ax.summary << "\n";
+                        print_frame_detail(ax, kf.payload.data(), kf.payload.size());
+                    } else {
+                        static constexpr const char* cmd_names[] =
+                            {"DATA","TXDELAY","P","SLOTTIME","TXTAIL",
+                             "FULLDUPLEX","SETHW","?","?","?","?","?","?","?","?","RETURN"};
+                        std::cout << DIM() << "[" << t << "]  <- BLE  KISS cmd="
+                                  << cmd_names[kf.type & 0xF] << " port=" << kf.port
+                                  << "  " << kf.payload.size() << " bytes\n";
+                        if (!kf.payload.empty())
+                            std::cout << hex_dump(kf.payload.data(), kf.payload.size(), "           ");
+                        std::cout << RESET();
                     }
                 }
                 std::cout.flush();
@@ -1027,9 +1034,30 @@ static void do_bridge(const BridgeConfig& cfg) {
             ++tx_frames;
             if (cfg.monitor) {
                 std::lock_guard<std::mutex> lk(mx);
-                std::cout << "\n" << hr() << "\n";
-                std::cout << "[" << ts() << "]  -> TCP->BLE  " << tn
-                          << " bytes  raw: " << hexdump(tbuf, tn) << "\n";
+                std::string t = ts();
+                auto frames = tx_decoder.feed(tbuf, (size_t)tn);
+                if (frames.empty()) {
+                    std::cout << DIM() << "[" << t << "]  -> TCP  "
+                              << tn << " bytes (buffering)\n"
+                              << hex_dump(tbuf, (size_t)tn, "           ") << RESET();
+                }
+                for (auto& kf : frames) {
+                    if (kf.type == 0 && !kf.payload.empty()) {
+                        auto ax = decode_ax25(kf.payload.data(), kf.payload.size());
+                        std::cout << "[" << t << "]  -> TCP  " << ax.summary << "\n";
+                        print_frame_detail(ax, kf.payload.data(), kf.payload.size());
+                    } else {
+                        static constexpr const char* cmd_names[] =
+                            {"DATA","TXDELAY","P","SLOTTIME","TXTAIL",
+                             "FULLDUPLEX","SETHW","?","?","?","?","?","?","?","?","RETURN"};
+                        std::cout << DIM() << "[" << t << "]  -> TCP  KISS cmd="
+                                  << cmd_names[kf.type & 0xF] << " port=" << kf.port
+                                  << "  " << kf.payload.size() << " bytes\n";
+                        if (!kf.payload.empty())
+                            std::cout << hex_dump(kf.payload.data(), kf.payload.size(), "           ");
+                        std::cout << RESET();
+                    }
+                }
                 std::cout.flush();
             }
             try {
@@ -1051,9 +1079,30 @@ static void do_bridge(const BridgeConfig& cfg) {
         ++tx_frames;
         if (cfg.monitor) {
             std::lock_guard<std::mutex> lk(mx);
-            std::cout << "\n" << hr() << "\n";
-            std::cout << "[" << ts() << "]  -> PTY->BLE  " << nr
-                      << " bytes  raw: " << hexdump(buf, nr) << "\n";
+            std::string t = ts();
+            auto frames = tx_decoder.feed(buf, (size_t)nr);
+            if (frames.empty()) {
+                std::cout << DIM() << "[" << t << "]  -> PTY  "
+                          << nr << " bytes (buffering)\n"
+                          << hex_dump(buf, (size_t)nr, "           ") << RESET();
+            }
+            for (auto& kf : frames) {
+                if (kf.type == 0 && !kf.payload.empty()) {
+                    auto ax = decode_ax25(kf.payload.data(), kf.payload.size());
+                    std::cout << "[" << t << "]  -> PTY  " << ax.summary << "\n";
+                    print_frame_detail(ax, kf.payload.data(), kf.payload.size());
+                } else {
+                    static constexpr const char* cmd_names[] =
+                        {"DATA","TXDELAY","P","SLOTTIME","TXTAIL",
+                         "FULLDUPLEX","SETHW","?","?","?","?","?","?","?","?","RETURN"};
+                    std::cout << DIM() << "[" << t << "]  -> PTY  KISS cmd="
+                              << cmd_names[kf.type & 0xF] << " port=" << kf.port
+                              << "  " << kf.payload.size() << " bytes\n";
+                    if (!kf.payload.empty())
+                        std::cout << hex_dump(kf.payload.data(), kf.payload.size(), "           ");
+                    std::cout << RESET();
+                }
+            }
             std::cout.flush();
         }
 
