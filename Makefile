@@ -116,13 +116,10 @@ test: test_ax25lib
 # ble-deps: phony convenience alias — the real work is the library file target.
 ble-deps: $(BLE_LIB)
 
-# Build SimpleBLE only when the library doesn't exist yet.
+# Build SimpleBLE from the vendored submodule.
+# Source is always available after: git submodule update --init --recursive
+# Library is rebuilt only when the .a file is absent.
 $(BLE_LIB):
-	@if [ ! -d $(SIMPLEBLE_DIR)/simpleble/include/simpleble ]; then \
-	    echo "Cloning SimpleBLE..."; \
-	    git clone --depth 1 --recurse-submodules --shallow-submodules \
-	        https://github.com/OpenBluetoothToolbox/SimpleBLE $(SIMPLEBLE_DIR); \
-	fi
 	@echo "Building SimpleBLE (static)..."
 	cmake -S $(SIMPLEBLE_DIR)/simpleble \
 	      -B $(SIMPLEBLE_DIR)/build \

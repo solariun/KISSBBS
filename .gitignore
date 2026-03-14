@@ -21,4 +21,6 @@ lib/
 # Dependency files
 *.d
 *.o
-vendor/
+
+# SimpleBLE build output (submodule source stays tracked)
+vendor/simpleble/build/

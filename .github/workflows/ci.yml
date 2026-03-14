@@ -30,6 +30,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       # ── Linux deps ─────────────────────────────────────────────────────────
       - name: Install dependencies (Ubuntu)
@@ -71,6 +73,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install cmake
         run: brew install cmake
