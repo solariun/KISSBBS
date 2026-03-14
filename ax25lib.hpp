@@ -265,15 +265,29 @@ struct Config {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Kiss — serial port + KISS framing layer
+// Kiss — KISS framing layer (transport-agnostic)
+//
+// Two ways to open:
+//   kiss.open(device, baud)   — opens a serial port internally
+//   kiss.open_fd(fd)          — uses any already-open fd (TCP socket,
+//                               PTY master, pipe, …)
 // ─────────────────────────────────────────────────────────────────────────────
 class Kiss {
 public:
-    // Open the serial device.  Call set_on_frame() before poll().
+    // Open a serial device (classic KISS TNC).
     bool open(const std::string& device, int baud);
+
+    // Open with any pre-existing file descriptor (TCP socket, PTY master, …).
+    // The fd is set non-blocking and is owned by Kiss (closed on close()).
+    bool open_fd(int fd);
+
     void close();
-    bool is_open() const { return serial_.is_open(); }
-    int  serial_fd() const { return serial_.fd(); }
+
+    bool is_open()    const { return serial_.is_open() || ext_fd_ >= 0; }
+
+    // Returns the active I/O file descriptor (ext_fd if set, else serial fd).
+    int  fd()         const { return ext_fd_ >= 0 ? ext_fd_ : serial_.fd(); }
+    int  serial_fd()  const { return fd(); }   // backward-compat alias
 
     // Register callback (called from poll() for each received AX.25 payload)
     void set_on_frame(std::function<void(std::vector<uint8_t>)> cb) {
@@ -288,22 +302,24 @@ public:
     void set_persistence(int val);
     void set_slottime(int ms);
 
-    // Read from serial; fires on_frame for each complete AX.25 payload
+    // Read from transport; fires on_frame for each complete AX.25 payload
     void poll();
 
     // ── Test / simulation hooks ───────────────────────────────────────────
-    // Simulate receiving an AX.25 payload (as if read from serial).
-    // Useful in unit tests — no real serial port needed.
+    // Simulate receiving an AX.25 payload (as if read from the transport).
     void test_inject(const std::vector<uint8_t>& ax25) {
         if (on_frame_) on_frame_(ax25);
     }
 
-    // If set, send_frame() calls this hook instead of the real serial write.
-    // Useful for loopback / simulation tests.
+    // If set, send_frame() calls this hook instead of the real I/O write.
     std::function<bool(const std::vector<uint8_t>&)> on_send_hook;
 
 private:
-    Serial       serial_;
+    // Write helper: writes to ext_fd_ if set, otherwise to serial_.
+    bool raw_write(const uint8_t* data, std::size_t len);
+
+    Serial        serial_;
+    int           ext_fd_ = -1;   // externally-provided fd (TCP, PTY, …)
     kiss::Decoder decoder_;
     std::function<void(std::vector<uint8_t>)> on_frame_;
 };
@@ -334,10 +350,15 @@ public:
     }
     void disconnect();
 
-    State       state()     const { return state_; }
-    bool        connected() const { return state_ == State::CONNECTED; }
-    const Addr& remote()    const { return remote_; }
-    const Addr& local()     const { return local_; }
+    State       state()       const { return state_; }
+    bool        connected()   const { return state_ == State::CONNECTED; }
+    const Addr& remote()      const { return remote_; }
+    const Addr& local()       const { return local_; }
+
+    // True when there are frames in-flight (sent but not yet acked) or
+    // queued to send.  Keep-alive should NOT inject data while this is true
+    // — the AX.25 retransmit logic already takes care of the link.
+    bool has_unacked() const { return !unacked_.empty() || !send_buf_.empty(); }
 
     // Tick timers — called by Router::poll()
     void tick(Millis now);

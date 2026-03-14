@@ -65,9 +65,14 @@
 #include <string>
 #include <vector>
 
+#include <arpa/inet.h>
 #include <getopt.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <signal.h>
 #include <sys/select.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 using namespace ax25;
@@ -134,11 +139,45 @@ struct AppCfg {
     int         ka_ms    = 60000;         // app-level keep-alive interval ms (0=off)
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// TCP connect helper (returns socket fd, or -1 on error)
+// ─────────────────────────────────────────────────────────────────────────────
+static int tcp_connect_fd(const std::string& host, const std::string& port_str) {
+    struct addrinfo hints{}, *res = nullptr;
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res) != 0 || !res)
+        return -1;
+    int s = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (s < 0) { ::freeaddrinfo(res); return -1; }
+    if (::connect(s, res->ai_addr, res->ai_addrlen) < 0) {
+        ::close(s); ::freeaddrinfo(res); return -1;
+    }
+    ::freeaddrinfo(res);
+    int one = 1;
+    ::setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    return s;
+}
+
+// Detect "host:port" format — true if the string does NOT start with '/'
+// and the substring after the last ':' is all digits.
+static bool is_tcp_address(const std::string& s, std::string& host, std::string& port) {
+    if (s.empty() || s[0] == '/') return false;   // unix path
+    auto p = s.rfind(':');
+    if (p == std::string::npos) return false;
+    std::string pt = s.substr(p + 1);
+    if (pt.empty()) return false;
+    for (char c : pt) if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+    host = s.substr(0, p);
+    port = pt;
+    return true;
+}
+
 static void print_usage(const char* prog) {
     std::cerr
         << "AX.25 / KISS TNC client — " << BOLD() << prog << RESET() << "\n\n"
         << "Usage:\n"
-        << "  " << prog << " [OPTIONS] <serial_device>\n\n"
+        << "  " << prog << " [OPTIONS] <device|host:port>\n\n"
         << "Modes  (-m):\n"
         << "  connect    AX.25 connected session with ARQ  (default when -r given)\n"
         << "  monitor    Passive frame monitor (no TX)\n"
@@ -148,7 +187,7 @@ static void print_usage(const char* prog) {
         << "  -r REMOTE    Remote station (connect mode)\n"
         << "  -m MODE      connect | monitor | unproto\n"
         << "  -d DEST      Destination callsign for unproto (default: CQ)\n"
-        << "  -b BAUD      Baud rate (default: 9600)\n"
+        << "  -b BAUD      Baud rate for serial (default: 9600; ignored for TCP)\n"
         << "  -p PATH      Digipeater path, comma-separated\n"
         << "  -M           Enable monitor output in connect/unproto mode\n"
         << "  -w WIN       Window size 1-7 (default: 3)\n"
@@ -216,7 +255,7 @@ static bool parse_args(int argc, char* argv[], AppCfg& cfg) {
     if (optind < argc) cfg.device = argv[optind];
 
     if (cfg.device.empty()) {
-        std::cerr << "Error: serial device required.\n";
+        std::cerr << "Error: device or host:port required.\n";
         print_usage(argv[0]); return false;
     }
     if (cfg.ax25.mycall.empty()) {
@@ -262,7 +301,7 @@ static void show_status(const AppCfg& cfg, const Connection* conn, const Stats& 
     std::cout << "\n" << BOLD() << "=== Status ===" << RESET() << "\n"
               << "  Local  : " << cfg.ax25.mycall.str() << "\n"
               << "  Remote : " << cfg.remote << "\n"
-              << "  Device : " << cfg.device << "  @" << cfg.baud << " baud\n"
+              << "  Device : " << cfg.device << "\n"
               << "  State  : ";
     if (conn) {
         switch (conn->state()) {
@@ -320,11 +359,10 @@ static int run_monitor(Kiss& kiss, Router& router) {
 
     while (!g_quit) {
         router.poll();
-        // Small sleep avoids busy-polling the serial port
         struct timeval tv{ 0, 20000 }; // 20 ms
         fd_set fds; FD_ZERO(&fds);
-        FD_SET(kiss.serial_fd(), &fds);
-        select(kiss.serial_fd() + 1, &fds, nullptr, nullptr, &tv);
+        FD_SET(kiss.fd(), &fds);
+        select(kiss.fd() + 1, &fds, nullptr, nullptr, &tv);
     }
 
     std::cout << "\nMonitor stopped.\n";
@@ -337,7 +375,7 @@ static int run_monitor(Kiss& kiss, Router& router) {
 static int run_unproto(Kiss& kiss, Router& router, const AppCfg& cfg) {
     Stats st;
     Addr  dest   = Addr::make(cfg.dest);
-    int   ser_fd = kiss.serial_fd();
+    int   ser_fd = kiss.fd();
 
     // Show all received UI frames
     router.on_ui = [&](const Frame& f) {
@@ -391,7 +429,7 @@ static int run_unproto(Kiss& kiss, Router& router, const AppCfg& cfg) {
 // ── CONNECT MODE ─────────────────────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
 static int run_connect(Kiss& kiss, Router& router, const AppCfg& cfg) {
-    int         ser_fd    = kiss.serial_fd();
+    int         ser_fd    = kiss.fd();
     Stats       st;
     Connection* conn      = nullptr;
     bool        done      = false;
@@ -542,7 +580,10 @@ static int run_connect(Kiss& kiss, Router& router, const AppCfg& cfg) {
         router.poll();
 
         // ── App-level keep-alive ─────────────────────────────────────────────
-        if (cfg.ka_ms > 0 && conn && conn->connected()) {
+        // Only inject a CR when the AX.25 window is empty: if there are
+        // unacked frames the retransmit machinery already keeps the link
+        // alive, and adding new I-frames would worsen a REJ situation.
+        if (cfg.ka_ms > 0 && conn && conn->connected() && !conn->has_unacked()) {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                                Clock::now() - last_tx).count();
             if (elapsed >= cfg.ka_ms) {
@@ -731,12 +772,27 @@ int main(int argc, char* argv[]) {
     sigaction(SIGTERM, &sa, nullptr);
     signal(SIGPIPE, SIG_IGN);
 
-    // ── Open KISS / serial ───────────────────────────────────────────────────
+    // ── Open KISS transport (serial or TCP) ─────────────────────────────────
     Kiss kiss;
-    if (!kiss.open(cfg.device, cfg.baud)) {
-        std::cerr << "Error: cannot open " << cfg.device << ": "
-                  << strerror(errno) << "\n";
-        return 1;
+    {
+        std::string tcp_host, tcp_port;
+        if (is_tcp_address(cfg.device, tcp_host, tcp_port)) {
+            // TCP mode: connect socket, hand fd to Kiss
+            int tcp_fd = tcp_connect_fd(tcp_host, tcp_port);
+            if (tcp_fd < 0) {
+                std::cerr << "Error: cannot connect to " << cfg.device << ": "
+                          << strerror(errno) << "\n";
+                return 1;
+            }
+            kiss.open_fd(tcp_fd);
+        } else {
+            // Serial mode
+            if (!kiss.open(cfg.device, cfg.baud)) {
+                std::cerr << "Error: cannot open " << cfg.device << ": "
+                          << strerror(errno) << "\n";
+                return 1;
+            }
+        }
     }
     kiss.set_txdelay(cfg.txdelay);
     kiss.set_persistence(cfg.ax25.persist);
@@ -745,10 +801,15 @@ int main(int argc, char* argv[]) {
     Router router(kiss, cfg.ax25);
 
     // ── Banner ───────────────────────────────────────────────────────────────
-    std::cout << BOLD() << "ax25client" << RESET()
-              << "  " << cfg.ax25.mycall.str()
-              << "  " << cfg.device << " @" << cfg.baud << " baud"
-              << "\n";
+    {
+        std::string tcp_host, tcp_port;
+        bool is_tcp = is_tcp_address(cfg.device, tcp_host, tcp_port);
+        std::cout << BOLD() << "ax25client" << RESET()
+                  << "  " << cfg.ax25.mycall.str()
+                  << "  " << cfg.device
+                  << (is_tcp ? "  TCP" : ("  @" + std::to_string(cfg.baud) + " baud"))
+                  << "\n";
+    }
 
     switch (cfg.mode) {
     case Mode::Monitor: return run_monitor(kiss, router);

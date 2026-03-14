@@ -297,31 +297,65 @@ std::string Frame::format() const {
 bool Kiss::open(const std::string& device, int baud) {
     return serial_.open(device, baud);
 }
-void Kiss::close() { serial_.close(); }
+
+bool Kiss::open_fd(int fd) {
+    ext_fd_ = fd;
+    // Ensure non-blocking I/O (same contract as Serial::open)
+    int fl = ::fcntl(ext_fd_, F_GETFL, 0);
+    if (fl >= 0) ::fcntl(ext_fd_, F_SETFL, fl | O_NONBLOCK);
+    return true;
+}
+
+void Kiss::close() {
+    serial_.close();
+    if (ext_fd_ >= 0) { ::close(ext_fd_); ext_fd_ = -1; }
+}
+
+bool Kiss::raw_write(const uint8_t* data, std::size_t len) {
+    if (ext_fd_ >= 0) {
+        // Simple loop to handle partial writes (TCP etc.)
+        std::size_t sent = 0;
+        while (sent < len) {
+            ssize_t n = ::write(ext_fd_, data + sent, len - sent);
+            if (n < 0) return errno == EAGAIN || errno == EWOULDBLOCK
+                              ? sent == len : false;
+            sent += static_cast<std::size_t>(n);
+        }
+        return true;
+    }
+    return serial_.write(data, len) == (ssize_t)len;
+}
 
 bool Kiss::send_frame(const std::vector<uint8_t>& ax25) {
     if (on_send_hook) return on_send_hook(ax25);   // test / simulation path
     auto f = kiss::encode(ax25);
-    return serial_.write(f.data(), f.size()) == (ssize_t)f.size();
+    return raw_write(f.data(), f.size());
 }
 
 void Kiss::set_txdelay(int ms) {
     std::vector<uint8_t> d{static_cast<uint8_t>(ms / 10)};
-    auto f = kiss::encode(d, kiss::Cmd::TxDelay); serial_.write(f.data(), f.size());
+    auto f = kiss::encode(d, kiss::Cmd::TxDelay);
+    raw_write(f.data(), f.size());
 }
 void Kiss::set_persistence(int val) {
     std::vector<uint8_t> d{static_cast<uint8_t>(val)};
-    auto f = kiss::encode(d, kiss::Cmd::Persistence); serial_.write(f.data(), f.size());
+    auto f = kiss::encode(d, kiss::Cmd::Persistence);
+    raw_write(f.data(), f.size());
 }
 void Kiss::set_slottime(int ms) {
     std::vector<uint8_t> d{static_cast<uint8_t>(ms / 10)};
-    auto f = kiss::encode(d, kiss::Cmd::SlotTime); serial_.write(f.data(), f.size());
+    auto f = kiss::encode(d, kiss::Cmd::SlotTime);
+    raw_write(f.data(), f.size());
 }
 
 void Kiss::poll() {
-    if (!serial_.is_open()) return;
+    if (!is_open()) return;
     uint8_t buf[512];
-    ssize_t n = serial_.read(buf, sizeof(buf));
+    ssize_t n;
+    if (ext_fd_ >= 0)
+        n = ::read(ext_fd_, buf, sizeof(buf));
+    else
+        n = serial_.read(buf, sizeof(buf));
     if (n <= 0) return;
     auto frames = decoder_.feed(buf, static_cast<std::size_t>(n));
     for (auto& kf : frames)

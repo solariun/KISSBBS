@@ -40,7 +40,12 @@
 #include <thread>
 #include <unistd.h>
 #include <vector>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/select.h>
+#include <sys/socket.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Global state
@@ -662,12 +667,14 @@ static void do_inspect(const std::string& address) {
 // ─────────────────────────────────────────────────────────────────────────────
 struct BridgeConfig {
     std::string address, service_uuid, write_uuid, read_uuid;
-    std::string link_path = "/tmp/kiss"; // symlink → PTY slave (empty = no link)
-    int    mtu       = 517;
-    double timeout   = 10.0;
-    int    ble_ka_ms = 5000;            // BLE keep-alive interval ms (0=off)
-    bool   monitor   = false;           // print per-frame hex + AX.25 decode
-    std::optional<bool> force_response; // nullopt = auto-detect
+    std::string link_path   = "/tmp/kiss"; // symlink → PTY slave (empty = no link)
+    int    mtu              = 517;
+    double timeout          = 10.0;
+    int    ble_ka_ms        = 5000;        // BLE keep-alive interval ms (0=off)
+    int    server_port      = 0;           // TCP server port (0 = disabled)
+    std::string server_host;               // bind address (empty = all interfaces)
+    bool   monitor          = false;       // print per-frame hex + AX.25 decode
+    std::optional<bool> force_response;    // nullopt = auto-detect
 };
 
 static void do_bridge(const BridgeConfig& cfg) {
@@ -751,8 +758,69 @@ static void do_bridge(const BridgeConfig& cfg) {
     std::cout << "\n";
     std::cout.flush();
 
+    // ── TCP server (optional) ──────────────────────────────────────────────
+    int server_sock = -1;
+    std::vector<int> tcp_clients;         // protected by mx
+
+    if (cfg.server_port > 0) {
+        // Try IPv6 dual-stack first, fall back to IPv4
+        server_sock = ::socket(AF_INET6, SOCK_STREAM, 0);
+        bool bound = false;
+
+        if (server_sock >= 0) {
+            int one = 1;
+            ::setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+            int off = 0;
+            ::setsockopt(server_sock, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
+
+            struct sockaddr_in6 a{};
+            a.sin6_family = AF_INET6;
+            a.sin6_port   = htons(static_cast<uint16_t>(cfg.server_port));
+            if (cfg.server_host.empty()) {
+                a.sin6_addr = in6addr_any;
+            } else {
+                if (::inet_pton(AF_INET6, cfg.server_host.c_str(), &a.sin6_addr) <= 0)
+                    a.sin6_addr = in6addr_any;   // fallback if host is IPv4
+            }
+            bound = (::bind(server_sock, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0);
+        }
+
+        if (!bound) {
+            if (server_sock >= 0) { ::close(server_sock); server_sock = -1; }
+            server_sock = ::socket(AF_INET, SOCK_STREAM, 0);
+            if (server_sock >= 0) {
+                int one = 1;
+                ::setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+                struct sockaddr_in a{};
+                a.sin_family = AF_INET;
+                a.sin_port   = htons(static_cast<uint16_t>(cfg.server_port));
+                if (cfg.server_host.empty()) {
+                    a.sin_addr.s_addr = INADDR_ANY;
+                } else {
+                    ::inet_pton(AF_INET, cfg.server_host.c_str(), &a.sin_addr);
+                }
+                bound = (::bind(server_sock, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0);
+                if (!bound) { ::close(server_sock); server_sock = -1; }
+            }
+        }
+
+        if (server_sock >= 0 && bound) {
+            ::listen(server_sock, 8);
+            // Non-blocking accept
+            int fl = ::fcntl(server_sock, F_GETFL, 0);
+            ::fcntl(server_sock, F_SETFL, fl | O_NONBLOCK);
+            std::cout << "  TCP server : "
+                      << (cfg.server_host.empty() ? "*" : cfg.server_host)
+                      << ":" << cfg.server_port << "\n";
+        } else {
+            std::cerr << "Warning: cannot start TCP server on port "
+                      << cfg.server_port << ": " << strerror(errno) << "\n";
+            server_sock = -1;
+        }
+    }
+
     KissDecoder decoder;
-    std::mutex mx;                        // protects decoder + stdout
+    std::mutex mx;                        // protects decoder + stdout + tcp_clients
     std::atomic<int> rx_frames{0}, tx_frames{0};
 
     // Disconnect callback
@@ -763,7 +831,7 @@ static void do_bridge(const BridgeConfig& cfg) {
         g_running = false;
     });
 
-    // ── BLE -> PTY ────────────────────────────────────────────────────────
+    // ── BLE -> PTY + TCP clients ─────────────────────────────────────────
     peripheral.notify(cfg.service_uuid, cfg.read_uuid,
         [&](SimpleBLE::ByteArray raw) {
             const uint8_t* d = raw.data();
@@ -772,8 +840,24 @@ static void do_bridge(const BridgeConfig& cfg) {
             std::lock_guard<std::mutex> lk(mx);
 
             // Write raw bytes to PTY master
-            if (write(master_fd, d, n) < 0)
+            if (::write(master_fd, d, n) < 0)
                 std::cerr << "  PTY write error: " << strerror(errno) << "\n";
+
+            // Fan-out to all TCP clients; remove dead ones
+            std::vector<int> dead;
+            for (int fd : tcp_clients) {
+                if (::write(fd, d, n) < 0) dead.push_back(fd);
+            }
+            for (int fd : dead) {
+                tcp_clients.erase(
+                    std::remove(tcp_clients.begin(), tcp_clients.end(), fd),
+                    tcp_clients.end());
+                ::close(fd);
+                if (cfg.monitor)
+                    std::cout << "[" << ts() << "]  TCP client fd=" << fd
+                              << " removed (write error)\n";
+            }
+
             ++rx_frames;
 
             if (cfg.monitor) {
@@ -826,18 +910,34 @@ static void do_bridge(const BridgeConfig& cfg) {
     };
 
     while (g_running && peripheral.is_connected()) {
+        // ── Build fd_set: PTY + TCP server + TCP clients ──────────────────
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(master_fd, &rfds);
-        struct timeval tv{0, 100000};  // 100 ms
+        int max_fd = master_fd;
 
-        bool got_data = select(master_fd + 1, &rfds, nullptr, nullptr, &tv) > 0;
+        if (server_sock >= 0) {
+            FD_SET(server_sock, &rfds);
+            max_fd = std::max(max_fd, server_sock);
+        }
+
+        // Snapshot client list to avoid holding mx during select()
+        std::vector<int> clients_snap;
+        {
+            std::lock_guard<std::mutex> lk(mx);
+            clients_snap = tcp_clients;
+        }
+        for (int fd : clients_snap) {
+            FD_SET(fd, &rfds);
+            max_fd = std::max(max_fd, fd);
+        }
+
+        struct timeval tv{0, 100000};  // 100 ms
+        bool got_any = select(max_fd + 1, &rfds, nullptr, nullptr, &tv) > 0;
 
         // ── BLE keep-alive: send KISS null (0xC0 0xC0) when idle ─────────
-        // Two consecutive FEND bytes are a valid KISS no-op: every KISS
-        // decoder discards the resulting empty frame, so the TNC's AX.25
-        // stack is unaffected — but the BLE write resets the TNC's own
-        // inactivity timer, preventing it from dropping the link.
+        // Two consecutive FENDs are a valid KISS no-op every KISS decoder
+        // discards, but the BLE write resets the TNC's inactivity timer.
         if (cfg.ble_ka_ms > 0) {
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                                SteadyClock::now() - last_ble_write).count();
@@ -855,10 +955,74 @@ static void do_bridge(const BridgeConfig& cfg) {
             }
         }
 
-        if (!got_data) continue;
+        if (!got_any) continue;
+
+        // ── Accept new TCP client ─────────────────────────────────────────
+        if (server_sock >= 0 && FD_ISSET(server_sock, &rfds)) {
+            int cli = ::accept(server_sock, nullptr, nullptr);
+            if (cli >= 0) {
+                int one = 1;
+                ::setsockopt(cli, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+                int fl = ::fcntl(cli, F_GETFL, 0);
+                ::fcntl(cli, F_SETFL, fl | O_NONBLOCK);
+                {
+                    std::lock_guard<std::mutex> lk(mx);
+                    tcp_clients.push_back(cli);
+                    if (cfg.monitor) {
+                        std::cout << "\n" << hr() << "\n";
+                        std::cout << "[" << ts() << "]  TCP client connected  fd="
+                                  << cli << "\n";
+                        std::cout.flush();
+                    }
+                }
+            }
+        }
+
+        // ── Read from TCP clients → BLE ───────────────────────────────────
+        for (int fd : clients_snap) {
+            if (!FD_ISSET(fd, &rfds)) continue;
+            uint8_t tbuf[4096];
+            ssize_t tn = ::read(fd, tbuf, sizeof(tbuf));
+            if (tn <= 0) {
+                // Client disconnected or error
+                ::close(fd);
+                {
+                    std::lock_guard<std::mutex> lk(mx);
+                    tcp_clients.erase(
+                        std::remove(tcp_clients.begin(), tcp_clients.end(), fd),
+                        tcp_clients.end());
+                    if (cfg.monitor) {
+                        std::cout << "\n" << hr() << "\n";
+                        std::cout << "[" << ts() << "]  TCP client disconnected  fd="
+                                  << fd << "\n";
+                        std::cout.flush();
+                    }
+                }
+                continue;
+            }
+
+            ++tx_frames;
+            if (cfg.monitor) {
+                std::lock_guard<std::mutex> lk(mx);
+                std::cout << "\n" << hr() << "\n";
+                std::cout << "[" << ts() << "]  -> TCP->BLE  " << tn
+                          << " bytes  raw: " << hexdump(tbuf, tn) << "\n";
+                std::cout.flush();
+            }
+            try {
+                ble_write(tbuf, (int)tn);
+            } catch (const std::exception& e) {
+                std::lock_guard<std::mutex> lk(mx);
+                std::cout << "  BLE write error (TCP->BLE): " << e.what() << "\n";
+                std::cout.flush();
+            }
+        }
+
+        // ── Read from PTY → BLE ───────────────────────────────────────────
+        if (!FD_ISSET(master_fd, &rfds)) continue;
 
         uint8_t buf[4096];
-        ssize_t nr = read(master_fd, buf, sizeof(buf));
+        ssize_t nr = ::read(master_fd, buf, sizeof(buf));
         if (nr <= 0) continue;
 
         ++tx_frames;
@@ -874,7 +1038,7 @@ static void do_bridge(const BridgeConfig& cfg) {
             ble_write(buf, (int)nr);
         } catch (const std::exception& e) {
             std::lock_guard<std::mutex> lk(mx);
-            std::cout << "  BLE write error: " << e.what() << "\n";
+            std::cout << "  BLE write error (PTY->BLE): " << e.what() << "\n";
             std::cout.flush();
         }
     }
@@ -882,8 +1046,17 @@ static void do_bridge(const BridgeConfig& cfg) {
     // ── Cleanup ───────────────────────────────────────────────────────────
     try { peripheral.unsubscribe(cfg.service_uuid, cfg.read_uuid); } catch (...) {}
     try { peripheral.disconnect(); } catch (...) {}
-    close(master_fd);
-    close(slave_fd);
+
+    // Close TCP server and all clients
+    if (server_sock >= 0) { ::close(server_sock); }
+    {
+        std::lock_guard<std::mutex> lk(mx);
+        for (int fd : tcp_clients) ::close(fd);
+        tcp_clients.clear();
+    }
+
+    ::close(master_fd);
+    ::close(slave_fd);
     if (!cfg.link_path.empty()) ::unlink(cfg.link_path.c_str());
 
     std::cout << "\n" << hr() << "\n";
@@ -911,6 +1084,9 @@ static void usage(const char* prog) {
         "  --ble-ka <secs>        BLE keep-alive: send KISS null every N seconds\n"
         "                         when idle to prevent TNC inactivity disconnect\n"
         "                         Default: 5  (use 0 to disable)\n"
+        "  --server-port <port>   Start a TCP server; KISS data is bridged between\n"
+        "                         BLE and all connected TCP clients simultaneously\n"
+        "  --server-host <host>   Bind TCP server to this address (default: all)\n"
         "  --monitor              Print per-frame hex + AX.25 decode to stdout\n"
         "                         (silent by default — only connection info shown)\n\n"
         "Examples:\n"
@@ -942,6 +1118,8 @@ int main(int argc, char* argv[]) {
         else if (a == "--mtu"               && i+1 < argc) { cfg.mtu          = std::stoi(argv[++i]); }
         else if (a == "--timeout"           && i+1 < argc) { timeout          = std::stod(argv[++i]); }
         else if (a == "--ble-ka"            && i+1 < argc) { cfg.ble_ka_ms    = (int)(std::stod(argv[++i]) * 1000); }
+        else if (a == "--server-port"       && i+1 < argc) { cfg.server_port  = std::stoi(argv[++i]); }
+        else if (a == "--server-host"       && i+1 < argc) { cfg.server_host  = argv[++i]; }
         else if (a == "--write-with-response")             { cfg.force_response = true; }
         else if (a == "--monitor")                         { cfg.monitor        = true; }
         else if (a == "--link"              && i+1 < argc) { cfg.link_path      = argv[++i]; }
