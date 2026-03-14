@@ -2139,10 +2139,12 @@ Full table: [APRS Symbol Reference](http://www.aprs.org/symbols.html)
 
 ## 15. ax25client — TNC Terminal Client
 
-`ax25client` is a professional interactive TNC terminal that demonstrates the
-full `ax25lib` API.  It ships three operating modes selectable at runtime and
-requires no code changes to switch between connected ARQ sessions, passive
-monitoring, or connectionless UI frames.
+`ax25client` is an interactive TNC terminal that provides a modern command-line
+interface to AX.25 packet radio.  By default it starts in **TNC mode** — an
+interactive command prompt where you can set your callsign, connect to remote
+stations, monitor the channel, and accept incoming connections, all without
+restarting.  It also supports three legacy single-purpose modes (`connect`,
+`monitor`, `unproto`) for backward compatibility or scripting.
 
 ### Build
 
@@ -2152,38 +2154,94 @@ make ax25client
 make
 ```
 
-### Modes
+### Operating modes
 
 | Mode | Flag | Description |
 |------|------|-------------|
-| `connect` | `-m connect` | AX.25 connected session with Go-Back-N ARQ (default when `-r` is given) |
+| **TNC** | *(default)* | Interactive command prompt — connect, disconnect, change callsign, accept incoming connections, all in one session |
+| `connect` | `-m connect` | AX.25 connected session with Go-Back-N ARQ (legacy single-shot mode) |
 | `monitor` | `-m monitor` | Passive receive-only — decodes and prints every AX.25 frame, no TX |
 | `unproto` | `-m unproto` | Connectionless UI frames — type a line, it goes out over the air |
 
 ### Quick start
 
 ```bash
-# Monitor everything on the channel (serial TNC)
-ax25client -c W1AW -m monitor /dev/ttyUSB0
+# Start TNC terminal (default callsign N0CALL, set it inside with MYC)
+ax25client /dev/ttyUSB0
 
-# Connect to a BBS (serial TNC)
+# Start TNC terminal with your callsign
+ax25client -c W1AW /dev/ttyUSB0
+
+# Start TNC and auto-connect to a remote station
 ax25client -c W1AW -r W1BBS-1 /dev/ttyUSB0
 
-# Connect to a BBS via TCP (ble_kiss_bridge --server-port, or any KISS-over-TCP TNC)
-ax25client -c W1AW -r W1BBS-1 localhost:8001
+# Start TNC via TCP (ble_kiss_bridge --server-port, or any KISS-over-TCP TNC)
+ax25client -c W1AW localhost:8001
 
-# Connect via digipeater path
-ax25client -c W1AW -r N0CALL -p WIDE1-1,WIDE2-1 /dev/ttyUSB0
+# Legacy: monitor mode
+ax25client -c W1AW -m monitor /dev/ttyUSB0
 
-# Wait for ANY incoming connection (passive)
-ax25client -c W1AW -r ANY /dev/ttyUSB0
-
-# Send UI frames (unproto) with monitor on
+# Legacy: unproto mode
 ax25client -c W1AW -m unproto -d CQ -M /dev/ttyUSB0
-
-# APRS monitoring (UI frames are printed regardless of destination)
-ax25client -c W1AW -m monitor -b 1200 /dev/ttyUSB0
 ```
+
+### TNC command reference
+
+In TNC mode you interact through a command prompt (`[W1AW cmd]>`).  Commands
+are case-insensitive and can be abbreviated to the shortest unambiguous prefix:
+
+| Command | Description |
+|---------|-------------|
+| `C <call>` / `CONNECT <call>` | Connect to a remote station |
+| `D` / `DISCONNECT` | Disconnect current session |
+| `L` / `LISTEN` | Show listen status (always listening for incoming connections) |
+| `MYC <call>` / `MYCALL <call>` | Change local callsign at runtime |
+| `MON [ON\|OFF]` / `MONITOR` | Toggle frame monitor on/off |
+| `UNPROTO [ON\|OFF]` | Toggle UI frame display |
+| `STATUS` / `S` | Show link status and traffic statistics |
+| `WIN <n>` | Set window size 1–7 |
+| `T1 <ms>` | Set T1 retransmit timer (ms) |
+| `T3 <ms>` | Set T3 keep-alive timer (ms) |
+| `MTU <bytes>` | Set I-frame MTU |
+| `TXDELAY <ms>` | Set KISS TX delay |
+| `SCRIPT <file>` | Run BASIC script (must be connected) |
+| `HELP` / `H` / `?` | Show command help |
+| `QUIT` / `Q` / `BYE` / `EXIT` | Exit the TNC |
+
+### Incoming connections
+
+The TNC always listens for incoming SABM requests addressed to your callsign.
+When a remote station connects, the TNC announces the connection and
+automatically switches to data mode:
+
+```
+*** Incoming connection from W1ABC ***
+[data mode — type ~. to disconnect, ~? for help]
+```
+
+This enables peer-to-peer communication without a dedicated BBS — any two
+stations running `ax25client` can connect to each other.
+
+### Data mode and tilde escapes
+
+When connected (either by issuing `C <call>` or by accepting an incoming
+connection), the TNC enters **data mode**: everything you type is transmitted
+as I-frames.  Tilde escapes are processed when `~` is the first character
+of a line:
+
+| Escape | Action |
+|--------|--------|
+| `~.` / `~d` | Disconnect, return to command mode |
+| `~s` | Show connection status and traffic statistics |
+| `~x <file>` | Run a BASIC script on the live connection |
+| `~~` | Send a literal `~` |
+| `~?` | Show tilde-escape help |
+
+### Double Ctrl+C to exit
+
+A single Ctrl+C prints a warning; pressing Ctrl+C again within 5 seconds
+disconnects and exits.  `SIGTERM` always exits immediately.  This prevents
+accidental disconnection while allowing a quick escape when needed.
 
 ### Full option reference
 
@@ -2196,9 +2254,9 @@ ax25client [OPTIONS] <device|host:port>
                 Baud rate (-b) is ignored for TCP connections.
 
 Options:
-  -c CALL       My callsign (required)
-  -r REMOTE     Remote station (connect mode; use ANY to accept inbound)
-  -m MODE       Operating mode: connect | monitor | unproto  (default: connect)
+  -c CALL       My callsign (default: N0CALL; can be changed at runtime with MYC)
+  -r REMOTE     Auto-connect to this station on startup (TNC mode) or remote station (connect mode)
+  -m MODE       Operating mode: connect | monitor | unproto  (default: TNC interactive)
   -d DEST       Destination for unproto UI frames (default: CQ)
   -b BAUD       Baud rate for serial (default: 9600; ignored for TCP)
   -p PATH       Digipeater path, comma-separated (e.g. WIDE1-1,WIDE2-1)
@@ -2210,23 +2268,10 @@ Options:
   --mtu BYTES   I-frame MTU bytes (default: 128)
   --txdelay MS  KISS TX delay ms (default: 300)
   --pid HEX     PID for UI frames (default: F0)
-  -s FILE       BASIC script to run after connecting (connect mode only)
+  -s FILE       BASIC script to run after connecting
   --ka SECS     App-level keep-alive: send CR every N seconds while idle (default: 60, 0=off)
   -h            Show help
 ```
-
-### Tilde-escape commands (connect mode)
-
-Tilde escapes are processed only when `~` is the very first character of a line:
-
-| Escape | Action |
-|--------|--------|
-| `~.` | Disconnect and exit |
-| `~s` | Show connection status and traffic statistics |
-| `~m` | Toggle frame monitor on/off |
-| `~r` | Redraw current line (useful after unsolicited data scrolled the screen) |
-| `~x FILE` | Run a BASIC script on the live connection; return to interactive mode when done |
-| `~?` | Show tilde-escape help |
 
 ### Line terminator convention
 
@@ -2245,8 +2290,8 @@ any client regardless of its line-ending convention.
 
 ### Self-callsign guard
 
-`ax25client` rejects a connect request when `-r REMOTE` matches the local
-callsign (`-c CALL`):
+`ax25client` rejects a connect request when the remote callsign matches the
+local callsign:
 
 ```
 $ ax25client -c W1AW -r W1AW /dev/ttyUSB0
@@ -2289,18 +2334,23 @@ The `~s` status display reports the configured interval (e.g. `KA=60s`) or
 > already-stuck retransmit window, which was the root cause of sessions
 > disconnecting via N2 exhaustion after a burst of REJ frames.
 
-### Session transcript example
+### TNC session transcript example
 
 ```
-# Serial TNC
-ax25client  W1AW  /dev/ttyUSB0 @9600 baud
-Connecting to W1BBS-1 from W1AW...
+$ ax25client -c W1AW /dev/ttyUSB0
 
-# TCP (e.g. ble_kiss_bridge --server-port 8001)
-ax25client  W1AW  localhost:8001  TCP
-Connecting to W1BBS-1 from W1AW...
+KISSBBS TNC — W1AW @ /dev/ttyUSB0 @9600 baud
+Type HELP for commands, double Ctrl+C to exit.
+Listening on W1AW for incoming connections.
+
+[W1AW cmd]> MYC W1AW-5
+Callsign set to W1AW-5
+
+[W1AW-5 cmd]> C W1BBS-1
+Connecting to W1BBS-1...
 
 *** Connected to W1BBS-1 ***
+[data mode — type ~. to disconnect, ~? for help]
 
 < Welcome to ExampleBBS!
 < Commands: H=Help  BYE=Quit
@@ -2310,24 +2360,25 @@ Connecting to W1BBS-1 from W1AW...
 < BYE  Disconnect
 
 ~s
-
 === Status ===
-  Local  : W1AW
+  Local  : W1AW-5
   Remote : W1BBS-1
-  Device : /dev/ttyUSB0  @9600 baud  (or TCP  localhost:8001)
   State  : CONNECTED
   Frames RX : 3  (87 data bytes)
   Frames TX : 2  (3 data bytes)
-  Window    : 3  MTU=128  T1=3000ms  T3=60000ms
+  Window    : 3  MTU=128  T1=3000ms  T3=60000ms  KA=60s
 
 > BYE
 < 73 de ExampleBBS
 
+~.
 *** Disconnected ***
 
-Session summary:
-  TX: 3 frames / 6 bytes
-  RX: 5 frames / 145 bytes
+[W1AW-5 cmd]> MON ON
+Monitor: ON
+
+[W1AW-5 cmd]> QUIT
+73!
 ```
 
 ### Monitor mode output
@@ -2340,25 +2391,28 @@ Session summary:
 [14:32:06] >> W1BBS>N0CALL [RR] Nr=1
 ```
 
-### BASIC scripting mode (`-s`)
+### BASIC scripting
 
-Pass `-s script.bas` (or `--script script.bas`) to run a BASIC script
-automatically after the AX.25 connection is established.  The script
-replaces the interactive keyboard loop — perfect for automating BBS logins,
-beaconing sequences, remote probing, or any other session that follows a
-predictable exchange.
+Pass `-s script.bas` to run a BASIC script automatically after connecting,
+or use the `SCRIPT` command / `~x` escape from within a live session:
 
 ```bash
-# Automate a BBS session with a script
+# Auto-run after connect
 ax25client -c W1AW -r W1BBS-1 -s login.bas /dev/ttyUSB0
+
+# From the TNC command prompt (while connected)
+[W1AW cmd]> SCRIPT login.bas
+
+# From data mode (while connected)
+~x login.bas
 ```
 
 #### Pre-defined variables
 
 | Variable | Value |
 |---|---|
-| `remote$` | Remote station callsign (same as `-r` argument) |
-| `local$` | My callsign (same as `-c` argument) |
+| `remote$` | Remote station callsign |
+| `local$` | My callsign |
 | `callsign$` | Alias for `remote$` (matches BBS script convention) |
 
 #### I/O wiring
@@ -2403,7 +2457,7 @@ END
 - Check the return value of `RECV` — an empty string means timeout, not
   necessarily a disconnect.
 - The script exits cleanly at `END` or when it falls off the bottom;
-  `ax25client` then disconnects automatically.
+  `ax25client` then returns to command mode (TNC) or disconnects (legacy connect mode).
 
 ---
 
@@ -2673,6 +2727,24 @@ and miss devices that are already known to the adapter from a previous session.
 
 If `--service` is omitted (inspect / scan modes) a generic active scan is used.
 
+### Automatic BLE reconnection
+
+`ble_kiss_bridge` is designed to run as a long-lived background service.  When
+the BLE connection drops (TNC power-cycled, out of range, BLE timeout, etc.),
+the bridge automatically attempts to reconnect:
+
+- **Up to 10 reconnection attempts** with a 5-second pause between each
+- **PTY and TCP server stay alive** across disconnects — clients like
+  `ax25client` keep their file descriptors open and resume transparently
+  once the BLE link is re-established
+- The symlink (e.g. `/tmp/kissble`) remains valid throughout
+- A `[BLE disconnected]` / `[BLE reconnecting (attempt N/10)]` message is
+  printed to the console so you can monitor the process
+
+This means you can start `ble_kiss_bridge` once (e.g. from a systemd unit or
+launchd plist) and it will survive intermittent BLE disruptions without losing
+the serial or TCP endpoints that downstream applications depend on.
+
 ### Notes
 
 - **macOS**: CoreBluetooth handles MTU negotiation automatically; `--mtu` acts as a chunk-size cap.
@@ -2712,11 +2784,11 @@ Loads the file and runs it to completion.  `PRINT` / `SEND` goes to stdout;
 `INPUT` / `RECV` reads from stdin; errors go to stderr.
 
 ```bash
-# Plain run
+# Plain run (uses built-in default variables — CALLSIGN$=N0CALL, BBS_NAME$=MyBBS, etc.)
 basic_tool welcome.bas
 
-# With pre-set variables (same as the BBS injects at runtime)
-basic_tool -v callsign\$=W1ABC -v bbs_name\$=MyBBS -v db_path\$=bbs.db welcome.bas
+# Override specific variables
+basic_tool -v callsign\$=W1ABC -v bbs_name\$=TestBBS welcome.bas
 
 # With line-by-line trace to stderr
 basic_tool --trace email.bas
@@ -2794,17 +2866,39 @@ hello
 | `HELP` / `?` | Show in-tool command reference |
 | `QUIT` / `EXIT` / `BYE` | Exit |
 
-### Pre-set variables (`--var`)
+### Default variables
 
-The BBS injects several variables into every script before running it.  Use
-`--var` to replicate that in offline testing:
+`basic_tool` automatically pre-fills the standard BBS script variables so that
+scripts run without requiring `-v` flags for every variable.  These defaults
+are applied first; any explicit `-v` flags override them:
+
+| Variable | Default value | Purpose |
+|----------|---------------|---------|
+| `CALLSIGN$` | `N0CALL` | Logged-in station callsign |
+| `LOCAL$` | `N0CALL` | Local station callsign |
+| `REMOTE$` | *(empty)* | Remote station callsign |
+| `BBS_NAME$` | `MyBBS` | BBS name shown in banners |
+| `DB_PATH$` | `bbs.db` | SQLite database path |
+
+This means you can run BBS scripts with zero configuration:
 
 ```bash
-basic_tool \
-  -v callsign\$=W1ABC    \   # logged-in station (string)
-  -v bbs_name\$=TestBBS  \   # BBS name shown in banners
-  -v db_path\$=bbs.db    \   # SQLite database path
-  welcome.bas
+# Uses all defaults — just works
+basic_tool welcome.bas
+
+# Override only what you need
+basic_tool -v callsign\$=W1ABC welcome.bas
+
+# Full override (same as before)
+basic_tool -v callsign\$=W1ABC -v bbs_name\$=TestBBS -v db_path\$=test.db welcome.bas
+```
+
+### Pre-set variables (`--var`)
+
+Use `--var` to set or override any scalar variable before the script runs:
+
+```bash
+basic_tool -v callsign\$=W1ABC -v bbs_name\$=TestBBS welcome.bas
 ```
 
 Variable names are case-insensitive (`callsign$`, `CALLSIGN$`, `Callsign$` are
