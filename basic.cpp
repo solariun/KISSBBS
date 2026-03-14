@@ -418,6 +418,12 @@ bool Basic::load_file(const std::string& path) {
 // First pass: collect FUNCTION/SUB/TYPE/CONST definitions
 // ─────────────────────────────────────────────────────────────────────────────
 void Basic::first_pass() {
+    // Reset tables so this is safe to call more than once (e.g. run() after
+    // a sequence of add_line() calls that bypassed load_string).
+    procs_.clear();
+    types_.clear();
+    consts_.clear();
+
     // Local lambda-style helper to parse "(a AS type, b$, ...)"
     auto parse_params = [&](Lexer& lx) -> std::vector<std::string> {
         std::vector<std::string> params;
@@ -676,7 +682,7 @@ int Basic::find_next_if_branch(int from_line, int& kind) {
             Lexer lx2(src); lx2.eat_kw("END");
             if (lx2.eat_kw("IF")) {
                 --depth;
-                if (depth == 0) { kind=2; return it->first; }
+                if (depth == 0) { kind=2; auto n=it;++n; return n!=program_.end()?n->first:0; }
             }
         }
     }
@@ -2510,6 +2516,9 @@ int Basic::exec_line(int linenum, const std::string& src) {
 bool Basic::run() {
     interrupted_ = false;
     if (program_.empty()) return true;
+    // Re-run first_pass so that programs built via add_line() (REPL editor)
+    // always have their SUB/FUNCTION/CONST/TYPE tables populated.
+    first_pass();
 
     auto it = program_.begin();
     while (it != program_.end() && !interrupted_) {
@@ -2562,31 +2571,71 @@ bool Basic::sock_recv_line(int fd, std::string& out, int timeout_ms) {
     }
 }
 
-std::string Basic::http_get(const std::string& url) {
-    std::string host, path; int port=80;
-    std::string u=url;
-    if (u.size()>=7 && u.substr(0,7)=="http://")  u=u.substr(7);
-    else if (u.size()>=8 && u.substr(0,8)=="https://") u=u.substr(8);
-    auto slash=u.find('/');
-    if (slash==std::string::npos) { host=u; path="/"; }
-    else { host=u.substr(0,slash); path=u.substr(slash); }
-    auto colon=host.find(':');
-    if (colon!=std::string::npos) {
-        try { port=std::stoi(host.substr(colon+1)); } catch(...) {}
-        host=host.substr(0,colon);
+std::string Basic::http_get(const std::string& url_in) {
+    std::string url = url_in;
+    for (int redir = 0; redir < 5; ++redir) {
+        // ── HTTPS: delegate to curl ────────────────────────────────────────
+        if (url.size() >= 8 && url.substr(0, 8) == "https://") {
+            // Escape single quotes in URL so the shell argument is safe.
+            std::string safe;
+            for (char c : url) { if (c == '\'') safe += "'\\''"; else safe += c; }
+            return exec_cmd("curl -s --max-time 10 '" + safe + "'", 15000, false);
+        }
+
+        // ── Plain HTTP via raw TCP ─────────────────────────────────────────
+        std::string host, path; int port = 80;
+        std::string u = url;
+        if (u.size() >= 7 && u.substr(0, 7) == "http://") u = u.substr(7);
+        auto slash = u.find('/');
+        if (slash == std::string::npos) { host = u; path = "/"; }
+        else { host = u.substr(0, slash); path = u.substr(slash); }
+        auto colon = host.find(':');
+        if (colon != std::string::npos) {
+            try { port = std::stoi(host.substr(colon + 1)); } catch (...) {}
+            host = host.substr(0, colon);
+        }
+        int fd = tcp_connect(host, port);
+        if (fd < 0) return "[ERROR: connect failed]";
+        std::string req = "GET " + path + " HTTP/1.0\r\nHost: " + host +
+                          "\r\nConnection: close\r\n\r\n";
+        ::write(fd, req.data(), req.size());
+        std::string resp; char buf[1024]; ssize_t n;
+        while ((n = ::read(fd, buf, sizeof(buf))) > 0) resp.append(buf, n);
+        ::close(fd);
+
+        // ── Parse HTTP status code ─────────────────────────────────────────
+        int code = 0;
+        auto crlf0 = resp.find("\r\n");
+        if (crlf0 != std::string::npos) {
+            auto sp = resp.find(' ');
+            if (sp != std::string::npos && sp < crlf0)
+                try { code = std::stoi(resp.substr(sp + 1)); } catch (...) {}
+        }
+
+        // ── Follow redirect? ───────────────────────────────────────────────
+        if (code >= 300 && code < 400) {
+            // Case-insensitive search for Location header
+            std::string lower = resp;
+            for (auto& c : lower) c = (char)std::tolower((unsigned char)c);
+            auto loc = lower.find("\r\nlocation:");
+            if (loc != std::string::npos) {
+                std::size_t vs = resp.find(':', loc + 2) + 1;
+                while (vs < resp.size() && (resp[vs] == ' ' || resp[vs] == '\t')) ++vs;
+                auto ve = resp.find("\r\n", vs);
+                if (ve == std::string::npos) ve = resp.size();
+                url = resp.substr(vs, ve - vs);
+                continue;
+            }
+        }
+
+        // ── Return body ───────────────────────────────────────────────────
+        auto hend = resp.find("\r\n\r\n");
+        if (hend != std::string::npos) return resp.substr(hend + 4);
+        auto hend2 = resp.find("\n\n");
+        if (hend2 != std::string::npos) return resp.substr(hend2 + 2);
+        return resp;
     }
-    int fd=tcp_connect(host,port);
-    if (fd<0) return "[ERROR: connect failed]";
-    std::string req="GET "+path+" HTTP/1.0\r\nHost: "+host+"\r\nConnection: close\r\n\r\n";
-    ::write(fd, req.data(), req.size());
-    std::string resp; char buf[1024]; ssize_t n;
-    while ((n=::read(fd, buf, sizeof(buf)))>0) resp.append(buf,n);
-    ::close(fd);
-    auto hend=resp.find("\r\n\r\n");
-    if (hend!=std::string::npos) return resp.substr(hend+4);
-    auto hend2=resp.find("\n\n");
-    if (hend2!=std::string::npos) return resp.substr(hend2+2);
-    return resp;
+    return "[ERROR: too many redirects]";
 }
 
 std::string Basic::exec_cmd(const std::string& cmd, int timeout_ms, bool capture_stderr) {
