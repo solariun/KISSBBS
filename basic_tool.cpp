@@ -395,6 +395,7 @@ static void repl_help() {
               << "    NEW                  Clear the stored program\n"
               << "    LOAD <file>          Load a .bas file\n"
               << "    SAVE <file>          Save stored program to file\n"
+              << "    INCLUDE <file>       Merge a .bas file into the stored program\n"
               << "\n"
               << "  " << BOLD() << "Direct execution:" << RESET() << "\n"
               << "    Any line without a line number that is not a command is run\n"
@@ -409,9 +410,10 @@ static void repl_help() {
 // =============================================================================
 // Interactive REPL
 // =============================================================================
-static void repl(const std::vector<VarSpec>&   vars,
-                 const std::vector<MapSpec>&    maps,
-                 const std::vector<QueueSpec>&  queues,
+static void repl(const std::vector<VarSpec>&        vars,
+                 const std::vector<MapSpec>&         maps,
+                 const std::vector<QueueSpec>&       queues,
+                 const std::vector<std::string>&     includes,
                  bool trace,
                  ReplProgram* preloaded = nullptr) {
     ReplProgram prog;
@@ -502,6 +504,32 @@ static void repl(const std::vector<VarSpec>&   vars,
             prompt(); continue;
         }
 
+        if (cmd1 == "INCLUDE") {
+            if (rest_args.empty()) {
+                std::cerr << YELLOW() << "Usage: INCLUDE <file>" << RESET() << "\n";
+                prompt(); continue;
+            }
+            std::ifstream f(rest_args);
+            if (!f.is_open()) {
+                std::cerr << RED() << "Error: cannot open '" << rest_args
+                          << "'" << RESET() << "\n";
+                prompt(); continue;
+            }
+            int count = 0;
+            std::string fline;
+            while (std::getline(f, fline)) {
+                while (!fline.empty() && (fline.back()=='\r'||fline.back()=='\n'))
+                    fline.pop_back();
+                if (fline.empty()) continue;
+                prog.add(prog.next_auto, fline);
+                prog.next_auto++;
+                ++count;
+            }
+            std::cout << GREEN() << "Included " << count
+                      << " lines from " << rest_args << RESET() << "\n";
+            prompt(); continue;
+        }
+
         if (cmd1 == "SAVE") {
             if (rest_args.empty()) {
                 std::cerr << YELLOW() << "Usage: SAVE <file>" << RESET() << "\n";
@@ -527,6 +555,12 @@ static void repl(const std::vector<VarSpec>&   vars,
             Basic b;
             g_interp = &b;
             prog.load_into(b);           // calls b.clear() internally
+            for (const auto& inc : includes) {
+                if (!b.include_file(inc)) {
+                    std::cerr << RED() << "Error: cannot include '" << inc
+                              << "'" << RESET() << "\n";
+                }
+            }
             apply_default_vars(b, vars); // defaults first
             apply_vars(b, vars);         // user overrides
             apply_maps(b, maps);
@@ -574,6 +608,7 @@ static void usage(const char* prog) {
         "Options:\n"
         "  -t, --trace            Print each executed line to stderr\n"
         "  -v, --var NAME=VAL     Pre-set a variable ($ suffix → string; else numeric)\n"
+        "  -i, --include FILE     Include a .bas file (merged before main script; repeatable)\n"
         "  --map  NAME:KEY=VAL    Inject a string entry into a MAP\n"
         "  --mapn NAME:KEY=NUM    Inject a numeric entry into a MAP\n"
         "  --queue  NAME:VAL      Push a string onto a QUEUE\n"
@@ -586,11 +621,13 @@ static void usage(const char* prog) {
         "  <linenum> <stmt>     Add/replace stored line\n"
         "  RUN / LIST / NEW     Execute / list / clear program\n"
         "  LOAD <f> / SAVE <f>  Load / save .bas file\n"
+        "  INCLUDE <f>          Merge a .bas file into the program\n"
         "  QUIT / EXIT          Exit\n"
         "\n"
         "Examples:\n"
         "  " << prog << " welcome.bas\n"
         "  " << prog << " --trace -v callsign\\$=W1ABC -v bbs_name\\$=MyBBS welcome.bas\n"
+        "  " << prog << " -i helpers.bas -i lib.bas main.bas\n"
         "  " << prog << " --map cfg:host=localhost --map cfg:port=8080 script.bas\n"
         "  " << prog << " --mapn scores:W1ABC=100 --queue msgs:hello script.bas\n"
         "  " << prog << "\n";
@@ -603,9 +640,10 @@ int main(int argc, char** argv) {
     bool        trace      = false;
     bool        open_repl  = false;
     std::string file;
-    std::vector<VarSpec>   vars;
-    std::vector<MapSpec>   maps;
-    std::vector<QueueSpec> queues;
+    std::vector<VarSpec>      vars;
+    std::vector<MapSpec>      maps;
+    std::vector<QueueSpec>    queues;
+    std::vector<std::string>  includes;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -619,6 +657,8 @@ int main(int argc, char** argv) {
         } else if (a == "-h" || a == "--help") {
             usage(argv[0]);
             return 0;
+        } else if ((a == "-i" || a == "--include") && i + 1 < argc) {
+            includes.push_back(argv[++i]);
         } else if ((a == "-v" || a == "--var") && i + 1 < argc) {
             vars.push_back(parse_var_spec(argv[++i]));
         } else if (a == "--map" && i + 1 < argc) {
@@ -661,6 +701,15 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        // Include additional .bas files (merged into the same program)
+        for (const auto& inc : includes) {
+            if (!b.include_file(inc)) {
+                std::cerr << RED() << "Error: cannot include '" << inc << "'"
+                          << RESET() << "\n";
+                return 1;
+            }
+        }
+
         // Apply data after load_file: load_file calls clear() internally,
         // which would wipe any variables / maps / queues set before loading.
         apply_default_vars(b, vars); // defaults first, user -v flags override
@@ -678,11 +727,11 @@ int main(int argc, char** argv) {
             ReplProgram prog;
             std::string errmsg;
             load_bas_file(prog, file, errmsg);
-            repl(vars, maps, queues, trace, &prog);
+            repl(vars, maps, queues, includes, trace, &prog);
         }
     } else {
         // ── Interactive REPL mode ─────────────────────────────────────────
-        repl(vars, maps, queues, trace);
+        repl(vars, maps, queues, includes, trace);
     }
 
     return 0;

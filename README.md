@@ -1154,6 +1154,53 @@ interp.map_set("system:limits", "max_msgs", 100.0);
 interp.queue_push("rx:frames",  raw_frame_hex);
 ```
 
+### INCLUDE — file inclusion
+
+The `INCLUDE` directive merges another `.bas` file into the current program at
+load time.  This is a preprocessor-style directive — the included code becomes
+part of `program_` before `first_pass()` runs, so `SUB`/`FUNCTION`/`TYPE`/`CONST`
+definitions from included files are available to the main script.
+
+```basic
+' main.bas
+INCLUDE "helpers.bas"
+INCLUDE "lib/utils.bas"
+
+Greet "World"
+PRINT "Result: " + STR$(Add(2, 3))
+END
+```
+
+```basic
+' helpers.bas
+SUB Greet(name$)
+    PRINT "Hello, " + name$ + "!"
+END SUB
+
+FUNCTION Add(a, b)
+    Add = a + b
+END FUNCTION
+```
+
+**Features:**
+- Case-insensitive (`INCLUDE`, `Include`, `include` all work)
+- Circular includes are silently skipped (each file is included at most once)
+- Depth limit of 16 to prevent runaway recursion
+- Included files can themselves `INCLUDE` other files
+
+**C++ API:**
+
+```cpp
+Basic interp;
+interp.load_file("main.bas");          // clears + loads (handles INCLUDE directives)
+interp.include_file("extra_lib.bas");  // merges into existing program (no clear)
+interp.include_string("SUB Foo()\nPRINT \"hi\"\nEND SUB\n");  // merge from string
+interp.run();
+```
+
+> `include_file()` / `include_string()` append to the existing program without
+> calling `clear()` — call them after `load_file()` / `load_string()`.
+
 ### Language quick reference
 
 #### Variables and types
@@ -2844,6 +2891,7 @@ hello
 |------|-------|-------------|
 | `--trace` | `-t` | Print `>> linenum: source` to stderr before each executed line |
 | `--var NAME=VAL` | `-v` | Pre-set a scalar variable (`$` suffix → string; otherwise numeric) |
+| `--include FILE` | `-i` | Include a `.bas` file (merged before main script; repeatable) |
 | `--map NAME:KEY=VAL` | | Inject a **string** entry into a named MAP |
 | `--mapn NAME:KEY=NUM` | | Inject a **numeric** entry into a named MAP |
 | `--queue NAME:VAL` | | Push a **string** value onto a named QUEUE |
@@ -2863,6 +2911,7 @@ hello
 | `NEW` | Clear the stored program |
 | `LOAD <file>` | Load a `.bas` file into the editor |
 | `SAVE <file>` | Save the stored program to a file |
+| `INCLUDE <file>` | Merge a `.bas` file into the stored program |
 | `HELP` / `?` | Show in-tool command reference |
 | `QUIT` / `EXIT` / `BYE` | Exit |
 

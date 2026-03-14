@@ -91,6 +91,8 @@ public:
     // ── Program loading ───────────────────────────────────────────────────
     bool load_file(const std::string& path);       // load from file
     void load_string(const std::string& source);   // load from string
+    bool include_file(const std::string& path);    // merge another .bas into current program
+    void include_string(const std::string& src);   // merge source string into current program
     void add_line(int linenum, const std::string& text);
     void clear();
 
@@ -254,6 +256,10 @@ private:
     // Returns next line to jump to (0=END, -1=advance, >0=jump)
     int exec_line(int linenum, const std::string& src);
     int exec_stmt(Lexer& lx, int linenum);
+
+    // ── Program loading internals ─────────────────────────────────────────
+    void parse_lines(const std::string& source,
+                     std::set<std::string>& included, int depth);
 
     // ── Program scanning ──────────────────────────────────────────────────
     void first_pass();            // collect labels, procs, types, consts

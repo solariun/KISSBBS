@@ -317,6 +317,7 @@ void Basic::clear() {
 
 void Basic::add_line(int linenum, const std::string& text) {
     program_[linenum] = text;
+    if (linenum >= next_auto_line_) next_auto_line_ = linenum + 1;
 }
 
 // Strip inline comment (after ' that is not inside a string)
@@ -329,11 +330,16 @@ static std::string strip_comment(const std::string& line) {
     return line;
 }
 
-void Basic::load_string(const std::string& source) {
-    clear();
+// ─────────────────────────────────────────────────────────────────────────────
+// parse_lines — internal line parser shared by load_string / include_string.
+// Appends to program_ starting from next_auto_line_.
+// Handles INCLUDE "file.bas" directives recursively (depth-limited).
+// ─────────────────────────────────────────────────────────────────────────────
+void Basic::parse_lines(const std::string& source,
+                        std::set<std::string>& included, int depth) {
+    static const int MAX_INCLUDE_DEPTH = 16;
     std::istringstream ss(source);
     std::string line;
-    int auto_ln = 1;
     while (std::getline(ss, line)) {
         while (!line.empty() && (line.back()=='\r'||line.back()=='\n')) line.pop_back();
         if (line.empty()) continue;
@@ -343,8 +349,7 @@ void Basic::load_string(const std::string& source) {
 
         // Skip pure comment lines
         if (line[p] == '\'') {
-            // Still need a slot so labels/procs can reference it
-            program_[auto_ln++] = "";
+            program_[next_auto_line_++] = "";
             continue;
         }
         // Check for REM at start
@@ -352,8 +357,37 @@ void Basic::load_string(const std::string& source) {
         for (std::size_t i = p; i < line.size() && i < p+4; ++i)
             upper_start += static_cast<char>(std::toupper((unsigned char)line[i]));
         if (upper_start.substr(0, 3) == "REM") {
-            program_[auto_ln++] = "";
+            program_[next_auto_line_++] = "";
             continue;
+        }
+
+        // ── INCLUDE "file.bas" directive ─────────────────────────────────
+        if (ci_starts(line, p, "INCLUDE")) {
+            std::size_t q = p + 7; // strlen("INCLUDE")
+            while (q < line.size() && (line[q]==' '||line[q]=='\t')) ++q;
+            if (q < line.size() && line[q] == '"') {
+                ++q; // skip opening quote
+                std::size_t end = line.find('"', q);
+                if (end != std::string::npos) {
+                    std::string inc_path = line.substr(q, end - q);
+                    if (depth >= MAX_INCLUDE_DEPTH) {
+                        log("[BASIC] INCLUDE depth limit reached: " + inc_path);
+                    } else if (included.count(inc_path)) {
+                        // Already included — skip (prevents circular includes)
+                    } else {
+                        std::ifstream f(inc_path);
+                        if (!f.is_open()) {
+                            log("[BASIC] Cannot open INCLUDE file: " + inc_path);
+                        } else {
+                            included.insert(inc_path);
+                            std::ostringstream buf;
+                            buf << f.rdbuf();
+                            parse_lines(buf.str(), included, depth + 1);
+                        }
+                    }
+                    continue;
+                }
+            }
         }
 
         // Does line start with a line number?
@@ -366,14 +400,13 @@ void Basic::load_string(const std::string& source) {
             if (q == line.size() || line[q] == ' ' || line[q] == '\t') {
                 while (q < line.size() && (line[q]==' '||line[q]=='\t')) ++q;
                 program_[linenum] = strip_comment(line.substr(q));
-                // Keep auto_ln ahead of explicit line numbers
-                if (linenum >= auto_ln) auto_ln = linenum + 1;
+                // Keep next_auto_line_ ahead of explicit line numbers
+                if (linenum >= next_auto_line_) next_auto_line_ = linenum + 1;
                 continue;
             }
         }
 
         // Check for label: starts with alpha, ends with ':'
-        // e.g. "MyLabel:" or "MyLabel:  ' comment"
         {
             std::string word;
             std::size_t q = p;
@@ -381,27 +414,30 @@ void Basic::load_string(const std::string& source) {
                 word += line[q++];
             while (q < line.size() && (line[q]==' '||line[q]=='\t')) ++q;
             if (!word.empty() && q < line.size() && line[q] == ':') {
-                // It's a label line — store label pointing to this slot
-                // Convert to upper for case-insensitive lookup
                 for (auto& ch : word) ch = static_cast<char>(std::toupper((unsigned char)ch));
-                labels_[word] = auto_ln;
-                program_[auto_ln] = ""; // empty body
-                // If there's code after the colon on same line, store it too
-                ++q; // skip ':'
+                labels_[word] = next_auto_line_;
+                program_[next_auto_line_] = "";
+                ++q;
                 while (q < line.size() && (line[q]==' '||line[q]=='\t')) ++q;
                 if (q < line.size() && line[q] != '\'' && line[q] != '\0') {
-                    // code after label on same line: place on same line number
-                    program_[auto_ln] = strip_comment(line.substr(q));
+                    program_[next_auto_line_] = strip_comment(line.substr(q));
                 }
-                auto_ln++;
+                next_auto_line_++;
                 continue;
             }
         }
 
         // Normal line without line number
-        program_[auto_ln] = strip_comment(line.substr(p));
-        auto_ln++;
+        program_[next_auto_line_] = strip_comment(line.substr(p));
+        next_auto_line_++;
     }
+}
+
+void Basic::load_string(const std::string& source) {
+    clear();
+    next_auto_line_ = 1;
+    std::set<std::string> included;
+    parse_lines(source, included, 0);
     first_pass();
 }
 
@@ -411,6 +447,20 @@ bool Basic::load_file(const std::string& path) {
     std::ostringstream ss;
     ss << f.rdbuf();
     load_string(ss.str());
+    return true;
+}
+
+void Basic::include_string(const std::string& src) {
+    std::set<std::string> included;
+    parse_lines(src, included, 0);
+}
+
+bool Basic::include_file(const std::string& path) {
+    std::ifstream f(path);
+    if (!f.is_open()) return false;
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    include_string(ss.str());
     return true;
 }
 
