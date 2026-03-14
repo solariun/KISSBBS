@@ -50,6 +50,7 @@
 // =============================================================================
 
 #include "ax25lib.hpp"
+#include "ax25dump.hpp"
 #include "basic.hpp"
 
 #include <algorithm>
@@ -289,9 +290,16 @@ static std::string timestamp() {
 }
 
 static void print_frame(const Frame& f, const char* direction = "") {
+    // header line
     std::cout << DIM() << "[" << timestamp() << "]" << RESET()
               << " " << CYAN() << direction << RESET()
-              << " " << f.format() << "\n" << std::flush;
+              << " " << f.format() << "\n";
+    // ctrl detail + hexdump (dimmed — useful for debug, quiet on the eye)
+    auto raw = f.encode();
+    std::cout << DIM()
+              << "           " << ctrl_detail(f.ctrl, raw.size()) << "\n"
+              << hex_dump(raw.data(), raw.size(), "           ")
+              << RESET() << std::flush;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -53,6 +53,7 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include "ax25dump.hpp"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ANSI colour helpers
@@ -65,6 +66,7 @@ namespace Colour {
     static const char* yellow() { return enabled ? "\033[33m" : ""; }
     static const char* cyan()   { return enabled ? "\033[36m" : ""; }
     static const char* bold()   { return enabled ? "\033[1m"  : ""; }
+    static const char* dim()    { return enabled ? "\033[2m"  : ""; }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -580,15 +582,17 @@ private:
             if (AX25::Frame::decode(kf.data, ax)) {
                 std::cout << Colour::cyan() << '[' << timestamp() << "] RX "
                           << Colour::reset() << ax.format() << '\n';
+                std::cout << Colour::dim()
+                          << "           " << ctrl_detail(ax.ctrl, kf.data.size()) << '\n'
+                          << hex_dump(kf.data.data(), kf.data.size(), "           ")
+                          << Colour::reset();
             } else {
                 std::cout << Colour::red()
-                          << '[' << timestamp() << "] RX MALFORMED KISS frame ("
+                          << '[' << timestamp() << "] RX MALFORMED ("
                           << kf.data.size() << " bytes)" << Colour::reset() << '\n';
-                std::cout << "  HEX:";
-                for (uint8_t b : kf.data)
-                    std::cout << ' ' << std::hex << std::uppercase
-                              << std::setw(2) << std::setfill('0') << (int)b;
-                std::cout << std::dec << '\n';
+                std::cout << Colour::dim()
+                          << hex_dump(kf.data.data(), kf.data.size(), "           ")
+                          << Colour::reset();
             }
         } else {
             // Non-data KISS command received from TNC
@@ -713,6 +717,10 @@ private:
             std::cout << Colour::yellow()
                       << '[' << timestamp() << "] TX "
                       << Colour::reset() << f.format() << '\n';
+            std::cout << Colour::dim()
+                      << "           " << ctrl_detail(f.ctrl, ax25_bytes.size()) << '\n'
+                      << hex_dump(ax25_bytes.data(), ax25_bytes.size(), "           ")
+                      << Colour::reset();
         }
     }
 
