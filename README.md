@@ -110,15 +110,12 @@ Your Application
        │
        ▼
    ┌────────┐
-   │  Kiss  │  Serial port + KISS framing layer
+   │  Kiss  │  Transport-agnostic KISS framing layer
    └────────┘
+       │  open(dev, baud)  ← serial port (Serial / termios)
+       │  open_fd(fd)      ← any POSIX fd: TCP socket, PTY, pipe
        │
-       ▼
-   ┌────────┐
-   │ Serial │  POSIX termios (non-blocking, cross-platform)
-   └────────┘
-       │
-    (wire)
+    (wire / socket / PTY)
        │
       TNC  ──── Radio ──── Remote station
 ```
@@ -160,6 +157,7 @@ different physical layer without touching the rest).
   │  + send(data)                                                           │
   │  + disconnect()                                                         │
   │  + tick(now_ms)                                                         │
+  │  + has_unacked() → bool   (true if unacked_ or send_buf_ non-empty)    │
   └───────────────────────────────────────────────────────────────────────┘
           │ lives in (inserted/removed automatically via ObjNode ctor/dtor)
           ▼
@@ -188,9 +186,12 @@ different physical layer without touching the rest).
   ┌───────────────────────────────────────────────────────────────────────┐
   │  Kiss                                                                  │
   │  ─────────────────────────────────────────────────────────────────────│
-  │  + open(device, baud)                                                  │
+  │  + open(device, baud)   ← serial port                                  │
+  │  + open_fd(fd)          ← any POSIX fd (TCP socket, PTY, pipe…)        │
+  │  + fd() → int           ← active file descriptor                       │
+  │  + is_open() → bool                                                     │
   │  + send_frame(ax25_bytes)                                              │
-  │  + poll()  — reads serial, fires on_frame for each complete AX.25 frame│
+  │  + poll()  — reads fd, fires on_frame for each complete AX.25 frame    │
   │  Hooks: on_send_hook (test/simulation), test_inject(payload)           │
   └───────────────────────────────────────────────────────────────────────┘
           │ owns
@@ -271,10 +272,14 @@ classDiagram
 
     class Kiss {
         -Serial serial_
+        -int ext_fd_
         -kiss_Decoder decoder_
         -function on_frame_
         +open(dev, baud) bool
+        +open_fd(fd) bool
         +close()
+        +is_open() bool
+        +fd() int
         +send_frame(ax25) bool
         +set_txdelay(ms)
         +set_persistence(val)
@@ -335,9 +340,11 @@ classDiagram
         +send(data) bool
         +disconnect()
         +state() State
+        +connected() bool
         +remote() Addr
         +local() Addr
         +tick(now)
+        +has_unacked() bool
     }
 
     class Router {
@@ -473,13 +480,14 @@ sudo dnf install gtest-devel sqlite-devel cmake dbus-devel
 ### Build targets
 
 ```bash
-make                  # build bbs, ax25kiss, and ax25client
+make                  # build bbs, ax25kiss, ax25client, and ble_kiss_bridge
+                      # (SimpleBLE is cloned and built automatically on first run)
 make test             # compile and run all unit tests
 make clean            # remove all build artefacts
 
-# BLE bridge (requires cmake — see §17)
+# BLE bridge (built automatically by `make`, but can also be triggered manually)
 make ble-deps         # clone + build SimpleBLE into vendor/simpleble  (once)
-make ble_kiss_bridge  # build the C++ BLE KISS bridge
+make ble_kiss_bridge  # build only the C++ BLE KISS bridge
 ```
 
 To cross-compile or choose a different compiler:
@@ -522,9 +530,24 @@ cfg.n2      = 10;    // max retries before link fail
 
 ### `ax25::Kiss`
 
+`Kiss` is **transport-agnostic**: it can operate over a serial port, a TCP
+socket, a PTY master, or any other POSIX file descriptor.
+
 ```cpp
 Kiss kiss;
+
+// ── Option A: serial port ─────────────────────────────────────────────
 kiss.open("/dev/ttyUSB0", 9600);
+
+// ── Option B: any pre-opened POSIX fd (TCP socket, PTY, pipe…) ───────
+int tcp_fd = /* socket() + connect() */;
+kiss.open_fd(tcp_fd);   // sets O_NONBLOCK; Kiss owns the fd from here
+
+// Query the active fd regardless of how it was opened
+int fd = kiss.fd();
+
+// Is the transport open?
+if (kiss.is_open()) { /* ... */ }
 
 // Register callback — fires for every complete AX.25 payload received
 kiss.set_on_frame([](std::vector<uint8_t> frame) { /* ... */ });
@@ -589,6 +612,13 @@ conn->disconnect();
 // State query
 if (conn->connected()) { /* ... */ }
 Connection::State s = conn->state();
+
+// Pending-frame guard — true when unacked_ or send_buf_ is non-empty.
+// Use this before injecting application-level keep-alive traffic so you
+// do not add new I-frames while the window is already stuck (REJ recovery).
+if (!conn->has_unacked()) {
+    conn->send("\r");   // safe: window is idle
+}
 
 // Addresses
 Addr local  = conn->local();
@@ -2009,11 +2039,14 @@ make
 ### Quick start
 
 ```bash
-# Monitor everything on the channel
+# Monitor everything on the channel (serial TNC)
 ax25client -c W1AW -m monitor /dev/ttyUSB0
 
-# Connect to a BBS
+# Connect to a BBS (serial TNC)
 ax25client -c W1AW -r W1BBS-1 /dev/ttyUSB0
+
+# Connect to a BBS via TCP (ble_kiss_bridge --server-port, or any KISS-over-TCP TNC)
+ax25client -c W1AW -r W1BBS-1 localhost:8001
 
 # Connect via digipeater path
 ax25client -c W1AW -r N0CALL -p WIDE1-1,WIDE2-1 /dev/ttyUSB0
@@ -2031,14 +2064,19 @@ ax25client -c W1AW -m monitor -b 1200 /dev/ttyUSB0
 ### Full option reference
 
 ```
-ax25client [OPTIONS] <serial_device>
+ax25client [OPTIONS] <device|host:port>
+
+  <device>      Serial device path (e.g. /dev/ttyUSB0)
+  <host:port>   TCP address (e.g. localhost:8001 or 192.168.1.5:8001)
+                Detected automatically: no leading '/' + numeric port → TCP.
+                Baud rate (-b) is ignored for TCP connections.
 
 Options:
   -c CALL       My callsign (required)
   -r REMOTE     Remote station (connect mode; use ANY to accept inbound)
   -m MODE       Operating mode: connect | monitor | unproto  (default: connect)
   -d DEST       Destination for unproto UI frames (default: CQ)
-  -b BAUD       Baud rate (default: 9600)
+  -b BAUD       Baud rate for serial (default: 9600; ignored for TCP)
   -p PATH       Digipeater path, comma-separated (e.g. WIDE1-1,WIDE2-1)
   -M            Enable frame monitor in connect/unproto mode
   -w WIN        Window size 1-7 (default: 3)
@@ -2121,10 +2159,21 @@ the local terminal so you can distinguish it from your own typed input.
 The `~s` status display reports the configured interval (e.g. `KA=60s`) or
 `KA=off` when disabled.  The default is **60 s** (always on).
 
+> **REJ-recovery safety:** The keep-alive is suppressed whenever there are
+> unacknowledged or queued frames (`Connection::has_unacked()` returns true).
+> This prevents the keep-alive from injecting additional I-frames into an
+> already-stuck retransmit window, which was the root cause of sessions
+> disconnecting via N2 exhaustion after a burst of REJ frames.
+
 ### Session transcript example
 
 ```
+# Serial TNC
 ax25client  W1AW  /dev/ttyUSB0 @9600 baud
+Connecting to W1BBS-1 from W1AW...
+
+# TCP (e.g. ble_kiss_bridge --server-port 8001)
+ax25client  W1AW  localhost:8001  TCP
 Connecting to W1BBS-1 from W1AW...
 
 *** Connected to W1BBS-1 ***
@@ -2141,7 +2190,7 @@ Connecting to W1BBS-1 from W1AW...
 === Status ===
   Local  : W1AW
   Remote : W1BBS-1
-  Device : /dev/ttyUSB0  @9600 baud
+  Device : /dev/ttyUSB0  @9600 baud  (or TCP  localhost:8001)
   State  : CONNECTED
   Frames RX : 3  (87 data bytes)
   Frames TX : 2  (3 data bytes)
@@ -2360,13 +2409,14 @@ wraps **BlueZ** on Linux and **CoreBluetooth** on macOS.
 #   Ubuntu: sudo apt-get install cmake libdbus-1-dev
 #   Fedora: sudo dnf install cmake dbus-devel
 
-# 2 — clone and build SimpleBLE into vendor/simpleble (once)
-make ble-deps
+# 2 — build everything (SimpleBLE is cloned and compiled automatically)
+make
 
-# 3 — compile
-make ble_kiss_bridge
+# Or build only ble_kiss_bridge explicitly:
+make ble-deps         # clone + build SimpleBLE into vendor/simpleble  (once)
+make ble_kiss_bridge  # compile the bridge
 
-# 4 — (optional) install to /usr/local/bin alongside the other tools
+# 3 — (optional) install to /usr/local/bin alongside the other tools
 sudo make install
 ```
 
@@ -2387,15 +2437,26 @@ sudo make install
 # 2. Identify UUIDs
 ./ble_kiss_bridge --inspect AA:BB:CC:DD:EE:FF
 
-# 3. Start PTY bridge
+# 3a. Start PTY bridge (single local user via /dev/pts/N)
 ./ble_kiss_bridge \
     --device   AA:BB:CC:DD:EE:FF \
     --service  00000001-ba2a-46c9-ae49-01b0961f68bb \
     --write    00000003-ba2a-46c9-ae49-01b0961f68bb \
     --read     00000002-ba2a-46c9-ae49-01b0961f68bb
 
-# 4. Use the printed PTY path with ax25client
+# 3b. Start PTY + TCP server bridge (multiple clients)
+./ble_kiss_bridge \
+    --device   AA:BB:CC:DD:EE:FF \
+    --service  00000001-ba2a-46c9-ae49-01b0961f68bb \
+    --write    00000003-ba2a-46c9-ae49-01b0961f68bb \
+    --read     00000002-ba2a-46c9-ae49-01b0961f68bb \
+    --server-port 8001
+
+# 4a. Use the printed PTY path with ax25client (local)
 ax25client -c W1AW -r W1BBS-1 /dev/pts/3
+
+# 4b. Or connect via TCP (local or remote)
+ax25client -c W1AW -r W1BBS-1 localhost:8001
 ```
 
 ### Options
@@ -2405,6 +2466,62 @@ ax25client -c W1AW -r W1BBS-1 /dev/pts/3
 | `--mtu N` | 517 | Cap BLE write chunk to N bytes (actual MTU negotiated by OS) |
 | `--write-with-response` | off | Force write-with-response (auto-detected by default) |
 | `--timeout S` | 10 | Scan / connect timeout in seconds |
+| `--ble-ka S` | 5 | BLE keep-alive interval in seconds (sends a KISS null frame `{0xC0,0xC0}` when idle); 0 = off |
+| `--server-port P` | — | Start a TCP KISS server on port P (all interfaces); enables multi-client bridging |
+| `--server-host H` | `0.0.0.0` | Bind the TCP server to a specific host/IP instead of all interfaces |
+
+### TCP server mode (`--server-port`)
+
+When `--server-port` is given, `ble_kiss_bridge` also listens on a TCP port and
+acts as a KISS-over-TCP server.  Any number of TCP clients (e.g. `ax25client`,
+`ax25client` on another machine, or custom applications) can connect
+simultaneously and share the same BLE TNC:
+
+```bash
+# Bridge Mobilinkd TNC4 to BLE and expose it as a TCP KISS server on port 8001
+./ble_kiss_bridge \
+    --device   AA:BB:CC:DD:EE:FF \
+    --service  00000001-ba2a-46c9-ae49-01b0961f68bb \
+    --write    00000003-ba2a-46c9-ae49-01b0961f68bb \
+    --read     00000002-ba2a-46c9-ae49-01b0961f68bb \
+    --server-port 8001
+
+# On the same machine (or any host on the network):
+ax25client -c W1AW -r W1BBS-1 localhost:8001
+
+# Restrict the server to a specific interface (e.g. loopback only):
+./ble_kiss_bridge ... --server-port 8001 --server-host 127.0.0.1
+```
+
+Traffic flow:
+- **BLE → TCP clients + PTY**: every BLE notification is forwarded to the PTY
+  master *and* all connected TCP clients simultaneously.
+- **TCP client → BLE**: any write from any TCP client is written to the BLE TNC.
+- **PTY → BLE**: the local PTY path continues to work alongside TCP clients.
+
+The TCP server uses an IPv6 dual-stack socket with `IPV6_V6ONLY=0` (accepts
+both IPv4 and IPv6 connections) with automatic IPv4-only fallback.
+
+### BLE keep-alive (`--ble-ka`)
+
+BLE TNCs (Mobilinkd, WB2OSZ NinoTNC-BT, etc.) often have an application-level
+inactivity timer that is only reset by BLE write operations.  Even when the
+AX.25 T3 keep-alive is keeping the radio link alive, extended periods with no
+outbound frames will trigger the TNC's BLE watchdog and drop the connection.
+
+`--ble-ka S` (default **5 s**) sends a KISS null frame `{0xC0, 0xC0}` — two
+FEND bytes, which every KISS decoder discards as an empty frame — to the TNC
+whenever no BLE write has occurred for S seconds.  This resets the TNC's
+inactivity timer transparently without injecting any AX.25 traffic.
+
+```bash
+# Default: BLE keep-alive every 5 s
+./ble_kiss_bridge --device AA:BB:CC:DD:EE:FF ...
+
+# Increase to 10 s, or disable entirely
+./ble_kiss_bridge --device AA:BB:CC:DD:EE:FF ... --ble-ka 10
+./ble_kiss_bridge --device AA:BB:CC:DD:EE:FF ... --ble-ka 0
+```
 
 ### UUID name resolution
 
@@ -2437,5 +2554,7 @@ If `--service` is omitted (inspect / scan modes) a generic active scan is used.
 - **macOS**: CoreBluetooth handles MTU negotiation automatically; `--mtu` acts as a chunk-size cap.
 - **Linux**: BlueZ negotiates MTU during connect; `--mtu` also acts as a cap.  BlueZ requires `libdbus-1-dev` at build time for the `SetDiscoveryFilter` integration.
 - The tool auto-detects write mode: prefers *write-without-response* when the characteristic supports it; falls back to *write-with-response*; use `--write-with-response` to override.
-- `vendor/simpleble` is excluded from git (`.gitignore`).
+- `vendor/simpleble` is excluded from git (`.gitignore`).  `make` clones and builds it automatically on first run; subsequent builds skip this step because the library file is used as a real-file Makefile target.
 - `make install` / `make uninstall` install/remove all built binaries (`bbs`, `ax25kiss`, `ax25client`, `ble_kiss_bridge`) under `$(PREFIX)` (default `/usr/local/bin`).
+- The BLE keep-alive (`--ble-ka`, default 5 s) writes a KISS null frame to reset the TNC's inactivity timer without affecting AX.25 traffic.
+- The TCP server uses a dual-stack IPv6 socket (`IPV6_V6ONLY=0`) accepting both IPv4 and IPv6 clients, with automatic IPv4-only fallback.
