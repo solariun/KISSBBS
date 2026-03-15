@@ -1315,9 +1315,22 @@ ble_handle_t ble_connect(const char* address,
     }
 
     // Preventive disconnect — clear any stale connection (ignore errors)
-    dbus_call_void(conn, "org.bluez", dev_path.c_str(),
-                   "org.bluez.Device1", "Disconnect", 3000);
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    if (dbus_get_bool_prop(conn, dev_path.c_str(),
+                            "org.bluez.Device1", "Connected")) {
+        dbus_call_void(conn, "org.bluez", dev_path.c_str(),
+                       "org.bluez.Device1", "Disconnect", 3000);
+        // Wait for Connected=false (up to 3s)
+        auto dc_deadline = std::chrono::steady_clock::now()
+                         + std::chrono::milliseconds(3000);
+        while (std::chrono::steady_clock::now() < dc_deadline) {
+            if (!dbus_get_bool_prop(conn, dev_path.c_str(),
+                                     "org.bluez.Device1", "Connected"))
+                break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        // Extra settle time for BlueZ internal cleanup
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    }
 
     // Connect
     if (!dbus_call_void(conn, "org.bluez", dev_path.c_str(),
