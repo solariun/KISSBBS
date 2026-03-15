@@ -566,31 +566,57 @@ struct AutoDetectResult {
 static AutoDetectResult auto_detect_from_gatt(
     const std::vector<GattService>& services)
 {
-    AutoDetectResult r;
+    AutoDetectResult best;
+    int best_score = -1;
 
-    // Phase 1: find a single service with both write + notify
+    // Score each candidate service: prefer write-without-response + notify
+    //   +2 if write char has write-without-response (avoids "In Progress")
+    //   +1 if read char has notify (better than indicate for streaming)
     for (auto& svc : services) {
         if (is_standard_gap_gatt(svc.uuid)) continue;
-        std::string w, w_path, n, n_path;
+
+        // Find best write and read chars within this service
+        const GattChar* w_chr = nullptr;
+        const GattChar* n_chr = nullptr;
         for (auto& chr : svc.chars) {
-            if (w.empty() && chr.can_write()) {
-                w = chr.uuid; w_path = chr.path;
+            if (chr.can_write()) {
+                if (!w_chr || (chr.can_write_without_response() &&
+                               !w_chr->can_write_without_response()))
+                    w_chr = &chr;
             }
-            if (n.empty() && chr.can_notify()) {
-                n = chr.uuid; n_path = chr.path;
+            if (chr.can_notify()) {
+                bool has_notify = false;
+                for (auto& f : chr.flags) if (f == "notify") { has_notify = true; break; }
+                if (!n_chr) {
+                    n_chr = &chr;
+                } else {
+                    bool old_notify = false;
+                    for (auto& f : n_chr->flags) if (f == "notify") { old_notify = true; break; }
+                    if (has_notify && !old_notify) n_chr = &chr;
+                }
             }
         }
-        if (!w.empty() && !n.empty()) {
-            r.service_uuid = svc.uuid;
-            r.write_uuid = w;
-            r.read_uuid = n;
-            r.write_char_path = w_path;
-            r.read_char_path = n_path;
-            return r;
+
+        if (w_chr && n_chr) {
+            int score = 0;
+            if (w_chr->can_write_without_response()) score += 2;
+            for (auto& f : n_chr->flags) if (f == "notify") { score += 1; break; }
+
+            if (score > best_score) {
+                best_score = score;
+                best.service_uuid    = svc.uuid;
+                best.write_uuid      = w_chr->uuid;
+                best.read_uuid       = n_chr->uuid;
+                best.write_char_path = w_chr->path;
+                best.read_char_path  = n_chr->path;
+            }
         }
     }
 
-    // Phase 2: fallback — first writable + first notifiable globally
+    if (best_score >= 0) return best;
+
+    // Fallback — first writable + first notifiable globally
+    AutoDetectResult r;
     for (auto& svc : services) {
         if (is_standard_gap_gatt(svc.uuid)) continue;
         for (auto& chr : svc.chars) {
@@ -1120,11 +1146,17 @@ void ble_inspect(const char* address, double timeout_s) {
 
     auto services = enumerate_gatt(conn, dev_path);
 
-    std::string best_svc, best_write, best_read;
+    // Use auto-detect scoring to pick the best service
+    auto ad = auto_detect_from_gatt(services);
+    std::string best_svc   = ad.service_uuid;
+    std::string best_write = ad.write_uuid;
+    std::string best_read  = ad.read_uuid;
 
     for (auto& svc : services) {
         std::string sname = uuid_short_name(svc.uuid);
-        std::cout << "SERVICE " << svc.uuid << ": " << sname << "\n";
+        bool is_best = (svc.uuid == best_svc);
+        std::cout << "SERVICE " << svc.uuid << ": " << sname
+                  << (is_best ? "  ★" : "") << "\n";
 
         for (auto& chr : svc.chars) {
             std::string caps;
@@ -1134,9 +1166,14 @@ void ble_inspect(const char* address, double timeout_s) {
             }
 
             std::string cname = uuid_short_name(chr.uuid);
+            bool is_w = (chr.uuid == best_write);
+            bool is_r = (chr.uuid == best_read);
+            std::string role;
+            if (is_w) role = " ←write";
+            if (is_r) role += " ←read";
             std::cout << "     CHARACTERISTIC " << chr.uuid
                       << ": " << cname
-                      << "  [" << caps << "]\n";
+                      << "  [" << caps << "]" << role << "\n";
 
             // Read value if readable
             if (chr.can_read()) {
@@ -1169,11 +1206,6 @@ void ble_inspect(const char* address, double timeout_s) {
                 std::cout << "         DESCRIPTOR " << desc_uuid
                           << ": " << uuid_short_name(desc_uuid) << "\n";
             }
-
-            // Track best candidates
-            if (best_svc.empty()) best_svc = svc.uuid;
-            if (best_write.empty() && chr.can_write()) best_write = chr.uuid;
-            if (best_read.empty() && chr.can_notify()) best_read = chr.uuid;
         }
         std::cout << "\n";
     }
