@@ -1101,9 +1101,11 @@ static void do_bridge(const BridgeConfig& cfg, RadioTransport& transport) {
     std::cout << hr() << "\n  Connecting to " << transport.label() << "...\n";
     std::cout.flush();
 
-    // -- Signal handlers --
+    // -- Signal handlers -- treat all termination signals as graceful shutdown
     signal(SIGINT,  sigint_handler);
     signal(SIGTERM, sigint_handler);
+    signal(SIGHUP,  sigint_handler);
+    signal(SIGQUIT, sigint_handler);
 
     // -- TCP server setup (once -- survives reconnects) --
     int server_sock = -1;
