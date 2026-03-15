@@ -301,9 +301,17 @@ if [[ "${BLE_BRIDGE_BUILT}" -eq 1 ]]; then
 
     # Use configured values or placeholders for later editing
     _BLE_DEVICE="${BLE_DEVICE:-REPLACE_WITH_BLE_MAC}"
-    _BLE_SERVICE="${BLE_SERVICE:-REPLACE_WITH_SERVICE_UUID}"
-    _BLE_WRITE="${BLE_WRITE:-REPLACE_WITH_WRITE_UUID}"
-    _BLE_READ="${BLE_READ:-REPLACE_WITH_READ_UUID}"
+
+    # Build ExecStart with optional --service/--write/--read (auto-detect if empty)
+    _EXEC="${BIN_DIR}/bt_kiss_bridge --ble"
+    _EXEC+=" --device ${_BLE_DEVICE}"
+    [[ -n "${BLE_SERVICE}" ]] && _EXEC+=" --service ${BLE_SERVICE}"
+    [[ -n "${BLE_WRITE}" ]]   && _EXEC+=" --write ${BLE_WRITE}"
+    [[ -n "${BLE_READ}" ]]    && _EXEC+=" --read ${BLE_READ}"
+    _EXEC+=" --link ${KISS_PTY}"
+    _EXEC+=" --mtu ${BLE_MTU}"
+    _EXEC+=" --ble-ka ${BLE_KEEPALIVE}"
+    _EXEC+=" --monitor"
 
     cat > "${SYSTEMD_DIR}/kissbbs-ble-bridge.service" <<SVCEOF
 [Unit]
@@ -314,15 +322,7 @@ Wants=bluetooth.target
 [Service]
 Type=simple
 User=${SERVICE_USER}
-ExecStart=${BIN_DIR}/bt_kiss_bridge \\
-    --device ${_BLE_DEVICE} \\
-    --service ${_BLE_SERVICE} \\
-    --write ${_BLE_WRITE} \\
-    --read ${_BLE_READ} \\
-    --link ${KISS_PTY} \\
-    --mtu ${BLE_MTU} \\
-    --ble-ka ${BLE_KEEPALIVE} \\
-    --monitor
+ExecStart=${_EXEC}
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
