@@ -818,39 +818,42 @@ static DBusMessage* build_write_msg(const std::string& char_path,
 // Uses dbus_connection_send() + flush to avoid competing with the
 // dispatch thread for the D-Bus socket (send_with_reply_and_block can
 // deadlock or timeout when dispatch loop is running on the same conn).
-static bool gatt_write_value_async(DBusConnection* conn, const std::string& char_path,
-                                     const uint8_t* data, size_t len,
-                                     bool with_response)
+// Return: 1 = ok, 0 = permanent error, -1 = "In Progress" (transient, retry)
+static int gatt_write_once(DBusConnection* conn, const std::string& char_path,
+                            const uint8_t* data, size_t len,
+                            bool with_response)
 {
     DBusMessage* msg = build_write_msg(char_path, data, len, with_response);
-    if (!msg) return false;
+    if (!msg) return 0;
 
     // For write-with-response we still need the reply to confirm delivery;
-    // use a pending-call callback so the dispatch thread handles it.
+    // use a pending-call so the dispatch thread handles it.
     if (with_response) {
         DBusPendingCall* pending = nullptr;
         if (!dbus_connection_send_with_reply(conn, msg, &pending, 5000)) {
             dbus_message_unref(msg);
-            return false;
+            return 0;
         }
         dbus_message_unref(msg);
         dbus_connection_flush(conn);
 
-        if (!pending) return false;
+        if (!pending) return 0;
 
         // Block until the dispatch thread delivers the reply
         dbus_pending_call_block(pending);
         DBusMessage* reply = dbus_pending_call_steal_reply(pending);
         bool ok = reply && (dbus_message_get_type(reply) == DBUS_MESSAGE_TYPE_METHOD_RETURN);
+        int result = ok ? 1 : 0;
         if (!ok && reply) {
-            const char* err_msg = nullptr;
-            dbus_message_get_args(reply, nullptr, DBUS_TYPE_STRING, &err_msg, DBUS_TYPE_INVALID);
-            if (err_msg)
-                std::cerr << "  BLE write error: " << err_msg << "\n";
+            // Check for "In Progress" — BlueZ returns this when a previous
+            // write-with-response hasn't been ACKed yet by the peripheral.
+            const char* err_name = dbus_message_get_error_name(reply);
+            if (err_name && std::string(err_name) == "org.bluez.Error.InProgress")
+                result = -1; // transient — caller should retry
         }
         if (reply) dbus_message_unref(reply);
         dbus_pending_call_unref(pending);
-        return ok;
+        return result;
     }
 
     // Fire-and-forget for write-without-response: just send + flush.
@@ -861,7 +864,25 @@ static bool gatt_write_value_async(DBusConnection* conn, const std::string& char
 
     if (sent) dbus_connection_flush(conn);
 
-    return sent;
+    return sent ? 1 : 0;
+}
+
+// Wrapper with retry on "In Progress" (up to ~2s with exponential backoff).
+static bool gatt_write_value_async(DBusConnection* conn, const std::string& char_path,
+                                     const uint8_t* data, size_t len,
+                                     bool with_response)
+{
+    int backoff_ms = 20;
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        int rc = gatt_write_once(conn, char_path, data, len, with_response);
+        if (rc == 1) return true;   // success
+        if (rc == 0) return false;  // permanent error
+        // rc == -1: "In Progress" — wait and retry
+        std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+        backoff_ms = std::min(backoff_ms * 2, 500);
+    }
+    std::cerr << "  BLE write: gave up after retries (In Progress)\n";
+    return false;
 }
 
 // ── ReadValue helper ────────────────────────────────────────────────────────
