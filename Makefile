@@ -134,10 +134,20 @@ $(BLE_LIB):
 	cmake --build $(SIMPLEBLE_DIR)/build --config Release -j$(NPROC)
 	@echo "SimpleBLE ready."
 
-bt_kiss_bridge: bt_kiss_bridge.cpp $(BLE_LIB)
+# ── macOS: Classic BT via IOBluetooth (Objective-C++ .mm) ────────────────────
+ifneq ($(UNAME), Linux)
+    BT_MACOS_OBJ = bt_rfcomm_macos.o
+else
+    BT_MACOS_OBJ =
+endif
+
+bt_rfcomm_macos.o: bt_rfcomm_macos.mm bt_rfcomm_macos.h
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -fobjc-arc -c -o $@ $<
+
+bt_kiss_bridge: bt_kiss_bridge.cpp $(BLE_LIB) $(BT_MACOS_OBJ)
 	$(CXX) -std=c++17 -O2 -Wall -Wextra \
 	    $(SIMPLEBLE_INC) \
-	    -o $@ bt_kiss_bridge.cpp \
+	    -o $@ bt_kiss_bridge.cpp $(BT_MACOS_OBJ) \
 	    $(BLE_LIB) $(SIMPLEBLE_SYS) $(BLUETOOTH_LIBS)
 	@echo "Built: bt_kiss_bridge"
 
@@ -147,7 +157,7 @@ ble_kiss_bridge: bt_kiss_bridge
 	@echo "Created symlink: ble_kiss_bridge -> bt_kiss_bridge"
 
 clean:
-	rm -f $(LIB_OBJ) $(BASIC_OBJ) bbs ax25kiss ax25tnc basic_tool test_ax25lib bt_kiss_bridge ble_kiss_bridge
+	rm -f $(LIB_OBJ) $(BASIC_OBJ) bbs ax25kiss ax25tnc basic_tool test_ax25lib bt_kiss_bridge ble_kiss_bridge bt_rfcomm_macos.o
 
 # ── Install / Uninstall ───────────────────────────────────────────────────────
 # Installs all built binaries to $(PREFIX)/bin  (default: /usr/local/bin).

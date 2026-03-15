@@ -2636,187 +2636,340 @@ Use `--inspect` to confirm UUIDs for your specific device.
 
 ## 17. bt_kiss_bridge — Bluetooth KISS Bridge (BLE + Classic BT)
 
-`bt_kiss_bridge` is a native C++17 Bluetooth KISS bridge supporting both BLE (GATT)
-and Classic Bluetooth (RFCOMM/SPP). It replaces `ble_kiss_monitor.py`, offering
-the same three modes with no Python dependency.  It uses
-[SimpleBLE](https://github.com/OpenBluetoothToolbox/SimpleBLE) which
-wraps **BlueZ** on Linux and **CoreBluetooth** on macOS.
+`bt_kiss_bridge` is a native C++17 Bluetooth KISS bridge supporting both
+**BLE** (GATT) and **Classic Bluetooth** (RFCOMM/SPP).  It replaces
+`ble_kiss_monitor.py`, offering the same modes with no Python dependency.
+
+| Transport | Library / Framework | Platforms | Use case |
+|-----------|-------------------|-----------|----------|
+| **BLE** | SimpleBLE → BlueZ / CoreBluetooth | Linux + macOS | Mobilinkd TNC4, NinoTNC-BT, etc. |
+| **Classic BT** | BlueZ RFCOMM / IOBluetooth RFCOMM | Linux + macOS | Kenwood TH-D75, TH-D74, other SPP radios |
+
+### Object Relationship Diagram
+
+```
+  ┌──────────────────────────────────────────────────────────────────────────────┐
+  │  bt_kiss_bridge.cpp + bt_rfcomm_macos.mm                                     │
+  └──────────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────────────────────┐
+  │  RadioTransport  «interface»                                                 │
+  │  ──────────────────────────────────────────────────────────────────────────  │
+  │  + connect() → bool                                                          │
+  │  + disconnect()                                                              │
+  │  + is_connected() → bool                                                     │
+  │  + write(data, len)                                                          │
+  │  + read_fd() → int           (-1 = callback-based, ≥0 = fd for select())    │
+  │  + set_on_receive(cb)        (BLE only — callback RX)                        │
+  │  + set_on_disconnect(cb)                                                     │
+  │  + label() → "BLE" | "BT"                                                   │
+  └──────────────────────────────────────────────────────────────────────────────┘
+          ▲ implements                          ▲ implements
+          │                                     │
+  ┌───────────────────────────────┐   ┌────────────────────────────────────────┐
+  │  BleTransport                 │   │  BtTransport                            │
+  │  ─────────────────────────── │   │  ────────────────────────────────────── │
+  │  SimpleBLE peripheral_        │   │  Linux: BlueZ RFCOMM socket (fd_)       │
+  │  Async TX queue + writer thd  │   │  macOS: IOBluetooth RFCOMM + pipe() fd  │
+  │  Callback RX (notify)         │   │  Direct TX (::write / writeSync)        │
+  │  BLE keep-alive timer         │   │  SDP auto-detect SPP channel (0x1101)   │
+  │  read_fd() = -1               │   │  read_fd() = socket fd / pipe read fd   │
+  └───────────────────────────────┘   └────────────────────────────────────────┘
+                                              │
+                                      ┌───────┴──────────────┐
+                                      │                      │
+                              ┌──────────────┐    ┌─────────────────────────┐
+                              │ Linux (BlueZ) │    │ macOS (IOBluetooth)     │
+                              │ ──────────── │    │ ─────────────────────── │
+                              │ AF_BLUETOOTH  │    │ bt_rfcomm_macos.mm      │
+                              │ BTPROTO_RFCOMM│    │ C-linkage API (extern)  │
+                              │ socket fd     │    │ IOBluetoothRFCOMMChannel│
+                              │ SDP via BlueZ │    │ delegate → pipe() fd    │
+                              └──────────────┘    │ performSDPQuery         │
+                                                  └─────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────────────────────┐
+  │  Bridge Core  (do_bridge)                                                    │
+  │  ──────────────────────────────────────────────────────────────────────────  │
+  │  PTY pair (/tmp/kiss symlink) ←──── mutual exclusive ────→ TCP server       │
+  │  select() loop: PTY + TCP clients + transport.read_fd()                      │
+  │  KISS + AX.25 monitor (--monitor)                                            │
+  │  Auto-reconnect (up to 10 retries, 5s pause)                                 │
+  └──────────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────────────────────────────────────────────┐
+  │  Discovery                                                                   │
+  │  ──────────────────────────────────────────────────────────────────────────  │
+  │  do_ble_scan()  → SimpleBLE adapter scan (all platforms)                     │
+  │  do_bt_scan()   → HCI inquiry (Linux) / IOBluetoothDeviceInquiry (macOS)    │
+  │  do_ble_inspect()→ GATT service + characteristic enumeration                 │
+  │  do_bt_inspect() → SDP service browsing + RFCOMM channel extraction          │
+  │  do_scan(AUTO)   → scans both BLE + BT on Linux and macOS                   │
+  └──────────────────────────────────────────────────────────────────────────────┘
+```
+
+### UML Class Diagram
+
+```mermaid
+classDiagram
+    class RadioTransport {
+        <<interface>>
+        +connect() bool
+        +disconnect()
+        +is_connected() bool
+        +write(data, len)
+        +read_fd() int
+        +set_on_receive(cb)
+        +set_on_disconnect(cb)
+        +label() string
+    }
+
+    class BleTransport {
+        -SimpleBLE::Peripheral peripheral_
+        -thread writer_thread_
+        -mutex tx_mx_
+        -queue tx_queue_
+        -function on_receive_
+        -SteadyClock last_write_
+        -int chunk_size_
+        +connect() bool
+        +write(data, len)
+        +read_fd() int  «returns -1»
+        +maybe_keepalive()
+        +label() string «BLE»
+    }
+
+    class BtTransport {
+        -string address_
+        -int channel_
+        -int fd_ «Linux: RFCOMM socket»
+        -bt_macos_handle_t handle_ «macOS: opaque»
+        -function on_disconnect_
+        +connect() bool
+        +write(data, len)
+        +read_fd() int «returns fd»
+        +label() string «BT»
+    }
+
+    class BridgeConfig {
+        +string address
+        +Transport transport «AUTO/BLE/BT»
+        +int server_port
+        +string server_host
+        +string link_path
+        +bool monitor
+        +int ble_ka_ms
+    }
+
+    class BtMacosHandle {
+        -IOBluetoothDevice* device
+        -IOBluetoothRFCOMMChannel* channel
+        -BtRfcommDelegate* delegate
+        -int pipe_read
+        -int pipe_write
+        -atomic~bool~ connected
+    }
+
+    class BtRfcommDelegate {
+        -BtMacosHandle* handle_
+        +rfcommChannelData(ch, data, len)
+        +rfcommChannelClosed(ch)
+        +rfcommChannelOpenComplete(ch, status)
+    }
+
+    RadioTransport <|.. BleTransport : implements
+    RadioTransport <|.. BtTransport : implements
+    BtTransport "1" --> "0..1" BtMacosHandle : macOS only
+    BtMacosHandle "1" --> "1" BtRfcommDelegate : delegate
+    BtRfcommDelegate ..> BtMacosHandle : writes to pipe
+```
+
+### Data Flow Diagram
+
+```mermaid
+flowchart LR
+    subgraph Radio
+        TNC["TNC / Radio<br/>(BLE or BT SPP)"]
+    end
+
+    subgraph bt_kiss_bridge
+        subgraph Transport
+            BLE["BleTransport<br/>SimpleBLE notify"]
+            BT_L["BtTransport (Linux)<br/>RFCOMM socket fd"]
+            BT_M["BtTransport (macOS)<br/>IOBluetooth → pipe fd"]
+        end
+        SEL["select() loop"]
+        MON["KISS/AX.25<br/>Monitor"]
+    end
+
+    subgraph Clients
+        PTY["PTY<br/>/tmp/kiss"]
+        TCP["TCP Server<br/>:8001"]
+        A1["ax25tnc"]
+        A2["bbs"]
+    end
+
+    TNC <-->|GATT notify/write| BLE
+    TNC <-->|RFCOMM| BT_L
+    TNC <-->|RFCOMM| BT_M
+
+    BLE --> SEL
+    BT_L --> SEL
+    BT_M --> SEL
+
+    SEL <--> PTY
+    SEL <--> TCP
+    SEL -.-> MON
+
+    PTY --- A1
+    TCP --- A2
+```
 
 ### Build
 
 ```bash
 # 1 — install cmake + dbus dev headers (once)
 #   macOS : brew install cmake
-#   Ubuntu: sudo apt-get install cmake libdbus-1-dev
-#   Fedora: sudo dnf install cmake dbus-devel
+#   Ubuntu: sudo apt-get install cmake libdbus-1-dev libbluetooth-dev
+#   Fedora: sudo dnf install cmake dbus-devel bluez-libs-devel
 
 # 2 — build everything (SimpleBLE is cloned and compiled automatically)
 make
 
 # Or build only bt_kiss_bridge explicitly:
 make ble-deps         # clone + build SimpleBLE into vendor/simpleble  (once)
-make bt_kiss_bridge  # compile the bridge
+make bt_kiss_bridge   # compile the bridge
 
 # 3 — (optional) install to /usr/local/bin alongside the other tools
 sudo make install
 ```
 
-### Three operating modes
+> On macOS, `bt_rfcomm_macos.mm` is compiled as Objective-C++ and linked
+> automatically.  No extra dependencies — IOBluetooth is part of the OS.
+
+### Four operating modes
 
 | Mode | Flag | Description |
 |------|------|-------------|
-| `scan` | `--scan` | Discover nearby BLE devices sorted by RSSI |
-| `inspect` | `--inspect ADDR` | Connect and list all GATT services / characteristics |
-| `bridge` | `--device ADDR` | Create a PTY serial port bridged to the BLE TNC |
+| `scan` | `--scan [--ble\|--bt]` | Discover nearby devices (BLE by RSSI, BT by inquiry) |
+| `inspect` | `--inspect ADDR [--ble\|--bt]` | List services: GATT (BLE) or SDP (BT) |
+| `bridge` | `--device ADDR --ble ...` | PTY/TCP ↔ BLE GATT TNC |
+| `bridge` | `--device ADDR --bt [--channel N]` | PTY/TCP ↔ Classic BT RFCOMM (SPP) |
 
-### Quick start
+### Quick start — BLE (Mobilinkd, NinoTNC-BT, etc.)
 
 ```bash
-# 1. Find devices
-./bt_kiss_bridge --scan --timeout 15
+# 1. Find BLE devices
+./bt_kiss_bridge --scan --ble --timeout 15
 
-# 2. Identify UUIDs
-./bt_kiss_bridge --inspect AA:BB:CC:DD:EE:FF
+# 2. Identify GATT UUIDs
+./bt_kiss_bridge --inspect AA:BB:CC:DD:EE:FF --ble
 
-# 3a. Start PTY bridge (single local user via /dev/pts/N)
-./bt_kiss_bridge \
+# 3. Start bridge (PTY or TCP)
+./bt_kiss_bridge --ble \
     --device   AA:BB:CC:DD:EE:FF \
     --service  00000001-ba2a-46c9-ae49-01b0961f68bb \
     --write    00000003-ba2a-46c9-ae49-01b0961f68bb \
     --read     00000002-ba2a-46c9-ae49-01b0961f68bb
 
-# 3b. Start PTY + TCP server bridge (multiple clients)
-./bt_kiss_bridge \
-    --device   AA:BB:CC:DD:EE:FF \
-    --service  00000001-ba2a-46c9-ae49-01b0961f68bb \
-    --write    00000003-ba2a-46c9-ae49-01b0961f68bb \
-    --read     00000002-ba2a-46c9-ae49-01b0961f68bb \
-    --server-port 8001
-
-# 4a. Use the printed PTY path with ax25tnc (local)
+# 4. Connect with ax25tnc
 ax25tnc -c W1AW -r W1BBS-1 /dev/pts/3
+```
 
-# 4b. Or connect via TCP (local or remote)
-ax25tnc -c W1AW -r W1BBS-1 localhost:8001
+### Quick start — Classic BT (Kenwood TH-D75, TH-D74, etc.)
+
+```bash
+# 1. Find Classic BT devices
+./bt_kiss_bridge --scan --bt --timeout 15
+
+# 2. Inspect SDP services (auto-detects RFCOMM channel)
+./bt_kiss_bridge --inspect 00:11:22:33:44:55 --bt
+
+# 3. Start bridge (channel auto-detected via SDP, or specify --channel N)
+./bt_kiss_bridge --bt --device 00:11:22:33:44:55 --monitor
+
+# 4. Connect with ax25tnc (via PTY)
+ax25tnc -c PU5GUS -r PU5GUS-1 /tmp/kiss
+
+# Or via TCP multi-client
+./bt_kiss_bridge --bt --device 00:11:22:33:44:55 --server-port 8001
+ax25tnc -c PU5GUS -r PU5GUS-1 localhost:8001
 ```
 
 ### Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--ble` | — | Use BLE (GATT) transport |
+| `--bt` | — | Use Classic Bluetooth (RFCOMM/SPP) transport |
+| `--channel N` | auto (SDP) | RFCOMM channel number (Classic BT only); 0 or omitted = auto-detect via SDP |
 | `--mtu N` | 517 | Cap BLE write chunk to N bytes (actual MTU negotiated by OS) |
-| `--write-with-response` | off | Force write-with-response (auto-detected by default) |
+| `--write-with-response` | off | Force write-with-response (BLE only, auto-detected by default) |
 | `--timeout S` | 10 | Scan / connect timeout in seconds |
-| `--ble-ka S` | 5 | BLE keep-alive interval in seconds (sends a KISS null frame `{0xC0,0xC0}` when idle); 0 = off |
-| `--server-port P` | — | Start a TCP KISS server on port P (all interfaces); enables multi-client bridging |
-| `--server-host H` | `0.0.0.0` | Bind the TCP server to a specific host/IP instead of all interfaces |
+| `--ble-ka S` | 5 | BLE keep-alive interval in seconds (sends KISS null frame when idle); 0 = off |
+| `--monitor` | off | Print decoded KISS + AX.25 frames in real-time |
+| `--link PATH` | `/tmp/kiss` | Symlink path for the PTY slave device |
+| `--server-port P` | — | Start a TCP KISS server on port P; enables multi-client bridging |
+| `--server-host H` | `0.0.0.0` | Bind the TCP server to a specific host/IP |
 
 ### TCP server mode (`--server-port`)
 
-When `--server-port` is given, `bt_kiss_bridge` also listens on a TCP port and
-acts as a KISS-over-TCP server.  Any number of TCP clients (e.g. `ax25tnc`,
-`ax25tnc` on another machine, or custom applications) can connect
-simultaneously and share the same BLE TNC:
+When `--server-port` is given, `bt_kiss_bridge` listens on a TCP port and
+acts as a KISS-over-TCP server.  Any number of TCP clients can connect
+simultaneously and share the same TNC:
 
 ```bash
-# Bridge Mobilinkd TNC4 to BLE and expose it as a TCP KISS server on port 8001
-./bt_kiss_bridge \
-    --device   AA:BB:CC:DD:EE:FF \
-    --service  00000001-ba2a-46c9-ae49-01b0961f68bb \
-    --write    00000003-ba2a-46c9-ae49-01b0961f68bb \
-    --read     00000002-ba2a-46c9-ae49-01b0961f68bb \
-    --server-port 8001
+# Bridge via BLE + TCP server
+./bt_kiss_bridge --ble --device AA:BB:CC:DD:EE:FF \
+    --service ... --write ... --read ... --server-port 8001
 
-# On the same machine (or any host on the network):
-ax25tnc -c W1AW -r W1BBS-1 localhost:8001
+# Bridge via Classic BT + TCP server
+./bt_kiss_bridge --bt --device 00:11:22:33:44:55 --server-port 8001
 
-# Restrict the server to a specific interface (e.g. loopback only):
-./bt_kiss_bridge ... --server-port 8001 --server-host 127.0.0.1
+# Connect from any machine on the network:
+ax25tnc -c W1AW -r W1BBS-1 192.168.1.50:8001
 ```
 
 Traffic flow:
-- **BLE → TCP clients + PTY**: every BLE notification is forwarded to the PTY
+- **Radio → TCP clients + PTY**: every received frame is forwarded to the PTY
   master *and* all connected TCP clients simultaneously.
-- **TCP client → BLE**: any write from any TCP client is written to the BLE TNC.
-- **PTY → BLE**: the local PTY path continues to work alongside TCP clients.
-
-The TCP server uses an IPv6 dual-stack socket with `IPV6_V6ONLY=0` (accepts
-both IPv4 and IPv6 connections) with automatic IPv4-only fallback.
+- **TCP client → Radio**: any write from any TCP client is sent to the TNC.
+- **PTY → Radio**: the local PTY path continues to work alongside TCP clients.
 
 ### BLE keep-alive (`--ble-ka`)
 
-BLE TNCs (Mobilinkd, WB2OSZ NinoTNC-BT, etc.) often have an application-level
-inactivity timer that is only reset by BLE write operations.  Even when the
-AX.25 T3 keep-alive is keeping the radio link alive, extended periods with no
-outbound frames will trigger the TNC's BLE watchdog and drop the connection.
+BLE TNCs often have an application-level inactivity timer.  `--ble-ka S`
+(default **5 s**) sends a KISS null frame `{0xC0, 0xC0}` to reset the timer.
+Classic BT does not need this — RFCOMM handles link maintenance natively.
 
-`--ble-ka S` (default **5 s**) sends a KISS null frame `{0xC0, 0xC0}` — two
-FEND bytes, which every KISS decoder discards as an empty frame — to the TNC
-whenever no BLE write has occurred for S seconds.  This resets the TNC's
-inactivity timer transparently without injecting any AX.25 traffic.
+### Platform-specific notes
 
-```bash
-# Default: BLE keep-alive every 5 s
-./bt_kiss_bridge --device AA:BB:CC:DD:EE:FF ...
+| Feature | Linux | macOS |
+|---------|-------|-------|
+| BLE transport | SimpleBLE → BlueZ + D-Bus | SimpleBLE → CoreBluetooth |
+| Classic BT transport | BlueZ RFCOMM socket (`AF_BLUETOOTH`) | IOBluetooth RFCOMM (`bt_rfcomm_macos.mm`) |
+| BT scan | HCI inquiry (`hci_inquiry`) | `IOBluetoothDeviceInquiry` |
+| BT inspect (SDP) | BlueZ SDP API (`sdp_connect`) | `performSDPQuery` + `services` |
+| SPP channel detection | `sdp_service_search_attr_req` (UUID 0x1101) | `hasServiceFromArray:` + `getRFCOMMChannelID:` |
+| I/O model (BT) | RFCOMM socket fd → `select()` | Delegate callback → `pipe()` fd → `select()` |
+| Build dependency | `libbluetooth-dev` (`-lbluetooth`) | IOBluetooth.framework (built-in) |
 
-# Increase to 10 s, or disable entirely
-./bt_kiss_bridge --device AA:BB:CC:DD:EE:FF ... --ble-ka 10
-./bt_kiss_bridge --device AA:BB:CC:DD:EE:FF ... --ble-ka 0
-```
-
-### UUID name resolution
-
-`--inspect` and `--device` modes display human-readable names for well-known
-Bluetooth service and characteristic UUIDs (SDP, RFCOMM, Serial Port, UART,
-Characteristic User Description, CCCD, etc.).  Unknown UUIDs are shown as-is.
-
-Example inspect output:
-
-```
-Service : 00000001-ba2a-46c9-ae49-01b0961f68bb  [SDP]
-  Characteristic: 00000003-ba2a-46c9-ae49-01b0961f68bb  [RFCOMM]
-                  read | notify
-  Characteristic: 00000002-ba2a-46c9-ae49-01b0961f68bb  [Unknown]
-                  write | write-without-response
-```
-
-### Device discovery (Linux)
-
-On Linux, `--device` passes the `--service` UUID to BlueZ's `SetDiscoveryFilter`
-D-Bus call before starting the scan.  This forces BlueZ to perform an **active
-scan** specifically for devices advertising that service UUID — identical to what
-`ble-serial` does internally.  Without the filter, BlueZ may use a passive scan
-and miss devices that are already known to the adapter from a previous session.
-
-If `--service` is omitted (inspect / scan modes) a generic active scan is used.
-
-### Automatic BLE reconnection
+### Automatic reconnection
 
 `bt_kiss_bridge` is designed to run as a long-lived background service.  When
-the BLE connection drops (TNC power-cycled, out of range, BLE timeout, etc.),
+the connection drops (TNC power-cycled, out of range, timeout, etc.),
 the bridge automatically attempts to reconnect:
 
 - **Up to 10 reconnection attempts** with a 5-second pause between each
-- **PTY and TCP server stay alive** across disconnects — clients like
-  `ax25tnc` keep their file descriptors open and resume transparently
-  once the BLE link is re-established
-- The symlink (e.g. `/tmp/kissble`) remains valid throughout
-- A `[BLE disconnected]` / `[BLE reconnecting (attempt N/10)]` message is
-  printed to the console so you can monitor the process
-
-This means you can start `bt_kiss_bridge` once (e.g. from a systemd unit or
-launchd plist) and it will survive intermittent BLE disruptions without losing
-the serial or TCP endpoints that downstream applications depend on.
+- **PTY and TCP server stay alive** across disconnects — clients keep their
+  file descriptors open and resume transparently once the link is re-established
+- The symlink (e.g. `/tmp/kiss`) remains valid throughout
 
 ### Notes
 
-- **macOS**: CoreBluetooth handles MTU negotiation automatically; `--mtu` acts as a chunk-size cap.
-- **Linux**: BlueZ negotiates MTU during connect; `--mtu` also acts as a cap.  BlueZ requires `libdbus-1-dev` at build time for the `SetDiscoveryFilter` integration.
-- The tool auto-detects write mode: prefers *write-without-response* when the characteristic supports it; falls back to *write-with-response*; use `--write-with-response` to override.
-- `vendor/simpleble` is excluded from git (`.gitignore`).  `make` clones and builds it automatically on first run; subsequent builds skip this step because the library file is used as a real-file Makefile target.
-- `make install` / `make uninstall` install/remove all built binaries (`bbs`, `ax25kiss`, `ax25tnc`, `basic_tool`, `bt_kiss_bridge`) under `$(PREFIX)` (default `/usr/local/bin`).
-- The BLE keep-alive (`--ble-ka`, default 5 s) writes a KISS null frame to reset the TNC's inactivity timer without affecting AX.25 traffic.
-- The TCP server uses a dual-stack IPv6 socket (`IPV6_V6ONLY=0`) accepting both IPv4 and IPv6 clients, with automatic IPv4-only fallback.
+- `vendor/simpleble` is excluded from git (`.gitignore`).  `make` clones and builds it automatically.
+- `make install` / `make uninstall` handle both `bt_kiss_bridge` and the `ble_kiss_bridge` backward-compat symlink.
+- The TCP server uses a dual-stack IPv6 socket (`IPV6_V6ONLY=0`) with automatic IPv4-only fallback.
 
 ---
 

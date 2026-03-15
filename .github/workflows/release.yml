@@ -40,7 +40,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y libsqlite3-dev pkg-config cmake \
-                                  libdbus-1-dev libgtest-dev
+                                  libdbus-1-dev libbluetooth-dev libgtest-dev
           GTEST_SRC=$(ls -d /usr/src/googletest /usr/src/gtest 2>/dev/null | head -1)
           cd "$GTEST_SRC"
           sudo cmake -B build -DCMAKE_BUILD_TYPE=Release
@@ -90,7 +90,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y libsqlite3-dev pkg-config cmake \
-                                  libdbus-1-dev libgtest-dev
+                                  libdbus-1-dev libbluetooth-dev libgtest-dev
           GTEST_SRC=$(ls -d /usr/src/googletest /usr/src/gtest 2>/dev/null | head -1)
           cd "$GTEST_SRC"
           sudo cmake -B build -DCMAKE_BUILD_TYPE=Release

@@ -956,16 +956,58 @@ public:
     }
 };
 
-#else // !__linux__ -- macOS stub
+#elif defined(__APPLE__)
 
+#include "bt_rfcomm_macos.h"
+
+class BtTransport : public RadioTransport {
+    std::string address_;
+    int channel_;
+    bt_macos_handle_t handle_ = nullptr;
+    std::function<void()> on_disconnect_;
+
+public:
+    BtTransport(const std::string& addr, int ch)
+        : address_(addr), channel_(ch) {}
+    ~BtTransport() override { disconnect(); }
+
+    const char* label() const override { return "BT"; }
+    int  read_fd() const override { return handle_ ? bt_macos_read_fd(handle_) : -1; }
+
+    void set_on_disconnect(std::function<void()> cb) override {
+        on_disconnect_ = std::move(cb);
+    }
+
+    bool is_connected() const override {
+        return handle_ && bt_macos_is_connected(handle_);
+    }
+
+    bool connect() override {
+        handle_ = bt_macos_connect(address_.c_str(), channel_);
+        return handle_ != nullptr;
+    }
+
+    void write(const uint8_t* data, size_t len) override {
+        if (handle_) bt_macos_write(handle_, data, len);
+    }
+
+    void disconnect() override {
+        if (handle_) {
+            bt_macos_disconnect(handle_);
+            handle_ = nullptr;
+        }
+    }
+};
+
+#else
+// Unsupported platform stub
 class BtTransport : public RadioTransport {
 public:
     BtTransport(const std::string&, int) {}
     ~BtTransport() override = default;
     const char* label() const override { return "BT"; }
     bool connect() override {
-        std::cerr << "Classic Bluetooth (RFCOMM) is not yet supported on macOS.\n"
-                  << "Use --ble for BLE transport, or run on Linux.\n";
+        std::cerr << "Classic Bluetooth (RFCOMM) is not supported on this platform.\n";
         return false;
     }
     void disconnect() override {}
@@ -1077,9 +1119,13 @@ static void do_bt_scan(double timeout_s) {
     bt_free(ii);
     close(sock);
 }
+#elif defined(__APPLE__)
+static void do_bt_scan(double timeout_s) {
+    bt_macos_scan(timeout_s);
+}
 #else
 static void do_bt_scan([[maybe_unused]] double timeout_s) {
-    std::cerr << "Classic Bluetooth scan is not yet supported on macOS.\n";
+    std::cerr << "Classic Bluetooth scan is not supported on this platform.\n";
 }
 #endif
 
@@ -1092,7 +1138,7 @@ static void do_scan(double timeout_s, BridgeConfig::Transport transport) {
     } else {
         // AUTO: scan both
         do_ble_scan(timeout_s);
-#ifdef __linux__
+#if defined(__linux__) || defined(__APPLE__)
         std::cout << "\n";
         do_bt_scan(timeout_s);
 #endif
@@ -1299,9 +1345,13 @@ static void do_bt_inspect(const std::string& address) {
                   << " --channel " << spp_channel << "\n";
     }
 }
+#elif defined(__APPLE__)
+static void do_bt_inspect(const std::string& address) {
+    bt_macos_inspect(address.c_str());
+}
 #else
 static void do_bt_inspect([[maybe_unused]] const std::string& address) {
-    std::cerr << "Classic Bluetooth inspect is not yet supported on macOS.\n";
+    std::cerr << "Classic Bluetooth inspect is not supported on this platform.\n";
 }
 #endif
 
