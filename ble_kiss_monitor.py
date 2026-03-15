@@ -21,7 +21,7 @@ Examples:
       --read     00000002-ba2a-46c9-ae49-01b0961f68bb
 
   Then in another terminal:
-      ax25client -c W1AW -r W1BBS-1 /dev/pts/3   # (use the PTY path printed above)
+      ax25tnc -c W1AW -r W1BBS-1 /dev/pts/3   # (use the PTY path printed above)
 """
 
 import asyncio
@@ -284,9 +284,9 @@ async def bridge(address: str, service_uuid: str,
     print(f"")
     print(f"      {slave_path}")
     print(f"")
-    print(f"  Use this path as the serial device in ax25client / Direwolf / etc.")
+    print(f"  Use this path as the serial device in ax25tnc / Direwolf / etc.")
     print(f"  Example:")
-    print(f"      ax25client -c W1AW -r W1BBS-1 {slave_path}")
+    print(f"      ax25tnc -c W1AW -r W1BBS-1 {slave_path}")
     print(hr("─"))
     print(f"  Connecting to BLE…")
 

@@ -2004,7 +2004,7 @@ TEST(HostMapQueue, MapAndQueueTogether) {
 // =============================================================================
 // Line-terminator compatibility tests
 //
-// ax25client sends CR-only (\r) as the line terminator (packet radio
+// ax25tnc sends CR-only (\r) as the line terminator (packet radio
 // convention).  The BBS on_data() must accept \r, \n, and \r\n equally so
 // that any client — modern or legacy — works without special configuration.
 //
@@ -2032,7 +2032,7 @@ static std::string feed_data_via_connection(const std::vector<uint8_t>& data) {
 }
 
 TEST(LineTerminator, CROnlyDelivered) {
-    // ax25client sends CR-only; receiver gets the CR byte verbatim.
+    // ax25tnc sends CR-only; receiver gets the CR byte verbatim.
     auto rx = feed_data_via_connection({'H','i','\r'});
     EXPECT_NE(rx.find("Hi"), std::string::npos);
     EXPECT_NE(rx.find('\r'), std::string::npos);

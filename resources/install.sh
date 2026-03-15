@@ -233,7 +233,7 @@ else
 fi
 
 info "Building core binaries..."
-make -j"$(nproc)" bbs ax25kiss ax25client basic_tool
+make -j"$(nproc)" bbs ax25kiss ax25tnc basic_tool
 success "Core binaries built"
 
 info "Building BLE bridge (optional)..."
@@ -431,7 +431,7 @@ echo -e "${BOLD}Config:${RESET}         ${BBS_INI}"
 echo -e "${BOLD}AX.25 ports:${RESET}    ${AXPORTS_FILE}"
 echo ""
 echo -e "${BOLD}Installed binaries:${RESET}"
-for bin in bbs ax25kiss ax25client basic_tool; do
+for bin in bbs ax25kiss ax25tnc basic_tool; do
     if [[ -f "${BIN_DIR}/${bin}" ]]; then
         echo -e "  ${GREEN}✓${RESET} ${bin}"
     else

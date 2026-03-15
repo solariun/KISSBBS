@@ -13,9 +13,9 @@
 //
 // ── Transport modes (mutually exclusive) ─────────────────────────────────────
 //   PTY  (default)  A virtual serial port is created.  Symlink → /tmp/kiss.
-//                   Connect: ax25client -c W1AW -r W1BBS-1 /tmp/kiss
+//                   Connect: ax25tnc -c W1AW -r W1BBS-1 /tmp/kiss
 //   TCP             --server-port N  opens a KISS-over-TCP listener.
-//                   Connect: ax25client -c W1AW -r W1BBS-1 localhost:N
+//                   Connect: ax25tnc -c W1AW -r W1BBS-1 localhost:N
 //
 // ── Rich frame monitor (--monitor) ───────────────────────────────────────────
 //   Each AX.25 frame is shown as:
@@ -34,7 +34,7 @@
 //   complete KISS frame is assembled.
 //
 //   The ctrl detail and hexdump-C output come from ax25dump.hpp, the same
-//   header used by ax25kiss and ax25client, keeping the format identical
+//   header used by ax25kiss and ax25tnc, keeping the format identical
 //   across all three tools.
 //
 // ── Build ─────────────────────────────────────────────────────────────────────
@@ -754,7 +754,7 @@ static void do_bridge(const BridgeConfig& cfg) {
         if (!cfg.link_path.empty())
             std::cout << "  Symlink    : " << cfg.link_path << "  -> " << slave_path << "\n";
         std::cout << "\n";
-        std::cout << "  Example:\n      ax25client -c W1AW -r W1BBS-1 " << display_path << "\n";
+        std::cout << "  Example:\n      ax25tnc -c W1AW -r W1BBS-1 " << display_path << "\n";
     }
     std::cout << hr() << "\n  Connecting to BLE...\n";
     std::cout.flush();
@@ -1236,10 +1236,10 @@ static void usage(const char* prog) {
         "             TCP mode  : --server-port <port> [--server-host <host>]\n\n"
         "Transport modes (mutually exclusive):\n"
         "  PTY mode (default)     A virtual serial port is created; connect with:\n"
-        "                           ax25client -c W1AW -r W1BBS-1 /tmp/kiss\n"
+        "                           ax25tnc -c W1AW -r W1BBS-1 /tmp/kiss\n"
         "  TCP mode               --server-port enables a TCP KISS server;\n"
         "                         NO PTY is created.  Connect with:\n"
-        "                           ax25client -c W1AW -r W1BBS-1 localhost:<port>\n\n"
+        "                           ax25tnc -c W1AW -r W1BBS-1 localhost:<port>\n\n"
         "Options (device mode):\n"
         "  --link <path>          (PTY mode) symlink pointing to the PTY slave\n"
         "                         Default: /tmp/kiss  (use --link '' to disable)\n"
@@ -1250,7 +1250,7 @@ static void usage(const char* prog) {
         "                         when idle to prevent TNC inactivity disconnect\n"
         "                         Default: 5  (use 0 to disable)\n"
         "  --monitor              Rich frame monitor: hexdump-C + AX.25 ctrl decode\n"
-        "                         Same format as ax25kiss/ax25client (dim detail lines)\n"
+        "                         Same format as ax25kiss/ax25tnc (dim detail lines)\n"
         "  --show-keepalive       Show BLE keep-alive messages in monitor output\n"
         "                         (hidden by default to reduce noise)\n\n"
         "Examples:\n"

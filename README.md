@@ -5,7 +5,7 @@
 A self-contained C++11 library implementing the AX.25 amateur-radio link-layer
 protocol over KISS-mode TNCs.  Includes a full-featured BBS with INI config,
 a QBASIC-style scripting engine (functions, structs, DO/LOOP, SELECT CASE, SQLite · TCP · HTTP),
-a complete TNC terminal client (`ax25client`), an offline BASIC debugger (`basic_tool`),
+a complete TNC terminal client (`ax25tnc`), an offline BASIC debugger (`basic_tool`),
 remote shell access, an interactive KISS terminal, and a 170-test GoogleTest suite.
 
 ---
@@ -24,7 +24,7 @@ brew install googletest sqlite cmake
 sudo apt-get install libgtest-dev libsqlite3-dev cmake libdbus-1-dev pkg-config
 
 # 3. Build core apps + run tests
-make          # builds: bbs  ax25kiss  ax25client  basic_tool  ble_kiss_bridge
+make          # builds: bbs  ax25kiss  ax25tnc  basic_tool  ble_kiss_bridge
 make test     # runs 170 tests — must all pass
 
 # 4. (Optional) BLE bridge — macOS & Linux with BlueZ
@@ -56,7 +56,7 @@ make ble_kiss_bridge   # links ble_kiss_bridge
 12. [INI Configuration](#12-ini-configuration)
 13. [BASIC Scripting](#13-basic-scripting)
 14. [APRS Helpers (ax25::aprs)](#14-aprs-helpers-ax25aprs)
-15. [ax25client — TNC Terminal Client](#15-ax25client--tnc-terminal-client)
+15. [ax25tnc — TNC Terminal Client](#15-ax25tnc--tnc-terminal-client)
 16. [ble_kiss_monitor.py — BLE KISS Scanner & AX.25 Monitor](#16-ble_kiss_monitorpy--ble-kiss-scanner--ax25-monitor)
 17. [ble_kiss_bridge — C++ BLE KISS Bridge](#17-ble_kiss_bridge--c-ble-kiss-bridge)
 18. [basic_tool — Offline BASIC Interpreter / REPL Debugger](#18-basic_tool--offline-basic-interpreter--repl-debugger)
@@ -523,7 +523,7 @@ sudo dnf install gtest-devel sqlite-devel cmake dbus-devel
 ### Build targets
 
 ```bash
-make                  # build bbs, ax25kiss, ax25client, and ble_kiss_bridge
+make                  # build bbs, ax25kiss, ax25tnc, and ble_kiss_bridge
                       # (SimpleBLE is cloned and built automatically on first run)
 make test             # compile and run all unit tests
 make clean            # remove all build artefacts
@@ -2199,9 +2199,9 @@ Full table: [APRS Symbol Reference](http://www.aprs.org/symbols.html)
 
 ---
 
-## 15. ax25client — TNC Terminal Client
+## 15. ax25tnc — TNC Terminal Client
 
-`ax25client` is an interactive TNC terminal that provides a modern command-line
+`ax25tnc` is an interactive TNC terminal that provides a modern command-line
 interface to AX.25 packet radio.  By default it starts in **TNC mode** — an
 interactive command prompt where you can set your callsign, connect to remote
 stations, monitor the channel, and accept incoming connections, all without
@@ -2211,7 +2211,7 @@ restarting.  It also supports three legacy single-purpose modes (`connect`,
 ### Build
 
 ```bash
-make ax25client
+make ax25tnc
 # or as part of the full build:
 make
 ```
@@ -2229,22 +2229,22 @@ make
 
 ```bash
 # Start TNC terminal (default callsign N0CALL, set it inside with MYC)
-ax25client /dev/ttyUSB0
+ax25tnc /dev/ttyUSB0
 
 # Start TNC terminal with your callsign
-ax25client -c W1AW /dev/ttyUSB0
+ax25tnc -c W1AW /dev/ttyUSB0
 
 # Start TNC and auto-connect to a remote station
-ax25client -c W1AW -r W1BBS-1 /dev/ttyUSB0
+ax25tnc -c W1AW -r W1BBS-1 /dev/ttyUSB0
 
 # Start TNC via TCP (ble_kiss_bridge --server-port, or any KISS-over-TCP TNC)
-ax25client -c W1AW localhost:8001
+ax25tnc -c W1AW localhost:8001
 
 # Legacy: monitor mode
-ax25client -c W1AW -m monitor /dev/ttyUSB0
+ax25tnc -c W1AW -m monitor /dev/ttyUSB0
 
 # Legacy: unproto mode
-ax25client -c W1AW -m unproto -d CQ -M /dev/ttyUSB0
+ax25tnc -c W1AW -m unproto -d CQ -M /dev/ttyUSB0
 ```
 
 ### TNC command reference
@@ -2282,7 +2282,7 @@ automatically switches to data mode:
 ```
 
 This enables peer-to-peer communication without a dedicated BBS — any two
-stations running `ax25client` can connect to each other.
+stations running `ax25tnc` can connect to each other.
 
 ### Data mode and tilde escapes
 
@@ -2308,7 +2308,7 @@ accidental disconnection while allowing a quick escape when needed.
 ### Full option reference
 
 ```
-ax25client [OPTIONS] <device|host:port>
+ax25tnc [OPTIONS] <device|host:port>
 
   <device>      Serial device path (e.g. /dev/ttyUSB0)
   <host:port>   TCP address (e.g. localhost:8001 or 192.168.1.5:8001)
@@ -2337,7 +2337,7 @@ Options:
 
 ### Line terminator convention
 
-`ax25client` sends **CR-only (`\r`)** as the line terminator, which is the
+`ax25tnc` sends **CR-only (`\r`)** as the line terminator, which is the
 universal packet-radio convention.  Sending `\r\n` caused remote BBS stations
 to receive a stray `\n` that corrupted subsequent commands (e.g. `//H` arriving
 as `//H<CR><LF>` instead of `//H<CR>`).
@@ -2352,11 +2352,11 @@ any client regardless of its line-ending convention.
 
 ### Self-callsign guard
 
-`ax25client` rejects a connect request when the remote callsign matches the
+`ax25tnc` rejects a connect request when the remote callsign matches the
 local callsign:
 
 ```
-$ ax25client -c W1AW -r W1AW /dev/ttyUSB0
+$ ax25tnc -c W1AW -r W1AW /dev/ttyUSB0
 Error: remote callsign (-r W1AW) cannot be the same as your own callsign (-c W1AW).
        A SABM addressed to yourself will never receive a UA reply.
 ```
@@ -2372,16 +2372,16 @@ by received **data** (I-frames carrying application payload).  The AX.25
 protocol-level keep-alive (T3 / RR poll) satisfies the radio link but not
 the BBS application layer, which may silently disconnect an idle session.
 
-Use `--ka <seconds>` to have `ax25client` automatically send a bare CR to the
+Use `--ka <seconds>` to have `ax25tnc` automatically send a bare CR to the
 remote station whenever no data has been transmitted for that many seconds:
 
 ```
 # Default: keep-alive fires every 60 s (always on out of the box)
-ax25client -c W1AW -r W1BBS-1 /dev/ttyUSB0
+ax25tnc -c W1AW -r W1BBS-1 /dev/ttyUSB0
 
 # Override to 30 s, or disable entirely
-ax25client -c W1AW -r W1BBS-1 --ka 30  /dev/ttyUSB0
-ax25client -c W1AW -r W1BBS-1 --ka 0   /dev/ttyUSB0
+ax25tnc -c W1AW -r W1BBS-1 --ka 30  /dev/ttyUSB0
+ax25tnc -c W1AW -r W1BBS-1 --ka 0   /dev/ttyUSB0
 ```
 
 When a keep-alive fires, a dimmed `[keep-alive]` annotation is printed on
@@ -2399,7 +2399,7 @@ The `~s` status display reports the configured interval (e.g. `KA=60s`) or
 ### TNC session transcript example
 
 ```
-$ ax25client -c W1AW /dev/ttyUSB0
+$ ax25tnc -c W1AW /dev/ttyUSB0
 
 KISSBBS TNC — W1AW @ /dev/ttyUSB0 @9600 baud
 Type HELP for commands, double Ctrl+C to exit.
@@ -2460,7 +2460,7 @@ or use the `SCRIPT` command / `~x` escape from within a live session:
 
 ```bash
 # Auto-run after connect
-ax25client -c W1AW -r W1BBS-1 -s login.bas /dev/ttyUSB0
+ax25tnc -c W1AW -r W1BBS-1 -s login.bas /dev/ttyUSB0
 
 # From the TNC command prompt (while connected)
 [W1AW cmd]> SCRIPT login.bas
@@ -2519,7 +2519,7 @@ END
 - Check the return value of `RECV` — an empty string means timeout, not
   necessarily a disconnect.
 - The script exits cleanly at `END` or when it falls off the bottom;
-  `ax25client` then returns to command mode (TNC) or disconnects (legacy connect mode).
+  `ax25tnc` then returns to command mode (TNC) or disconnects (legacy connect mode).
 
 ---
 
@@ -2692,11 +2692,11 @@ sudo make install
     --read     00000002-ba2a-46c9-ae49-01b0961f68bb \
     --server-port 8001
 
-# 4a. Use the printed PTY path with ax25client (local)
-ax25client -c W1AW -r W1BBS-1 /dev/pts/3
+# 4a. Use the printed PTY path with ax25tnc (local)
+ax25tnc -c W1AW -r W1BBS-1 /dev/pts/3
 
 # 4b. Or connect via TCP (local or remote)
-ax25client -c W1AW -r W1BBS-1 localhost:8001
+ax25tnc -c W1AW -r W1BBS-1 localhost:8001
 ```
 
 ### Options
@@ -2713,8 +2713,8 @@ ax25client -c W1AW -r W1BBS-1 localhost:8001
 ### TCP server mode (`--server-port`)
 
 When `--server-port` is given, `ble_kiss_bridge` also listens on a TCP port and
-acts as a KISS-over-TCP server.  Any number of TCP clients (e.g. `ax25client`,
-`ax25client` on another machine, or custom applications) can connect
+acts as a KISS-over-TCP server.  Any number of TCP clients (e.g. `ax25tnc`,
+`ax25tnc` on another machine, or custom applications) can connect
 simultaneously and share the same BLE TNC:
 
 ```bash
@@ -2727,7 +2727,7 @@ simultaneously and share the same BLE TNC:
     --server-port 8001
 
 # On the same machine (or any host on the network):
-ax25client -c W1AW -r W1BBS-1 localhost:8001
+ax25tnc -c W1AW -r W1BBS-1 localhost:8001
 
 # Restrict the server to a specific interface (e.g. loopback only):
 ./ble_kiss_bridge ... --server-port 8001 --server-host 127.0.0.1
@@ -2797,7 +2797,7 @@ the bridge automatically attempts to reconnect:
 
 - **Up to 10 reconnection attempts** with a 5-second pause between each
 - **PTY and TCP server stay alive** across disconnects — clients like
-  `ax25client` keep their file descriptors open and resume transparently
+  `ax25tnc` keep their file descriptors open and resume transparently
   once the BLE link is re-established
 - The symlink (e.g. `/tmp/kissble`) remains valid throughout
 - A `[BLE disconnected]` / `[BLE reconnecting (attempt N/10)]` message is
@@ -2813,7 +2813,7 @@ the serial or TCP endpoints that downstream applications depend on.
 - **Linux**: BlueZ negotiates MTU during connect; `--mtu` also acts as a cap.  BlueZ requires `libdbus-1-dev` at build time for the `SetDiscoveryFilter` integration.
 - The tool auto-detects write mode: prefers *write-without-response* when the characteristic supports it; falls back to *write-with-response*; use `--write-with-response` to override.
 - `vendor/simpleble` is excluded from git (`.gitignore`).  `make` clones and builds it automatically on first run; subsequent builds skip this step because the library file is used as a real-file Makefile target.
-- `make install` / `make uninstall` install/remove all built binaries (`bbs`, `ax25kiss`, `ax25client`, `basic_tool`, `ble_kiss_bridge`) under `$(PREFIX)` (default `/usr/local/bin`).
+- `make install` / `make uninstall` install/remove all built binaries (`bbs`, `ax25kiss`, `ax25tnc`, `basic_tool`, `ble_kiss_bridge`) under `$(PREFIX)` (default `/usr/local/bin`).
 - The BLE keep-alive (`--ble-ka`, default 5 s) writes a KISS null frame to reset the TNC's inactivity timer without affecting AX.25 traffic.
 - The TCP server uses a dual-stack IPv6 socket (`IPV6_V6ONLY=0`) accepting both IPv4 and IPv6 clients, with automatic IPv4-only fallback.
 

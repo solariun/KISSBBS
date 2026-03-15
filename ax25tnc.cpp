@@ -1,5 +1,5 @@
 // =============================================================================
-// ax25client.cpp — Complete AX.25 / KISS TNC client  (C++11, POSIX)
+// ax25tnc.cpp — Complete AX.25 / KISS TNC client  (C++11, POSIX)
 //
 // Acts as a classic packet-radio terminal with four operating modes:
 //
@@ -20,10 +20,10 @@
 //              matching the source callsign are displayed.
 //
 // Build:
-//   g++ -std=c++11 -O2 -Wall -o ax25client ax25client.cpp ax25lib.cpp basic.o
+//   g++ -std=c++11 -O2 -Wall -o ax25tnc ax25tnc.cpp ax25lib.cpp basic.o
 //
 // Usage:
-//   ax25client [OPTIONS] <serial_device>
+//   ax25tnc [OPTIONS] <serial_device>
 //
 // Options:
 //   -c CALL         My callsign (default: N0CALL)
@@ -1202,7 +1202,7 @@ static void run_basic_script(
     };
 
     // Set all standard BBS-compatible variables so scripts work identically
-    // whether run from the BBS server or from ax25client
+    // whether run from the BBS server or from ax25tnc
     interp.set_str("REMOTE$",    cfg.remote);
     interp.set_str("LOCAL$",     cfg.ax25.mycall.str());
     interp.set_str("CALLSIGN$",  cfg.remote);
@@ -1581,7 +1581,7 @@ int main(int argc, char* argv[]) {
     {
         std::string tcp_host, tcp_port;
         bool is_tcp = is_tcp_address(cfg.device, tcp_host, tcp_port);
-        std::cout << BOLD() << "ax25client" << RESET()
+        std::cout << BOLD() << "ax25tnc" << RESET()
                   << "  " << cfg.ax25.mycall.str()
                   << "  " << cfg.device
                   << (is_tcp ? "  TCP" : ("  @" + std::to_string(cfg.baud) + " baud"))

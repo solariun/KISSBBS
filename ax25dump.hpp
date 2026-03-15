@@ -1,6 +1,6 @@
 // ax25dump.hpp — hexdump-C formatter + AX.25 control field decoder
 // Header-only, no external dependencies.
-// Shared by ax25kiss.cpp and ax25client.cpp.
+// Shared by ax25kiss.cpp and ax25tnc.cpp.
 //
 // Provides:
 //   hex_dump(data, len, prefix)  →  hexdump -C style multi-line string

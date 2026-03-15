@@ -11,7 +11,7 @@ env:
 
 jobs:
   # ── Core build + tests ─────────────────────────────────────────────────────
-  # Builds bbs / ax25kiss / ax25client and runs the full test suite.
+  # Builds bbs / ax25kiss / ax25tnc and runs the full test suite.
   # ble_kiss_bridge is excluded here because it requires SimpleBLE (cmake +
   # libdbus-1-dev on Linux, CoreBluetooth on macOS) — those deps are handled
   # in the separate "ble-bridge" job below.
@@ -56,7 +56,7 @@ jobs:
 
       # ── Build core (no BLE) ────────────────────────────────────────────────
       - name: Build core apps
-        run: make bbs ax25kiss ax25client
+        run: make bbs ax25kiss ax25tnc
 
       # ── Test suite ─────────────────────────────────────────────────────────
       - name: Run tests
