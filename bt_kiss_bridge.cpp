@@ -637,10 +637,47 @@ class BleTransport : public RadioTransport {
     // Resolved UUIDs (from config or auto-detected)
     std::string auto_service_, auto_write_, auto_read_;
 
-    // Auto-detect GATT UUIDs (same logic as do_ble_inspect)
+    // Auto-detect GATT UUIDs — find a service containing both a writable
+    // and a notifiable characteristic.  Skip standard GAP/GATT services.
     void auto_detect_uuids() {
         if (!peripheral_) return;
+
+        // Standard services to skip (Generic Access / Generic Attribute)
+        static const char* skip[] = {
+            "00001800-0000-1000-8000-00805f9b34fb",
+            "00001801-0000-1000-8000-00805f9b34fb",
+            "1800", "1801",
+        };
+        auto dominated = [&](const std::string& uuid) {
+            for (auto& s : skip)
+                if (uuid == s) return true;
+            return false;
+        };
+
+        // Phase 1 — find a service with BOTH write + notify/indicate
         for (auto& svc : peripheral_->services()) {
+            if (dominated(svc.uuid())) continue;
+            std::string w, r;
+            for (auto& chr : svc.characteristics()) {
+                if (w.empty() &&
+                    (chr.can_write_command() || chr.can_write_request()))
+                    w = chr.uuid();
+                if (r.empty() &&
+                    (chr.can_notify() || chr.can_indicate()))
+                    r = chr.uuid();
+            }
+            if (!w.empty() && !r.empty()) {
+                auto_service_ = svc.uuid();
+                auto_write_   = w;
+                auto_read_    = r;
+                return;  // best match — single service with both
+            }
+        }
+
+        // Phase 2 — fallback: pick first writable + first notifiable globally
+        //           (still skip GAP/GATT)
+        for (auto& svc : peripheral_->services()) {
+            if (dominated(svc.uuid())) continue;
             for (auto& chr : svc.characteristics()) {
                 if (auto_write_.empty() &&
                     (chr.can_write_command() || chr.can_write_request())) {
