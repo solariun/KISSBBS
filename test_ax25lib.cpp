@@ -76,10 +76,11 @@ private:
 // ─────────────────────────────────────────────────────────────────────────────
 static Config make_cfg(const std::string& call) {
     Config c;
-    c.mycall = Addr::make(call);
-    c.t1_ms  = 500;
-    c.t3_ms  = 5000;
-    c.n2     = 3;
+    c.mycall  = Addr::make(call);
+    c.t1_ms   = 500;
+    c.t3_ms   = 5000;
+    c.n2      = 3;
+    c.txdelay = 0;    // no TX pacing in tests (synchronous wire)
     return c;
 }
 
@@ -716,15 +717,16 @@ TEST(Timers, T1RetransmitReachesLinkFailed) {
     conn_a->send("unacked data");
 
     // Simulate time passing by forcing T1 to expire via tick().
-    // Each tick must advance time by > t1_ms (500 ms) so that T1 re-arms and
-    // re-fires on the next call.  retransmit_all resets T1 to now+t1_ms, so
+    // Each tick must advance time by > compute_t1() so that T1 re-arms and
+    // re-fires on the next call.  retransmit_all resets T1 to now+T1, so
     // using a fixed timestamp would stop T1 from firing after the first tick.
     // cfg n2=3 → link_failed on tick 4 (retry_ 0→1→2→3 >= 3).
     bool a_disconnected = false;
     conn_a->on_disconnect = [&]{ a_disconnected = true; };
 
+    int t1 = net.router_a.config().compute_t1();
     Millis base = now_ms() + 100000;
-    for (int i = 0; i < 5; ++i) conn_a->tick(base + (Millis)i * 1000);
+    for (int i = 0; i < 5; ++i) conn_a->tick(base + (Millis)i * (t1 + 100));
 
     EXPECT_EQ(conn_a->state(), Connection::State::DISCONNECTED);
     EXPECT_TRUE(a_disconnected);

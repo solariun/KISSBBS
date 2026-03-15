@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -221,6 +222,37 @@ public:
     }
 
     void stop() { running_ = false; }
+
+    // Graceful shutdown: disconnect all sessions and wait for DISC exchange
+    void shutdown() {
+        std::cerr << "[" << timestamp() << "] Shutting down — disconnecting "
+                  << sessions_.size() << " session(s)…\n";
+        for (auto& kv : sessions_) {
+            Connection* c = kv.second->conn;
+            if (c && c->connected()) {
+                kv.second->println("*** BBS shutting down. 73!");
+                c->disconnect();
+            }
+        }
+        // Poll until all sessions disconnect or timeout (2 seconds)
+        auto t0 = std::chrono::steady_clock::now();
+        for (;;) {
+            router_.poll();
+            bool any_active = false;
+            for (auto& kv : sessions_) {
+                if (kv.second->conn->state() != Connection::State::DISCONNECTED)
+                    any_active = true;
+            }
+            if (!any_active) break;
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - t0).count();
+            if (ms >= 2000) {
+                std::cerr << "[" << timestamp() << "] Shutdown timeout — forcing disconnect.\n";
+                break;
+            }
+            usleep(5000);
+        }
+    }
 
     void broadcast(const std::string& msg, const std::string& from = "") {
         for (auto it = sessions_.begin(); it != sessions_.end(); ++it) {
@@ -836,6 +868,7 @@ int main(int argc, char* argv[]) {
     g_bbs = &bbs;
     signal(SIGINT, sig_handler); signal(SIGTERM, sig_handler); signal(SIGCHLD, SIG_DFL);
     bbs.run();
+    bbs.shutdown();
     std::cerr << "BBS shutdown.\n";
     return 0;
 }

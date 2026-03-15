@@ -256,12 +256,19 @@ struct Config {
     std::vector<Addr> digis;          // digipeater path (default: empty)
     int mtu     = 128;                // max info bytes per I-frame
     int window  = 3;                  // max outstanding I-frames (K, 1-7)
-    int t1_ms   = 3000;               // retransmit timer ms
-    int t2_ms   = 200;                // delayed-ack timer ms (not used in send path)
+    int t1_ms   = 15000;              // retransmit timer ms (min, see compute_t1)
     int t3_ms   = 60000;              // keep-alive / inactivity timer ms
     int n2      = 10;                 // max retransmissions before link-fail
+    int baud    = 9600;               // link speed (for dynamic T1 computation)
     int txdelay = 40;                 // KISS TX delay (×10 ms units, default 400ms)
     int persist = 63;                 // KISS persistence (0-255)
+
+    // KISSet-style dynamic T1: max(t1_ms, window × mtu × 40000 / baud).
+    // Ensures T1 is long enough for the full window to transit the link.
+    int compute_t1() const {
+        int link_t1 = (window * mtu * 40000) / std::max(baud, 1);
+        return std::max(t1_ms, link_t1);
+    }
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -387,13 +394,12 @@ private:
     void retransmit_all(Millis now);
     void link_failed();
 
-    // Timer helpers
-    void start_t1(Millis now) { t1_exp_=now+srtt_ms_; t1_run_=true; }
+    // Timer helpers — simple fixed timers like KISSet
+    void start_t1(Millis now) { t1_exp_ = now + cfg_.compute_t1(); t1_run_ = true; }
     void stop_t1()            { t1_run_=false; }
     void start_t3(Millis now) { t3_exp_=now+cfg_.t3_ms; t3_run_=true; }
     void stop_t3()            { t3_run_=false; }
     void reset_t3(Millis now) { t3_exp_=now+cfg_.t3_ms; t3_run_=true; }
-    void update_rtt(Millis rtt);   // adaptive T1: SRTT estimator
 
     Router* router_;
     Addr    local_, remote_;
@@ -409,11 +415,10 @@ private:
     bool   t3_run_=false; Millis t3_exp_=0;
     bool   poll_pending_=false;
 
-    // Adaptive T1 (Smoothed Round-Trip Time estimator)
-    int    srtt_ms_  = 0;         // current adaptive T1 value (0 = use cfg_.t1_ms)
-    int    rttvar_   = 0;         // RTT variance (scaled ×4)
-    Millis rtt_start_= 0;         // when the oldest unacked frame was sent
-    bool   rtt_active_= false;    // true when measuring a round-trip
+    // Flow control
+    bool   peer_busy_=false;            // remote sent RNR — stop transmitting
+    int    rx_since_ack_=0;             // I-frames received since last RR sent
+    int    poll_sent_=0;               // count of outstanding P=1 polls awaiting F=1
 
     // Data queues
     std::deque<std::vector<uint8_t>> send_buf_;  // MTU-chunked, waiting to send
@@ -472,10 +477,15 @@ private:
     ObjList<Connection> conns_;
     std::function<void(Connection*)> on_accept_;
 
+    // TX pacing — one frame per TXDELAY interval
+    std::deque<std::vector<uint8_t>> tx_queue_;   // encoded frames waiting to go out
+    Millis                           tx_next_ = 0; // earliest time next frame may be sent
+
     void route(std::vector<uint8_t> raw, Millis now);
     Connection* find(const Addr& local, const Addr& remote);
     bool        tx(const Frame& f);
     bool        send_frame(const Frame& f) { return tx(f); }  // for Connection
+    void        drain_tx(Millis now);   // send queued frames respecting TXDELAY pacing
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

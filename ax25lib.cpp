@@ -191,10 +191,11 @@ inline uint8_t mk_rej(int nr,bool p)       { return static_cast<uint8_t>(0x09|(p
 Frame::Type Frame::type() const {
     if ((ctrl & 0x01) == 0x00) return Type::IFrame;
     if ((ctrl & 0x03) == 0x01) {
+        // SS bits (3-2): 00=RR, 01=RNR, 10=REJ  (AX.25 v2.2 §4.3.2)
         switch ((ctrl >> 2) & 3) {
             case 0: return Type::RR;
-            case 1: return Type::REJ;
-            case 2: return Type::RNR;
+            case 1: return Type::RNR;
+            case 2: return Type::REJ;
             default: return Type::SFrame;
         }
     }
@@ -372,10 +373,8 @@ Connection::Connection(Router* router, ObjList<Connection>& lst,
     : ObjNode<Connection>(lst),         // ← auto-insert via ObjNode ctor
       router_(router),
       local_(local), remote_(remote),
-      cfg_(cfg), outgoing_(outgoing),
-      srtt_ms_(cfg.t1_ms)              // initial adaptive T1 = configured value
+      cfg_(cfg), outgoing_(outgoing)
 {
-    rttvar_ = cfg.t1_ms / 2;           // initial variance = half of T1
     (void)outgoing_;   // suppress unused-parameter warning
 }
 
@@ -433,44 +432,38 @@ void Connection::tx_iframe(int ns, int nr, bool pf,
     f.has_pid = true;
     f.info    = std::vector<uint8_t>(d, d + len);
     router_->send_frame(f);
+    // I-frame piggybacks NR — no separate RR needed
 }
 
 // =============================================================================
 // Connection — window management
 // =============================================================================
 void Connection::flush_window(Millis now) {
+    if (peer_busy_) return;  // remote sent RNR — stop transmitting
     while (!send_buf_.empty() && (int)unacked_.size() < cfg_.window) {
-        // Move the chunk out of send_buf_ and into unacked_ BEFORE calling
-        // tx_iframe.  This prevents a re-entrancy hazard: if tx_iframe
-        // triggers a synchronous callback chain (RR → process_nr →
-        // flush_window), the queues are already in a consistent state.
         auto chunk = std::move(send_buf_.front());
         send_buf_.pop_front();
         int ns = vs_;
         vs_ = (vs_ + 1) & 7;
         unacked_.push_back({ns, chunk});           // keep a copy in unacked_
-        tx_iframe(ns, vr_, false, chunk.data(), chunk.size());
+
+        // P=1 (poll) only when the window is now full.
+        // Don't poll when send_buf_ merely empties — more send() calls
+        // may follow immediately (e.g. BBS sending menu lines one by one).
+        // For partial-window sends, T1 retransmit will eventually poll.
+        bool window_full = (int)unacked_.size() >= cfg_.window;
+        if (window_full) ++poll_sent_;
+        tx_iframe(ns, vr_, window_full, chunk.data(), chunk.size());
     }
     if (!unacked_.empty() && !t1_run_) start_t1(now);
-    // Start RTT measurement on the first unacked frame
-    if (!unacked_.empty() && !rtt_active_) {
-        rtt_start_  = now;
-        rtt_active_ = true;
-    }
 }
 
 void Connection::process_nr(int nr, Millis now) {
     // Pop all frames acknowledged by peer (ns != nr means it's been acked)
-    bool any_acked = !unacked_.empty() && unacked_.front().ns != nr;
     while (!unacked_.empty() && unacked_.front().ns != nr)
         unacked_.pop_front();
     va_ = nr;
     retry_ = 0;
-    // Adaptive T1: complete RTT measurement when frames are newly acked
-    if (any_acked && rtt_active_) {
-        update_rtt(now - rtt_start_);
-        rtt_active_ = false;
-    }
     if (unacked_.empty()) stop_t1();
     else                  start_t1(now);
     flush_window(now);
@@ -478,18 +471,19 @@ void Connection::process_nr(int nr, Millis now) {
 }
 
 void Connection::retransmit_all(Millis now) {
-    // Go-Back-N: replay all unacked frames with current vr_
-    rtt_active_ = false;   // invalidate RTT measurement on retransmit
+    // Go-Back-N: replay all unacked frames with current vr_.
+    // Does NOT flush new data — caller decides whether to send more.
     vs_ = va_;
     std::deque<UnackedFrame> tmp;
     std::swap(tmp, unacked_);
-    for (auto& uf : tmp) {
-        tx_iframe(vs_, vr_, false, uf.data.data(), uf.data.size());
+    for (std::size_t i = 0; i < tmp.size(); ++i) {
+        auto& uf = tmp[i];
+        bool last = (i == tmp.size() - 1);  // P=1 on last frame to poll
+        if (last) ++poll_sent_;
+        tx_iframe(vs_, vr_, last, uf.data.data(), uf.data.size());
         unacked_.push_back({vs_, std::move(uf.data)});
         vs_ = (vs_ + 1) & 7;
     }
-    // Fill remaining window slots with new data from send_buf_
-    flush_window(now);
     if (!unacked_.empty()) start_t1(now);
 }
 
@@ -499,36 +493,12 @@ void Connection::link_failed() {
     if (on_disconnect) on_disconnect();
 }
 
-// Adaptive T1: Jacobson/Karels SRTT estimator (RFC 6298 simplified)
-// rtt = measured round-trip time in ms
-void Connection::update_rtt(Millis rtt) {
-    int r = (int)rtt;
-    if (srtt_ms_ == cfg_.t1_ms && rttvar_ == cfg_.t1_ms / 2) {
-        // First real measurement — initialize per RFC 6298
-        srtt_ms_ = r;
-        rttvar_  = r / 2;
-    } else {
-        // RTTVAR = (1-β) × RTTVAR + β × |SRTT - R|   (β = 1/4)
-        int delta = srtt_ms_ - r;
-        if (delta < 0) delta = -delta;
-        rttvar_ = (3 * rttvar_ + delta) / 4;
-        // SRTT  = (1-α) × SRTT + α × R               (α = 1/8)
-        srtt_ms_ = (7 * srtt_ms_ + r) / 8;
-    }
-    // T1 = SRTT + max(200, 4 × RTTVAR), clamped to [500, cfg_.t1_ms × 4]
-    int t1 = srtt_ms_ + std::max(200, 4 * rttvar_);
-    int lo = 500;                      // never go below 500 ms
-    int hi = cfg_.t1_ms * 4;           // never exceed 4× configured T1
-    if (t1 < lo) t1 = lo;
-    if (t1 > hi) t1 = hi;
-    srtt_ms_ = t1;
-}
-
 // =============================================================================
 // Connection — start outgoing
 // =============================================================================
 void Connection::start_connect(Millis now) {
     vs_ = vr_ = va_ = retry_ = 0;
+    peer_busy_ = false; rx_since_ack_ = 0; poll_sent_ = 0;
     state_ = State::CONNECTING;
     tx_sabm();
     start_t1(now);
@@ -569,6 +539,7 @@ void Connection::handle_frame(const Frame& f, Millis now) {
     case State::DISCONNECTED:
         if (t == Frame::Type::SABM) {
             vs_ = vr_ = va_ = retry_ = 0;
+            peer_busy_ = false; rx_since_ack_ = 0;
             tx_ua(f.get_pf());
             state_ = State::CONNECTED;
             start_t3(now);
@@ -614,6 +585,7 @@ void Connection::handle_frame(const Frame& f, Millis now) {
         if (t == Frame::Type::SABM) {
             // Re-connect from peer: reset and ack
             vs_ = vr_ = va_ = 0;
+            peer_busy_ = false;
             unacked_.clear(); send_buf_.clear();
             tx_ua(f.get_pf());
             return;
@@ -623,12 +595,17 @@ void Connection::handle_frame(const Frame& f, Millis now) {
         if (t == Frame::Type::IFrame) {
             process_nr(f.get_nr(), now);
             if (f.get_ns() == vr_) {
+                // In-sequence: accept and ACK immediately.
+                // Must ACK every frame because we don't know the
+                // remote's window size (could be 1).
                 vr_ = (vr_ + 1) & 7;
                 if (on_data && !f.info.empty())
                     on_data(f.info.data(), f.info.size());
-                tx_rr(f.get_pf());   // ack; mirrors Poll bit as Final
+                tx_rr(f.get_pf());
             } else {
-                // Out-of-sequence: REJ
+                // Out-of-sequence or duplicate: REJ to request retransmit
+                rx_since_ack_ = 0;
+                tx_rr(f.get_pf());
                 Frame rej;
                 rej.dest = remote_; rej.src = local_;
                 rej.ctrl = mk_rej(vr_, false);
@@ -636,27 +613,39 @@ void Connection::handle_frame(const Frame& f, Millis now) {
                 router_->send_frame(rej);
             }
         } else if (t == Frame::Type::RR) {
+            peer_busy_ = false;            // RR clears busy condition
             process_nr(f.get_nr(), now);
-            if (f.get_pf()) tx_rr(true);  // respond to poll with F=1
+            if (f.get_pf()) {
+                if (poll_sent_ > 0) {
+                    // F=1 response to our P=1 poll — don't echo back
+                    --poll_sent_;
+                } else {
+                    // P=1 poll from peer — must respond with F=1
+                    tx_rr(true);
+                }
+            }
         } else if (t == Frame::Type::RNR) {
+            peer_busy_ = true;             // stop sending I-frames
             process_nr(f.get_nr(), now);
-            // Peer busy; window management already handled
+            if (f.get_pf()) {
+                if (poll_sent_ > 0) {
+                    --poll_sent_;
+                } else {
+                    tx_rr(true);
+                }
+            }
         } else if (t == Frame::Type::REJ) {
-            // Ack frames up to NR (like process_nr) but do NOT flush new
-            // frames — retransmit_all will replay unacked + flush in one pass.
+            peer_busy_ = false;            // REJ implies ready to receive
+            // Ack frames up to NR, then replay remaining + fill new slots
             {
-                bool any_acked = !unacked_.empty() && unacked_.front().ns != f.get_nr();
                 while (!unacked_.empty() && unacked_.front().ns != f.get_nr())
                     unacked_.pop_front();
                 va_ = f.get_nr();
                 retry_ = 0;
-                if (any_acked && rtt_active_) {
-                    update_rtt(now - rtt_start_);
-                    rtt_active_ = false;
-                }
                 reset_t3(now);
             }
-            retransmit_all(now);
+            retransmit_all(now);   // replay remaining unacked
+            flush_window(now);     // fill freed slots with new data
         }
         break;
 
@@ -684,8 +673,15 @@ void Connection::tick(Millis now) {
         case State::CONNECTING:
             tx_sabm(); start_t1(now); break;
         case State::CONNECTED:
-            if (poll_pending_) { link_failed(); return; }
-            retransmit_all(now);
+            if (!unacked_.empty()) {
+                // Retransmit directly. On BLE half-duplex links, the
+                // burst of I-frames triggers the radio turnaround that
+                // lets the remote respond (a small RR poll doesn't).
+                retransmit_all(now);
+            } else if (poll_pending_) {
+                // Keep-alive poll got no response — link dead
+                link_failed(); return;
+            }
             break;
         case State::DISCONNECTING:
             tx_disc(); start_t1(now); break;
@@ -697,6 +693,7 @@ void Connection::tick(Millis now) {
     if (t3_run_ && now >= t3_exp_ && state_ == State::CONNECTED) {
         t3_run_       = false;
         poll_pending_ = true;
+        ++poll_sent_;
         tx_rr(true);       // RR with P=1
         start_t1(now);
     }
@@ -748,6 +745,7 @@ void Router::send_aprs(const std::string& info, const Addr& dest,
 void Router::poll() {
     kiss_.poll();
     Millis now = now_ms();
+    drain_tx(now);                       // send queued frames respecting TX pacing
     for (auto* c : conns_.snapshot())
         c->tick(now);
 }
@@ -759,12 +757,40 @@ Connection* Router::find(const Addr& local, const Addr& remote) {
 }
 
 bool Router::tx(const Frame& f) {
-    return kiss_.send_frame(f.encode());
+    auto encoded = f.encode();
+    if (encoded.empty()) return false;
+    // No pacing when txdelay == 0 (tests, local loopback)
+    if (cfg_.txdelay == 0) return kiss_.send_frame(std::move(encoded));
+    // Queue for burst-aware paced transmission
+    tx_queue_.push_back(std::move(encoded));
+    drain_tx(now_ms());
+    return true;
+}
+
+void Router::drain_tx(Millis now) {
+    while (!tx_queue_.empty()) {
+        if (now < tx_next_) return;            // waiting for TXDELAY pause
+
+        kiss_.send_frame(std::move(tx_queue_.front()));
+        tx_queue_.pop_front();
+
+        // One frame, then pause TXDELAY before the next.
+        // Gives the remote side time to respond between frames.
+        if (!tx_queue_.empty())
+            tx_next_ = now + (Millis)(cfg_.txdelay * 10);
+    }
 }
 
 void Router::route(std::vector<uint8_t> raw, Millis now) {
     Frame f;
     if (!Frame::decode(raw, f)) return;
+
+    // TXDELAY turnaround: don't respond instantly after receiving.
+    // Give the remote side time to switch from TX to RX.
+    if (cfg_.txdelay > 0) {
+        Millis earliest = now + (Millis)(cfg_.txdelay * 10);
+        if (earliest > tx_next_) tx_next_ = earliest;
+    }
 
     // Monitor callback: fires for every decoded frame
     if (on_monitor) on_monitor(f);
@@ -857,6 +883,8 @@ bool CLIParams::parse(int argc, char* argv[], const char* extra_usage) {
         std::cerr << "Error: callsign required  (-c CALL[-SSID])\n";
         return false;
     }
+    // Flow baud rate into config for dynamic T1 computation
+    cfg.baud = baud;
     return true;
 }
 
@@ -869,9 +897,9 @@ void CLIParams::print_help(const char* prog, const char* extra) {
         << "  -p <path>       Digipeater path, comma-separated\n"
         << "  -m <bytes>      I-frame MTU (default: 128)\n"
         << "  -w <1-7>        Window size (default: 3)\n"
-        << "  -t <ms>         T1 retransmit timer ms (default: 3000)\n"
+        << "  -t <ms>         T1 retransmit timer min ms (default: 15000)\n"
         << "  -k <ms>         T3 keep-alive timer ms (default: 60000)\n"
-        << "  -T <units>      KISS TX delay ×10 ms (default: 30)\n"
+        << "  -T <units>      KISS TX delay ×10 ms (default: 40)\n"
         << "  -s <0-255>      KISS persistence (default: 63)\n";
     if (extra && *extra) std::cerr << extra;
 }

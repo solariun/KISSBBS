@@ -89,14 +89,26 @@ a flag byte carrying the SSID and housekeeping bits.
 | REJ | Reject — requests retransmission from a given sequence number |
 
 **Connected mode** (what `Connection` implements) uses a sliding window
-(Go-Back-N, mod-8) with three timers:
+(Go-Back-N, mod-8) with two timers:
 
-* **T1** — Retransmit timer.  Started when an I-frame is sent.  If T1 expires
-  before an ACK arrives the frame is retransmitted.  After *N2* retries the link
-  is declared failed.
-* **T2** — Delayed-ACK timer.  Not used in the send path here.
+* **T1** — Retransmit timer.  Dynamically computed:
+  `max(t1_ms, window × mtu × 40000 / baud)`.  This ensures T1 is long enough
+  for the full window to transit slow links (BLE, 1200 baud, etc.).  Default
+  minimum is 15 000 ms.  If T1 expires before an ACK arrives the frame is
+  retransmitted with P=1 to poll the remote.  After *N2* retries the link is
+  declared failed.
 * **T3** — Keep-alive / inactivity timer.  If no data is exchanged within T3 the
-  station sends an RR poll to verify the link is still alive.
+  station sends an RR poll (P=1) to verify the link is still alive.
+
+**P/F poll tracking** — The library tracks outstanding P=1 polls internally.
+When the window fills, the last I-frame is sent with P=1 to solicit an RR
+response from the remote.  Incoming RR/RNR with F=1 are matched against
+outstanding polls so the library never echoes back a spurious RR.  Applications
+never need to manage polling — it is fully transparent.
+
+**TX pacing** — Outgoing frames are spaced by TXDELAY (default 400 ms) to give
+half-duplex radios time for TX/RX turnaround.  After receiving a frame, the
+router also enforces a turnaround delay before responding.
 
 ### KISS
 
@@ -552,11 +564,14 @@ std::string s = a.str();   // → "W1AW-7"
 ```cpp
 Config cfg;
 cfg.mycall  = Addr::make("W1AW");
-cfg.mtu     = 128;   // max info bytes per I-frame
-cfg.window  = 3;     // max outstanding unacked I-frames (1–7)
-cfg.t1_ms   = 3000;  // retransmit timer ms
-cfg.t3_ms   = 60000; // keep-alive inactivity timer ms
-cfg.n2      = 10;    // max retries before link fail
+cfg.mtu     = 128;     // max info bytes per I-frame
+cfg.window  = 3;       // max outstanding unacked I-frames (1–7)
+cfg.t1_ms   = 15000;   // retransmit timer min ms (dynamic: see compute_t1())
+cfg.t3_ms   = 60000;   // keep-alive inactivity timer ms
+cfg.n2      = 10;      // max retries before link fail
+cfg.baud    = 9600;    // link speed — used by compute_t1()
+cfg.txdelay = 40;      // KISS TX delay (×10 ms, default 400 ms)
+cfg.persist = 63;      // KISS persistence (0–255)
 ```
 
 ### `ax25::Kiss`
@@ -994,10 +1009,10 @@ baud   = 9600             ; baud rate: 1200 / 9600 / 38400 / 115200
 callsign    = W1BBS-1     ; your station callsign (required)
 mtu         = 128         ; max bytes per I-frame
 window      = 3           ; sliding window size (1–7)
-t1_ms       = 3000        ; retransmit timer (ms)
+t1_ms       = 15000       ; retransmit timer min ms (auto-scaled by baud)
 t3_ms       = 60000       ; keep-alive timer (ms)
 n2          = 10          ; max retries before link failure
-txdelay     = 30          ; KISS TX delay (×10 ms)
+txdelay     = 40          ; KISS TX delay (×10 ms, default 400 ms)
 persist     = 63          ; KISS persistence byte (0–255)
 ; digipeaters = WIDE1-1,WIDE2-1   ; optional digi path
 

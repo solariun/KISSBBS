@@ -977,18 +977,50 @@ static void do_bridge(const BridgeConfig& cfg) {
             });
 
         using SteadyClock = std::chrono::steady_clock;
-        auto last_ble_write = SteadyClock::now();
+        std::atomic<SteadyClock::time_point> last_ble_write{SteadyClock::now()};
 
-        auto ble_write = [&](const uint8_t* data, int len) {
-            for (int i = 0; i < len; i += chunk_size) {
-                int clen = std::min(chunk_size, len - i);
-                SimpleBLE::ByteArray chunk(data + i, data + i + clen);
-                if (use_response)
-                    peripheral.write_request(cfg.service_uuid, cfg.write_uuid, chunk);
-                else
-                    peripheral.write_command(cfg.service_uuid, cfg.write_uuid, chunk);
+        // ── Async BLE write queue + writer thread ────────────────────────
+        // Moves BLE writes off the main loop so notifications (BLE→PTY)
+        // are never blocked by write_request() completions on the
+        // CoreBluetooth dispatch queue.
+        std::mutex                        ble_tx_mx;
+        std::condition_variable           ble_tx_cv;
+        std::deque<std::vector<uint8_t>>  ble_tx_queue;
+        std::atomic<bool>                 ble_tx_stop{false};
+
+        std::thread ble_writer([&]() {
+            while (!ble_tx_stop) {
+                std::vector<uint8_t> pkt;
+                {
+                    std::unique_lock<std::mutex> lk(ble_tx_mx);
+                    ble_tx_cv.wait_for(lk, std::chrono::milliseconds(50),
+                        [&]{ return !ble_tx_queue.empty() || ble_tx_stop.load(); });
+                    if (ble_tx_queue.empty()) continue;
+                    pkt = std::move(ble_tx_queue.front());
+                    ble_tx_queue.pop_front();
+                }
+                try {
+                    for (int i = 0; i < (int)pkt.size(); i += chunk_size) {
+                        int clen = std::min(chunk_size, (int)pkt.size() - i);
+                        SimpleBLE::ByteArray chunk(pkt.data() + i, pkt.data() + i + clen);
+                        if (use_response)
+                            peripheral.write_request(cfg.service_uuid, cfg.write_uuid, chunk);
+                        else
+                            peripheral.write_command(cfg.service_uuid, cfg.write_uuid, chunk);
+                    }
+                    last_ble_write.store(SteadyClock::now());
+                } catch (const std::exception& e) {
+                    std::lock_guard<std::mutex> lk(mx);
+                    std::cerr << "  BLE write error: " << e.what() << "\n";
+                }
             }
-            last_ble_write = SteadyClock::now();
+        });
+
+        // Non-blocking enqueue — never blocks the caller
+        auto ble_write = [&](const uint8_t* data, int len) {
+            std::lock_guard<std::mutex> lk(ble_tx_mx);
+            ble_tx_queue.emplace_back(data, data + len);
+            ble_tx_cv.notify_one();
         };
 
         // ── PTY → BLE session loop ────────────────────────────────────────
@@ -1021,18 +1053,16 @@ static void do_bridge(const BridgeConfig& cfg) {
             // BLE keep-alive
             if (cfg.ble_ka_ms > 0) {
                 auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                   SteadyClock::now() - last_ble_write).count();
+                                   SteadyClock::now() - last_ble_write.load()).count();
                 if (elapsed >= cfg.ble_ka_ms) {
-                    try {
-                        static const uint8_t kiss_null[] = {0xC0, 0xC0};
-                        ble_write(kiss_null, 2);
-                        if (cfg.monitor && cfg.show_keepalive) {
-                            std::lock_guard<std::mutex> lk(mx);
-                            std::cout << "\n" << hr() << "\n";
-                            std::cout << "[" << ts() << "]  BLE keep-alive  (KISS null)\n";
-                            std::cout.flush();
-                        }
-                    } catch (...) {}
+                    static const uint8_t kiss_null[] = {0xC0, 0xC0};
+                    ble_write(kiss_null, 2);  // non-blocking enqueue
+                    if (cfg.monitor && cfg.show_keepalive) {
+                        std::lock_guard<std::mutex> lk(mx);
+                        std::cout << "\n" << hr() << "\n";
+                        std::cout << "[" << ts() << "]  BLE keep-alive  (KISS null)\n";
+                        std::cout.flush();
+                    }
                 }
             }
 
@@ -1110,13 +1140,7 @@ static void do_bridge(const BridgeConfig& cfg) {
                     }
                     std::cout.flush();
                 }
-                try {
-                    ble_write(tbuf, (int)tn);
-                } catch (const std::exception& e) {
-                    std::lock_guard<std::mutex> lk(mx);
-                    std::cout << "  BLE write error (TCP->BLE): " << e.what() << "\n";
-                    std::cout.flush();
-                }
+                ble_write(tbuf, (int)tn);  // non-blocking enqueue
             }
 
             // Read from PTY → BLE (serial mode only)
@@ -1155,14 +1179,13 @@ static void do_bridge(const BridgeConfig& cfg) {
                 }
                 std::cout.flush();
             }
-            try {
-                ble_write(buf, (int)nr);
-            } catch (const std::exception& e) {
-                std::lock_guard<std::mutex> lk(mx);
-                std::cout << "  BLE write error (PTY->BLE): " << e.what() << "\n";
-                std::cout.flush();
-            }
+            ble_write(buf, (int)nr);  // non-blocking enqueue
         }  // end session main loop
+
+        // ── Stop BLE writer thread ───────────────────────────────────────
+        ble_tx_stop = true;
+        ble_tx_cv.notify_one();
+        if (ble_writer.joinable()) ble_writer.join();
 
         // ── Per-session BLE cleanup ───────────────────────────────────────
         try { peripheral.unsubscribe(cfg.service_uuid, cfg.read_uuid); } catch (...) {}
