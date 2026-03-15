@@ -24,12 +24,12 @@ brew install googletest sqlite cmake
 sudo apt-get install libgtest-dev libsqlite3-dev cmake libdbus-1-dev pkg-config
 
 # 3. Build core apps + run tests
-make          # builds: bbs  ax25kiss  ax25tnc  basic_tool  ble_kiss_bridge
+make          # builds: bbs  ax25kiss  ax25tnc  basic_tool  bt_kiss_bridge
 make test     # runs 170 tests — must all pass
 
-# 4. (Optional) BLE bridge — macOS & Linux with BlueZ
+# 4. (Optional) Bluetooth bridge — macOS & Linux with BlueZ
 make ble-deps          # compiles SimpleBLE once from vendor/simpleble
-make ble_kiss_bridge   # links ble_kiss_bridge
+make bt_kiss_bridge    # links bt_kiss_bridge (BLE + Classic BT)
 ```
 
 > **First clone on an existing checkout?**
@@ -58,7 +58,7 @@ make ble_kiss_bridge   # links ble_kiss_bridge
 14. [APRS Helpers (ax25::aprs)](#14-aprs-helpers-ax25aprs)
 15. [ax25tnc — TNC Terminal Client](#15-ax25tnc--tnc-terminal-client)
 16. [ble_kiss_monitor.py — BLE KISS Scanner & AX.25 Monitor](#16-ble_kiss_monitorpy--ble-kiss-scanner--ax25-monitor)
-17. [ble_kiss_bridge — C++ BLE KISS Bridge](#17-ble_kiss_bridge--c-ble-kiss-bridge)
+17. [bt_kiss_bridge — Bluetooth KISS Bridge (BLE + Classic BT)](#17-bt_kiss_bridge--bluetooth-kiss-bridge-ble--classic-bt)
 18. [basic_tool — Offline BASIC Interpreter / REPL Debugger](#18-basic_tool--offline-basic-interpreter--repl-debugger)
 
 ---
@@ -507,7 +507,7 @@ sequenceDiagram
 **SQLite3** — needed for the `DBOPEN/DBEXEC/DBQUERY` BASIC commands.
 The Makefile auto-detects it via `pkg-config`; everything else compiles without it.
 
-**cmake** — needed only for `ble_kiss_bridge` (see §17).
+**cmake** — needed only for `bt_kiss_bridge` (see §17).
 
 ```bash
 # macOS
@@ -523,14 +523,14 @@ sudo dnf install gtest-devel sqlite-devel cmake dbus-devel
 ### Build targets
 
 ```bash
-make                  # build bbs, ax25kiss, ax25tnc, and ble_kiss_bridge
+make                  # build bbs, ax25kiss, ax25tnc, and bt_kiss_bridge
                       # (SimpleBLE is cloned and built automatically on first run)
 make test             # compile and run all unit tests
 make clean            # remove all build artefacts
 
-# BLE bridge (built automatically by `make`, but can also be triggered manually)
+# Bluetooth bridge (built automatically by `make`, but can also be triggered manually)
 make ble-deps         # clone + build SimpleBLE into vendor/simpleble  (once)
-make ble_kiss_bridge  # build only the C++ BLE KISS bridge
+make bt_kiss_bridge  # build the Bluetooth KISS bridge (BLE + Classic BT)
 ```
 
 To cross-compile or choose a different compiler:
@@ -2237,7 +2237,7 @@ ax25tnc -c W1AW /dev/ttyUSB0
 # Start TNC and auto-connect to a remote station
 ax25tnc -c W1AW -r W1BBS-1 /dev/ttyUSB0
 
-# Start TNC via TCP (ble_kiss_bridge --server-port, or any KISS-over-TCP TNC)
+# Start TNC via TCP (bt_kiss_bridge --server-port, or any KISS-over-TCP TNC)
 ax25tnc -c W1AW localhost:8001
 
 # Legacy: monitor mode
@@ -2634,9 +2634,10 @@ Use `--inspect` to confirm UUIDs for your specific device.
 
 ---
 
-## 17. ble_kiss_bridge — C++ BLE KISS Bridge
+## 17. bt_kiss_bridge — Bluetooth KISS Bridge (BLE + Classic BT)
 
-`ble_kiss_bridge` is a native C++17 companion to `ble_kiss_monitor.py`, offering
+`bt_kiss_bridge` is a native C++17 Bluetooth KISS bridge supporting both BLE (GATT)
+and Classic Bluetooth (RFCOMM/SPP). It replaces `ble_kiss_monitor.py`, offering
 the same three modes with no Python dependency.  It uses
 [SimpleBLE](https://github.com/OpenBluetoothToolbox/SimpleBLE) which
 wraps **BlueZ** on Linux and **CoreBluetooth** on macOS.
@@ -2652,9 +2653,9 @@ wraps **BlueZ** on Linux and **CoreBluetooth** on macOS.
 # 2 — build everything (SimpleBLE is cloned and compiled automatically)
 make
 
-# Or build only ble_kiss_bridge explicitly:
+# Or build only bt_kiss_bridge explicitly:
 make ble-deps         # clone + build SimpleBLE into vendor/simpleble  (once)
-make ble_kiss_bridge  # compile the bridge
+make bt_kiss_bridge  # compile the bridge
 
 # 3 — (optional) install to /usr/local/bin alongside the other tools
 sudo make install
@@ -2672,20 +2673,20 @@ sudo make install
 
 ```bash
 # 1. Find devices
-./ble_kiss_bridge --scan --timeout 15
+./bt_kiss_bridge --scan --timeout 15
 
 # 2. Identify UUIDs
-./ble_kiss_bridge --inspect AA:BB:CC:DD:EE:FF
+./bt_kiss_bridge --inspect AA:BB:CC:DD:EE:FF
 
 # 3a. Start PTY bridge (single local user via /dev/pts/N)
-./ble_kiss_bridge \
+./bt_kiss_bridge \
     --device   AA:BB:CC:DD:EE:FF \
     --service  00000001-ba2a-46c9-ae49-01b0961f68bb \
     --write    00000003-ba2a-46c9-ae49-01b0961f68bb \
     --read     00000002-ba2a-46c9-ae49-01b0961f68bb
 
 # 3b. Start PTY + TCP server bridge (multiple clients)
-./ble_kiss_bridge \
+./bt_kiss_bridge \
     --device   AA:BB:CC:DD:EE:FF \
     --service  00000001-ba2a-46c9-ae49-01b0961f68bb \
     --write    00000003-ba2a-46c9-ae49-01b0961f68bb \
@@ -2712,14 +2713,14 @@ ax25tnc -c W1AW -r W1BBS-1 localhost:8001
 
 ### TCP server mode (`--server-port`)
 
-When `--server-port` is given, `ble_kiss_bridge` also listens on a TCP port and
+When `--server-port` is given, `bt_kiss_bridge` also listens on a TCP port and
 acts as a KISS-over-TCP server.  Any number of TCP clients (e.g. `ax25tnc`,
 `ax25tnc` on another machine, or custom applications) can connect
 simultaneously and share the same BLE TNC:
 
 ```bash
 # Bridge Mobilinkd TNC4 to BLE and expose it as a TCP KISS server on port 8001
-./ble_kiss_bridge \
+./bt_kiss_bridge \
     --device   AA:BB:CC:DD:EE:FF \
     --service  00000001-ba2a-46c9-ae49-01b0961f68bb \
     --write    00000003-ba2a-46c9-ae49-01b0961f68bb \
@@ -2730,7 +2731,7 @@ simultaneously and share the same BLE TNC:
 ax25tnc -c W1AW -r W1BBS-1 localhost:8001
 
 # Restrict the server to a specific interface (e.g. loopback only):
-./ble_kiss_bridge ... --server-port 8001 --server-host 127.0.0.1
+./bt_kiss_bridge ... --server-port 8001 --server-host 127.0.0.1
 ```
 
 Traffic flow:
@@ -2756,11 +2757,11 @@ inactivity timer transparently without injecting any AX.25 traffic.
 
 ```bash
 # Default: BLE keep-alive every 5 s
-./ble_kiss_bridge --device AA:BB:CC:DD:EE:FF ...
+./bt_kiss_bridge --device AA:BB:CC:DD:EE:FF ...
 
 # Increase to 10 s, or disable entirely
-./ble_kiss_bridge --device AA:BB:CC:DD:EE:FF ... --ble-ka 10
-./ble_kiss_bridge --device AA:BB:CC:DD:EE:FF ... --ble-ka 0
+./bt_kiss_bridge --device AA:BB:CC:DD:EE:FF ... --ble-ka 10
+./bt_kiss_bridge --device AA:BB:CC:DD:EE:FF ... --ble-ka 0
 ```
 
 ### UUID name resolution
@@ -2791,7 +2792,7 @@ If `--service` is omitted (inspect / scan modes) a generic active scan is used.
 
 ### Automatic BLE reconnection
 
-`ble_kiss_bridge` is designed to run as a long-lived background service.  When
+`bt_kiss_bridge` is designed to run as a long-lived background service.  When
 the BLE connection drops (TNC power-cycled, out of range, BLE timeout, etc.),
 the bridge automatically attempts to reconnect:
 
@@ -2803,7 +2804,7 @@ the bridge automatically attempts to reconnect:
 - A `[BLE disconnected]` / `[BLE reconnecting (attempt N/10)]` message is
   printed to the console so you can monitor the process
 
-This means you can start `ble_kiss_bridge` once (e.g. from a systemd unit or
+This means you can start `bt_kiss_bridge` once (e.g. from a systemd unit or
 launchd plist) and it will survive intermittent BLE disruptions without losing
 the serial or TCP endpoints that downstream applications depend on.
 
@@ -2813,7 +2814,7 @@ the serial or TCP endpoints that downstream applications depend on.
 - **Linux**: BlueZ negotiates MTU during connect; `--mtu` also acts as a cap.  BlueZ requires `libdbus-1-dev` at build time for the `SetDiscoveryFilter` integration.
 - The tool auto-detects write mode: prefers *write-without-response* when the characteristic supports it; falls back to *write-with-response*; use `--write-with-response` to override.
 - `vendor/simpleble` is excluded from git (`.gitignore`).  `make` clones and builds it automatically on first run; subsequent builds skip this step because the library file is used as a real-file Makefile target.
-- `make install` / `make uninstall` install/remove all built binaries (`bbs`, `ax25kiss`, `ax25tnc`, `basic_tool`, `ble_kiss_bridge`) under `$(PREFIX)` (default `/usr/local/bin`).
+- `make install` / `make uninstall` install/remove all built binaries (`bbs`, `ax25kiss`, `ax25tnc`, `basic_tool`, `bt_kiss_bridge`) under `$(PREFIX)` (default `/usr/local/bin`).
 - The BLE keep-alive (`--ble-ka`, default 5 s) writes a KISS null frame to reset the TNC's inactivity timer without affecting AX.25 traffic.
 - The TCP server uses a dual-stack IPv6 socket (`IPV6_V6ONLY=0`) accepting both IPv4 and IPv6 clients, with automatic IPv4-only fallback.
 

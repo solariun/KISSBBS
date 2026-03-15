@@ -70,10 +70,12 @@ ifeq ($(UNAME), Linux)
     DBUS_LIBS   := $(shell pkg-config --libs   dbus-1 2>/dev/null || echo "-ldbus-1")
     SIMPLEBLE_SYS = $(DBUS_LIBS) -lpthread
     SIMPLEBLE_INC += $(DBUS_CFLAGS)
+    BLUETOOTH_LIBS = -lbluetooth
 else
     DBUS_CFLAGS :=
     SIMPLEBLE_SYS = -framework CoreBluetooth -framework Foundation \
                     -framework IOKit -framework IOBluetooth -lpthread
+    BLUETOOTH_LIBS =
 endif
 
 NPROC := $(shell nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 4)
@@ -88,7 +90,7 @@ BINDIR     = $(PREFIX)/bin
 
 .PHONY: all clean test install uninstall install-deps ble-deps
 
-all: bbs ax25kiss ax25tnc basic_tool ble_kiss_bridge
+all: bbs ax25kiss ax25tnc basic_tool bt_kiss_bridge
 
 $(LIB_OBJ): $(LIB_SRC) ax25lib.hpp
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
@@ -132,15 +134,20 @@ $(BLE_LIB):
 	cmake --build $(SIMPLEBLE_DIR)/build --config Release -j$(NPROC)
 	@echo "SimpleBLE ready."
 
-ble_kiss_bridge: ble_kiss_bridge.cpp $(BLE_LIB)
+bt_kiss_bridge: bt_kiss_bridge.cpp $(BLE_LIB)
 	$(CXX) -std=c++17 -O2 -Wall -Wextra \
 	    $(SIMPLEBLE_INC) \
-	    -o $@ ble_kiss_bridge.cpp \
-	    $(BLE_LIB) $(SIMPLEBLE_SYS)
-	@echo "Built: ble_kiss_bridge"
+	    -o $@ bt_kiss_bridge.cpp \
+	    $(BLE_LIB) $(SIMPLEBLE_SYS) $(BLUETOOTH_LIBS)
+	@echo "Built: bt_kiss_bridge"
+
+# Backward-compatible alias: ble_kiss_bridge -> bt_kiss_bridge
+ble_kiss_bridge: bt_kiss_bridge
+	ln -sf bt_kiss_bridge ble_kiss_bridge
+	@echo "Created symlink: ble_kiss_bridge -> bt_kiss_bridge"
 
 clean:
-	rm -f $(LIB_OBJ) $(BASIC_OBJ) bbs ax25kiss ax25tnc basic_tool test_ax25lib ble_kiss_bridge
+	rm -f $(LIB_OBJ) $(BASIC_OBJ) bbs ax25kiss ax25tnc basic_tool test_ax25lib bt_kiss_bridge ble_kiss_bridge
 
 # ── Install / Uninstall ───────────────────────────────────────────────────────
 # Installs all built binaries to $(PREFIX)/bin  (default: /usr/local/bin).
@@ -153,14 +160,15 @@ install:
 	install -m 755 ax25kiss   $(BINDIR)/ax25kiss
 	install -m 755 ax25tnc $(BINDIR)/ax25tnc
 	install -m 755 basic_tool $(BINDIR)/basic_tool
-	@if [ -f ble_kiss_bridge ]; then \
-	    install -m 755 ble_kiss_bridge $(BINDIR)/ble_kiss_bridge; \
-	    echo "  installed: $(BINDIR)/ble_kiss_bridge"; \
+	@if [ -f bt_kiss_bridge ]; then \
+	    install -m 755 bt_kiss_bridge $(BINDIR)/bt_kiss_bridge; \
+	    ln -sf bt_kiss_bridge $(BINDIR)/ble_kiss_bridge; \
+	    echo "  installed: $(BINDIR)/bt_kiss_bridge (+ ble_kiss_bridge symlink)"; \
 	else \
-	    echo "  skipped  : ble_kiss_bridge (not built — run: make ble-deps && make ble_kiss_bridge)"; \
+	    echo "  skipped  : bt_kiss_bridge (not built — run: make ble-deps && make bt_kiss_bridge)"; \
 	fi
 	@echo "Done.  Binaries in $(BINDIR):"
-	@echo "  bbs  ax25kiss  ax25tnc  basic_tool  ble_kiss_bridge"
+	@echo "  bbs  ax25kiss  ax25tnc  basic_tool  bt_kiss_bridge"
 
 uninstall:
 	@echo "Removing from $(BINDIR) ..."
@@ -168,6 +176,7 @@ uninstall:
 	      $(BINDIR)/ax25kiss \
 	      $(BINDIR)/ax25tnc \
 	      $(BINDIR)/basic_tool \
+	      $(BINDIR)/bt_kiss_bridge \
 	      $(BINDIR)/ble_kiss_bridge
 	@echo "Done."
 
@@ -177,7 +186,8 @@ install-deps:
 	@echo "  Ubuntu : sudo apt-get install libgtest-dev libsqlite3-dev cmake libdbus-1-dev"
 	@echo "  Fedora : sudo dnf install gtest-devel sqlite-devel cmake dbus-devel"
 	@echo ""
-	@echo "BLE bridge (ble_kiss_bridge):"
+	@echo "BT/BLE bridge (bt_kiss_bridge):"
 	@echo "  All platforms : cmake required (see above)"
 	@echo "  Linux only    : libdbus-1-dev (BlueZ backend)"
-	@echo "  Then run      : make ble-deps && make ble_kiss_bridge"
+	@echo "  Linux (BT)    : libbluetooth-dev (Classic Bluetooth RFCOMM)"
+	@echo "  Then run      : make ble-deps && make bt_kiss_bridge"

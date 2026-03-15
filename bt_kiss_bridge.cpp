@@ -1,35 +1,44 @@
-// ble_kiss_bridge.cpp — BLE KISS TNC serial bridge + AX.25 monitor (C++17)
+// bt_kiss_bridge.cpp — Bluetooth KISS TNC serial bridge + AX.25 monitor (C++17)
 //
-// Requires: SimpleBLE  →  make ble-deps  (builds vendor/simpleble via cmake)
+// Supports two radio transports:
+//   BLE   — Bluetooth Low Energy (SimpleBLE, all platforms)
+//   BT    — Classic Bluetooth RFCOMM (BlueZ sockets, Linux only)
 //
-// ── Modes ─────────────────────────────────────────────────────────────────────
-//   --scan                       Scan for nearby BLE devices
-//   --inspect <ADDR>             List every GATT service/characteristic
+// Requires: SimpleBLE  ->  make ble-deps  (builds vendor/simpleble via cmake)
+//           libbluetooth-dev (Linux, for Classic BT)
+//
+// -- Modes ---------------------------------------------------------------
+//   --scan                       Scan for nearby devices
+//   --inspect <ADDR>             List services (GATT for BLE, SDP for BT)
 //   --device  <ADDR>             Bridge mode (PTY or TCP)
-//                  --service / --write / --read   GATT UUIDs
-//                  [--mtu <N>]                    Max chunk cap (default 517)
-//                  [--write-with-response]        Force write-with-response
-//                  [--monitor]                    Enable rich frame monitor
+//                  --ble                        Force BLE transport
+//                  --bt                         Force Classic BT transport
+//                  --service / --write / --read GATT UUIDs (BLE)
+//                  --channel <N>                RFCOMM channel (BT, 0=auto)
+//                  [--mtu <N>]                  Max chunk cap (default 517)
+//                  [--write-with-response]      Force write-with-response
+//                  [--monitor]                  Enable rich frame monitor
 //
-// ── Transport modes (mutually exclusive) ─────────────────────────────────────
-//   PTY  (default)  A virtual serial port is created.  Symlink → /tmp/kiss.
+// -- Transport modes (mutually exclusive) --------------------------------
+//   PTY  (default)  A virtual serial port is created.  Symlink -> /tmp/kiss.
 //                   Connect: ax25tnc -c W1AW -r W1BBS-1 /tmp/kiss
 //   TCP             --server-port N  opens a KISS-over-TCP listener.
 //                   Connect: ax25tnc -c W1AW -r W1BBS-1 localhost:N
 //
-// ── Rich frame monitor (--monitor) ───────────────────────────────────────────
+// -- Rich frame monitor (--monitor) --------------------------------------
 //   Each AX.25 frame is shown as:
 //
-//     [HH:MM:SS.mmm]  <- BLE  W1AW -> W1BBS-1  [SABM]        ← normal
-//                ctrl=0x2f  U/SABM  P/F=1  (15 bytes)         ← dim
-//                00000000  c0 1e 9a 76 40 ...  |...v@...|      ← dim
+//     [HH:MM:SS.mmm]  <- BLE  W1AW -> W1BBS-1  [SABM]        <- normal
+//                ctrl=0x2f  U/SABM  P/F=1  (15 bytes)         <- dim
+//                00000000  c0 1e 9a 76 40 ...  |...v@...|      <- dim
 //
 //   Direction tags:
-//     "<- BLE"  BLE TNC  → PTY / TCP clients  (receive path)
-//     "-> PTY"  PTY       → BLE TNC           (transmit path, PTY mode)
-//     "-> TCP"  TCP client → BLE TNC           (transmit path, TCP mode)
+//     "<- BLE"  BLE TNC   -> PTY / TCP clients  (receive path)
+//     "<- BT"   BT TNC    -> PTY / TCP clients  (receive path)
+//     "-> PTY"  PTY        -> TNC               (transmit path, PTY mode)
+//     "-> TCP"  TCP client -> TNC               (transmit path, TCP mode)
 //
-//   KISS control frames (TXDELAY, P, SLOTTIME …) are shown in dim with a
+//   KISS control frames (TXDELAY, P, SLOTTIME ...) are shown in dim with a
 //   plain hexdump.  Fragmented packets are labelled "(buffering)" until a
 //   complete KISS frame is assembled.
 //
@@ -37,9 +46,9 @@
 //   header used by ax25kiss and ax25tnc, keeping the format identical
 //   across all three tools.
 //
-// ── Build ─────────────────────────────────────────────────────────────────────
-//   make ble-deps        # build SimpleBLE (one-time, needs cmake)
-//   make ble_kiss_bridge
+// -- Build ---------------------------------------------------------------
+//   make ble-deps          # build SimpleBLE (one-time, needs cmake)
+//   make bt_kiss_bridge
 
 #ifdef __APPLE__
 #  include <util.h>
@@ -54,8 +63,11 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <fcntl.h>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
@@ -74,18 +86,27 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 
+#ifdef __linux__
+#  include <bluetooth/bluetooth.h>
+#  include <bluetooth/rfcomm.h>
+#  include <bluetooth/hci.h>
+#  include <bluetooth/hci_lib.h>
+#  include <bluetooth/sdp.h>
+#  include <bluetooth/sdp_lib.h>
+#endif
+
 #include "ax25dump.hpp"
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------
 // Global state
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------
 static std::atomic<bool> g_running{true};
-static std::atomic<bool> g_ble_disc{false}; // set by BLE disconnect callback
+static std::atomic<bool> g_transport_disc{false}; // set by transport disconnect callback
 static void sigint_handler(int) { g_running = false; }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------
 // Helpers
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------
 static std::string ts() {
     auto now = std::chrono::system_clock::now();
     auto t   = std::chrono::system_clock::to_time_t(now);
@@ -118,9 +139,9 @@ static std::string hr(char c = '-', int n = 68) {
 static const char* DIM()   { static bool t = ::isatty(STDOUT_FILENO); return t ? "\033[2m" : ""; }
 static const char* RESET() { static bool t = ::isatty(STDOUT_FILENO); return t ? "\033[0m" : ""; }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------
 // KISS decoder
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------
 static constexpr uint8_t FEND  = 0xC0;
 static constexpr uint8_t FESC  = 0xDB;
 static constexpr uint8_t TFEND = 0xDC;
@@ -157,9 +178,9 @@ public:
     }
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------
 // AX.25 decoder (display only)
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------
 struct Ax25Info {
     std::string dest, src, type, ctrl_hex, summary;
     std::vector<std::string> via;
@@ -263,9 +284,9 @@ static void print_frame_detail(const Ax25Info& ax,
               << RESET();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------
 // PTY setup
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------
 static bool open_pty(int& master, int& slave, std::string& path) {
     char name[256]{};
     if (openpty(&master, &slave, name, nullptr, nullptr) < 0) {
@@ -283,14 +304,14 @@ static bool open_pty(int& master, int& slave, std::string& path) {
     return true;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------
 // UUID name lookup
 //
 // Bluetooth SIG assigns 16-bit numbers; in 128-bit UUIDs they appear as
 // the first 4 bytes:  0000XXXX-????-????-????-????????????
 // We extract XXXX regardless of the base UUID suffix, which is why vendor
 // UUIDs like 0000XXXX-ba2a-... still resolve to the standard SIG names.
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------
 static std::string uuid_name(const std::string& uuid) {
     // Well-known full 128-bit UUIDs (vendor / profile-specific)
     static const std::pair<const char*, const char*> full128[] = {
@@ -304,7 +325,7 @@ static std::string uuid_name(const std::string& uuid) {
         if (lo == k) return v;
 
     // Extract 16-bit SIG number from 0000XXXX-*
-    // UUID format: 8-4-4-4-12  →  positions 4-7 are the 16-bit number
+    // UUID format: 8-4-4-4-12  ->  positions 4-7 are the 16-bit number
     if (lo.size() >= 8) {
         unsigned val = 0;
         try { val = (unsigned)std::stoul(lo.substr(0, 8), nullptr, 16); }
@@ -312,7 +333,7 @@ static std::string uuid_name(const std::string& uuid) {
         // Only consider the lower 16 bits (upper 16 should be 0000 for SIG UUIDs)
         uint16_t sig = (uint16_t)(val & 0xFFFF);
 
-        // Bluetooth SIG 16-bit UUIDs — protocols
+        // Bluetooth SIG 16-bit UUIDs -- protocols
         static const std::pair<uint16_t, const char*> sig_uuids[] = {
             // Protocols
             {0x0001, "SDP"},
@@ -428,9 +449,47 @@ static std::string uuid_name(const std::string& uuid) {
     return "Unknown";
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// =========================================================================
+// RadioTransport -- abstract interface for BLE and Classic BT
+// =========================================================================
+struct RadioTransport {
+    virtual ~RadioTransport() = default;
+    virtual bool connect() = 0;
+    virtual void disconnect() = 0;
+    virtual bool is_connected() const = 0;
+    virtual void write(const uint8_t* data, size_t len) = 0;
+    virtual int  read_fd() const { return -1; }          // -1 = callback-based (BLE)
+    virtual void set_on_receive(std::function<void(const uint8_t*, size_t)>) {}
+    virtual void set_on_disconnect(std::function<void()>) {}
+    virtual const char* label() const = 0;               // "BLE" or "BT"
+};
+
+// =========================================================================
+// BridgeConfig
+// =========================================================================
+struct BridgeConfig {
+    std::string address, service_uuid, write_uuid, read_uuid;
+    std::string link_path   = "/tmp/kiss"; // symlink -> PTY slave (empty = no link)
+    int    mtu              = 517;
+    double timeout          = 10.0;
+    int    ble_ka_ms        = 5000;        // BLE keep-alive interval ms (0=off)
+    int    server_port      = 0;           // TCP server port (0 = disabled)
+    std::string server_host;               // bind address (empty = all interfaces)
+    bool   monitor          = false;       // print per-frame hex + AX.25 decode
+    bool   show_keepalive   = false;       // show BLE keep-alive in monitor output
+    std::optional<bool> force_response;    // nullopt = auto-detect
+
+    // Transport selection
+    enum Transport { AUTO, BLE, BT };
+    Transport transport = AUTO;
+
+    // Classic BT specific
+    int bt_channel = 0;  // RFCOMM channel (0 = auto-detect via SDP)
+};
+
+// =========================================================================
 // BLE adapter helpers
-// ─────────────────────────────────────────────────────────────────────────────
+// =========================================================================
 static std::optional<SimpleBLE::Adapter> get_adapter() {
     if (!SimpleBLE::Adapter::bluetooth_enabled()) {
         std::cerr << "Bluetooth not enabled.\n";
@@ -444,16 +503,9 @@ static std::optional<SimpleBLE::Adapter> get_adapter() {
     return adapters[0];
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------
 // Linux-only: tell BlueZ to do an active LE scan filtered to a service UUID.
-//
-// bleak does this via BleakScanner(service_uuids=[...]) which calls
-// org.bluez.Adapter1.SetDiscoveryFilter({"UUIDs":[uuid],"Transport":"le"}).
-// Without it, BlueZ may do a passive scan and never surface the device.
-//
-// BlueZ merges filters from every D-Bus client, so our call is additive
-// with whatever SimpleBLE already sets.  Safe to call before scan_start().
-// ─────────────────────────────────────────────────────────────────────────────
+// -------------------------------------------------------------------------
 #ifdef __linux__
 static void bluez_set_discovery_filter(const std::string& adapter_id,
                                        const std::string& service_uuid)
@@ -466,7 +518,7 @@ static void bluez_set_discovery_filter(const std::string& adapter_id,
     DBusConnection* conn = dbus_bus_get(DBUS_BUS_SYSTEM, &err);
     if (!conn || dbus_error_is_set(&err)) {
         dbus_error_free(&err);
-        return; // not fatal — scan will proceed without the filter
+        return; // not fatal -- scan will proceed without the filter
     }
 
     std::string obj_path = "/org/bluez/" + adapter_id;
@@ -475,12 +527,12 @@ static void bluez_set_discovery_filter(const std::string& adapter_id,
         "org.bluez", obj_path.c_str(), "org.bluez.Adapter1", "SetDiscoveryFilter");
     if (!msg) { dbus_connection_unref(conn); return; }
 
-    // Build argument: a{sv}  →  {"UUIDs": as["uuid"], "Transport": s"le"}
+    // Build argument: a{sv}  ->  {"UUIDs": as["uuid"], "Transport": s"le"}
     DBusMessageIter args, dict, entry, variant, arr;
     dbus_message_iter_init_append(msg, &args);
     dbus_message_iter_open_container(&args, DBUS_TYPE_ARRAY, "{sv}", &dict);
 
-    // "UUIDs" → ["service_uuid"]
+    // "UUIDs" -> ["service_uuid"]
     {
         const char* key = "UUIDs";
         dbus_message_iter_open_container(&dict, DBUS_TYPE_DICT_ENTRY, nullptr, &entry);
@@ -494,7 +546,7 @@ static void bluez_set_discovery_filter(const std::string& adapter_id,
         dbus_message_iter_close_container(&dict, &entry);
     }
 
-    // "Transport" → "le"
+    // "Transport" -> "le"
     {
         const char* key = "Transport";
         const char* val = "le";
@@ -527,7 +579,7 @@ find_peripheral(SimpleBLE::Adapter& adapter,
     std::mutex mx;
     std::atomic<bool> done{false};
 
-    // Match by address OR by name (identifier) — case-insensitive
+    // Match by address OR by name (identifier) -- case-insensitive
     auto check = [&](SimpleBLE::Peripheral p) {
         if (lower(p.address())    == target ||
             lower(p.identifier()) == target) {
@@ -536,15 +588,10 @@ find_peripheral(SimpleBLE::Adapter& adapter,
         }
     };
 
-    // set_callback_on_scan_found  → fires for devices seen for the first time
-    // set_callback_on_scan_updated → fires for devices already cached by the adapter
-    // Both are needed: without _updated, a recently-seen device is never matched.
     adapter.set_callback_on_scan_found  ([&](SimpleBLE::Peripheral p) { check(p); });
     adapter.set_callback_on_scan_updated([&](SimpleBLE::Peripheral p) { check(p); });
 
 #ifdef __linux__
-    // Mirror what bleak does: set BlueZ discovery filter to the service UUID
-    // so BlueZ uses active LE scanning for this specific service.
     bluez_set_discovery_filter(adapter.identifier(), service_uuid);
 #endif
 
@@ -557,10 +604,383 @@ find_peripheral(SimpleBLE::Adapter& adapter,
     return found;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SCAN mode
-// ─────────────────────────────────────────────────────────────────────────────
-static void do_scan(double timeout_s) {
+// =========================================================================
+// BleTransport -- wraps all SimpleBLE interactions
+// =========================================================================
+class BleTransport : public RadioTransport {
+    const BridgeConfig& cfg_;
+    std::optional<SimpleBLE::Adapter>     adapter_;
+    std::optional<SimpleBLE::Peripheral>  peripheral_;
+
+    // Async write queue + writer thread
+    std::mutex                        tx_mx_;
+    std::condition_variable           tx_cv_;
+    std::deque<std::vector<uint8_t>>  tx_queue_;
+    std::atomic<bool>                 tx_stop_{false};
+    std::thread                       writer_thread_;
+
+    // BLE write parameters (detected at connect time)
+    int  chunk_size_  = 20;
+    bool use_response_= false;
+
+    // Callbacks
+    std::function<void(const uint8_t*, size_t)> on_receive_;
+    std::function<void()>                       on_disconnect_;
+
+    // Disconnect flag
+    std::atomic<bool> disconnected_{false};
+
+    // Keep-alive timer
+    using SteadyClock = std::chrono::steady_clock;
+    std::atomic<SteadyClock::time_point> last_write_{SteadyClock::now()};
+
+public:
+    explicit BleTransport(const BridgeConfig& cfg) : cfg_(cfg) {}
+    ~BleTransport() override { disconnect(); }
+
+    const char* label() const override { return "BLE"; }
+    int  read_fd() const override { return -1; }  // callback-based
+
+    void set_on_receive(std::function<void(const uint8_t*, size_t)> cb) override {
+        on_receive_ = std::move(cb);
+    }
+    void set_on_disconnect(std::function<void()> cb) override {
+        on_disconnect_ = std::move(cb);
+    }
+
+    bool is_connected() const override {
+        if (disconnected_) return false;
+        if (!peripheral_) return false;
+        // SimpleBLE::Peripheral::is_connected() is non-const, cast away const
+        try { return const_cast<SimpleBLE::Peripheral&>(*peripheral_).is_connected(); }
+        catch (...) { return false; }
+    }
+
+    // Keep-alive: returns true if a keep-alive was sent
+    bool maybe_keepalive() {
+        if (cfg_.ble_ka_ms <= 0) return false;
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           SteadyClock::now() - last_write_.load()).count();
+        if (elapsed >= cfg_.ble_ka_ms) {
+            static const uint8_t kiss_null[] = {0xC0, 0xC0};
+            write(kiss_null, 2);
+            return true;
+        }
+        return false;
+    }
+
+    bool connect() override {
+        disconnected_ = false;
+        tx_stop_ = false;
+
+        // Find adapter
+        adapter_ = get_adapter();
+        if (!adapter_) {
+            std::cerr << "  No Bluetooth adapter available.\n";
+            return false;
+        }
+
+        // Find peripheral
+        peripheral_ = find_peripheral(*adapter_, cfg_.address,
+                                      (int)(cfg_.timeout * 1000), cfg_.service_uuid);
+        if (!peripheral_) {
+            std::cerr << "[" << ts() << "]  Device " << cfg_.address << " not found.\n";
+            return false;
+        }
+
+        try { peripheral_->connect(); }
+        catch (const std::exception& e) {
+            std::cerr << "[" << ts() << "]  Connect failed: " << e.what() << "\n";
+            return false;
+        }
+
+        // Capability check
+        bool can_wwr = false, can_wr = false;
+        for (auto& svc : peripheral_->services()) {
+            if (lower(svc.uuid()) != lower(cfg_.service_uuid)) continue;
+            for (auto& chr : svc.characteristics()) {
+                if (lower(chr.uuid()) != lower(cfg_.write_uuid)) continue;
+                can_wwr = chr.can_write_command();
+                can_wr  = chr.can_write_request();
+            }
+        }
+        use_response_ = cfg_.force_response.has_value()
+                       ? *cfg_.force_response
+                       : (!can_wwr && can_wr);
+
+        uint16_t mtu_val = 23;
+        try { mtu_val = peripheral_->mtu(); } catch (...) {}
+        if (mtu_val < 23) mtu_val = 23;
+        chunk_size_ = std::max(1, std::min(cfg_.mtu, (int)mtu_val) - 3);
+
+        std::cout << "  Connected.  MTU=" << mtu_val
+                  << "  chunk=" << chunk_size_ << "b"
+                  << "  wwr=" << (can_wwr ? "yes" : "no")
+                  << "  response=" << (use_response_ ? "yes" : "no") << "\n";
+        if (cfg_.ble_ka_ms > 0)
+            std::cout << "  BLE keep-alive: " << cfg_.ble_ka_ms / 1000
+                      << "s  (KISS null writes)\n";
+        std::cout.flush();
+
+        // Disconnect callback
+        peripheral_->set_callback_on_disconnected([this]() {
+            disconnected_ = true;
+            if (on_disconnect_) on_disconnect_();
+        });
+
+        // Notify subscription
+        peripheral_->notify(cfg_.service_uuid, cfg_.read_uuid,
+            [this](SimpleBLE::ByteArray raw) {
+                if (on_receive_) {
+                    on_receive_(raw.data(), raw.size());
+                }
+            });
+
+        // Start writer thread
+        last_write_.store(SteadyClock::now());
+        writer_thread_ = std::thread([this]() {
+            while (!tx_stop_) {
+                std::vector<uint8_t> pkt;
+                {
+                    std::unique_lock<std::mutex> lk(tx_mx_);
+                    tx_cv_.wait_for(lk, std::chrono::milliseconds(50),
+                        [this]{ return !tx_queue_.empty() || tx_stop_.load(); });
+                    if (tx_queue_.empty()) continue;
+                    pkt = std::move(tx_queue_.front());
+                    tx_queue_.pop_front();
+                }
+                try {
+                    for (int i = 0; i < (int)pkt.size(); i += chunk_size_) {
+                        int clen = std::min(chunk_size_, (int)pkt.size() - i);
+                        SimpleBLE::ByteArray chunk(pkt.data() + i, pkt.data() + i + clen);
+                        if (use_response_)
+                            peripheral_->write_request(cfg_.service_uuid, cfg_.write_uuid, chunk);
+                        else
+                            peripheral_->write_command(cfg_.service_uuid, cfg_.write_uuid, chunk);
+                    }
+                    last_write_.store(SteadyClock::now());
+                } catch (const std::exception& e) {
+                    std::cerr << "  BLE write error: " << e.what() << "\n";
+                }
+            }
+        });
+
+        return true;
+    }
+
+    void write(const uint8_t* data, size_t len) override {
+        std::lock_guard<std::mutex> lk(tx_mx_);
+        tx_queue_.emplace_back(data, data + len);
+        tx_cv_.notify_one();
+    }
+
+    void disconnect() override {
+        // Stop writer thread
+        tx_stop_ = true;
+        tx_cv_.notify_one();
+        if (writer_thread_.joinable()) writer_thread_.join();
+
+        // BLE cleanup
+        if (peripheral_) {
+            try { peripheral_->unsubscribe(cfg_.service_uuid, cfg_.read_uuid); } catch (...) {}
+            try { peripheral_->disconnect(); } catch (...) {}
+        }
+        peripheral_.reset();
+        adapter_.reset();
+    }
+};
+
+// =========================================================================
+// BtTransport -- Classic Bluetooth RFCOMM (Linux only)
+// =========================================================================
+#ifdef __linux__
+
+// SDP lookup for SPP UUID 0x1101 -- returns RFCOMM channel, or -1
+static int sdp_find_rfcomm_channel(const std::string& address) {
+    bdaddr_t target;
+    str2ba(address.c_str(), &target);
+
+    bdaddr_t any_addr;
+    bacpy(&any_addr, BDADDR_ANY);
+
+    sdp_session_t* session = sdp_connect(&any_addr, &target, SDP_RETRY_IF_BUSY);
+    if (!session) {
+        std::cerr << "  SDP connect failed: " << strerror(errno) << "\n";
+        return -1;
+    }
+
+    // Search for SPP UUID 0x1101
+    uuid_t svc_uuid;
+    sdp_uuid16_create(&svc_uuid, SERIAL_PORT_SVCLASS_ID);
+
+    sdp_list_t* search_list = sdp_list_append(nullptr, &svc_uuid);
+    uint32_t range = 0x0000FFFF;
+    sdp_list_t* attrid_list = sdp_list_append(nullptr, &range);
+
+    sdp_list_t* response_list = nullptr;
+    int err = sdp_service_search_attr_req(session, search_list,
+                                           SDP_ATTR_REQ_RANGE, attrid_list,
+                                           &response_list);
+    sdp_list_free(search_list, nullptr);
+    sdp_list_free(attrid_list, nullptr);
+
+    int channel = -1;
+    if (err == 0) {
+        for (sdp_list_t* r = response_list; r && channel < 0; r = r->next) {
+            sdp_record_t* rec = (sdp_record_t*)r->data;
+            sdp_list_t* proto_list = nullptr;
+            if (sdp_get_access_protos(rec, &proto_list) == 0) {
+                for (sdp_list_t* p = proto_list; p && channel < 0; p = p->next) {
+                    sdp_list_t* pds = (sdp_list_t*)p->data;
+                    for (sdp_list_t* d = pds; d && channel < 0; d = d->next) {
+                        sdp_data_t* pd = (sdp_data_t*)d->data;
+                        // Walk the protocol descriptor
+                        for (; pd; pd = pd->next) {
+                            if (pd->dtd == SDP_UUID16 &&
+                                sdp_uuid_to_proto(&pd->val.uuid) == RFCOMM_UUID) {
+                                // Next element is the channel number
+                                pd = pd->next;
+                                if (pd) channel = pd->val.uint8;
+                                break;
+                            }
+                        }
+                    }
+                }
+                sdp_list_free(proto_list, nullptr);
+            }
+            sdp_record_free(rec);
+        }
+        sdp_list_free(response_list, nullptr);
+    }
+
+    sdp_close(session);
+    return channel;
+}
+
+class BtTransport : public RadioTransport {
+    std::string address_;
+    int channel_;
+    int fd_ = -1;
+
+    std::function<void()> on_disconnect_;
+
+public:
+    BtTransport(const std::string& address, int channel)
+        : address_(address), channel_(channel) {}
+    ~BtTransport() override { disconnect(); }
+
+    const char* label() const override { return "BT"; }
+    int  read_fd() const override { return fd_; }
+
+    void set_on_disconnect(std::function<void()> cb) override {
+        on_disconnect_ = std::move(cb);
+    }
+
+    bool is_connected() const override { return fd_ >= 0; }
+
+    bool connect() override {
+        int ch = channel_;
+
+        // Auto-detect via SDP if channel is 0
+        if (ch == 0) {
+            std::cout << "  SDP lookup for SPP on " << address_ << "...\n";
+            std::cout.flush();
+            ch = sdp_find_rfcomm_channel(address_);
+            if (ch < 0) {
+                std::cerr << "  SDP: no SPP service found.  Use --channel to specify manually.\n";
+                return false;
+            }
+            std::cout << "  SDP: found SPP on RFCOMM channel " << ch << "\n";
+        }
+
+        fd_ = ::socket(AF_BLUETOOTH, SOCK_STREAM, BTPROTO_RFCOMM);
+        if (fd_ < 0) {
+            std::cerr << "  RFCOMM socket: " << strerror(errno) << "\n";
+            return false;
+        }
+
+        struct sockaddr_rc addr{};
+        addr.rc_family  = AF_BLUETOOTH;
+        addr.rc_channel = (uint8_t)ch;
+        str2ba(address_.c_str(), &addr.rc_bdaddr);
+
+        std::cout << "  Connecting RFCOMM channel " << ch << " on " << address_ << "...\n";
+        std::cout.flush();
+
+        if (::connect(fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            std::cerr << "  RFCOMM connect: " << strerror(errno) << "\n";
+            ::close(fd_);
+            fd_ = -1;
+            return false;
+        }
+
+        // Set non-blocking after connect
+        int fl = ::fcntl(fd_, F_GETFL, 0);
+        ::fcntl(fd_, F_SETFL, fl | O_NONBLOCK);
+
+        std::cout << "  Connected.  RFCOMM channel=" << ch << "\n";
+        std::cout.flush();
+        return true;
+    }
+
+    void write(const uint8_t* data, size_t len) override {
+        if (fd_ < 0) return;
+        size_t sent = 0;
+        while (sent < len) {
+            ssize_t n = ::write(fd_, data + sent, len - sent);
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // Brief wait for buffer space
+                    fd_set wfds;
+                    FD_ZERO(&wfds);
+                    FD_SET(fd_, &wfds);
+                    struct timeval tv{0, 50000}; // 50ms
+                    if (::select(fd_ + 1, nullptr, &wfds, nullptr, &tv) <= 0) break;
+                    continue;
+                }
+                std::cerr << "  BT write error: " << strerror(errno) << "\n";
+                ::close(fd_);
+                fd_ = -1;
+                if (on_disconnect_) on_disconnect_();
+                return;
+            }
+            sent += (size_t)n;
+        }
+    }
+
+    void disconnect() override {
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+    }
+};
+
+#else // !__linux__ -- macOS stub
+
+class BtTransport : public RadioTransport {
+public:
+    BtTransport(const std::string&, int) {}
+    ~BtTransport() override = default;
+    const char* label() const override { return "BT"; }
+    bool connect() override {
+        std::cerr << "Classic Bluetooth (RFCOMM) is not yet supported on macOS.\n"
+                  << "Use --ble for BLE transport, or run on Linux.\n";
+        return false;
+    }
+    void disconnect() override {}
+    bool is_connected() const override { return false; }
+    void write(const uint8_t*, size_t) override {}
+};
+
+#endif // __linux__
+
+// =========================================================================
+// SCAN modes
+// =========================================================================
+
+// -- BLE scan (all platforms) --
+static void do_ble_scan(double timeout_s) {
     auto opt = get_adapter();
     if (!opt) return;
     auto& adapter = *opt;
@@ -598,19 +1018,98 @@ static void do_scan(double timeout_s) {
         std::cout << "\n";
     }
     std::cout << hr('=') << "\n";
-    std::cout << "Found " << found.size() << " device(s).\n";
-    std::cout << "\nNext step:\n  ble_kiss_bridge --inspect <ADDRESS>\n";
+    std::cout << "Found " << found.size() << " BLE device(s).\n";
+    std::cout << "\nNext step:\n  bt_kiss_bridge --ble --inspect <ADDRESS>\n";
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// INSPECT mode
-// ─────────────────────────────────────────────────────────────────────────────
-static void do_inspect(const std::string& address) {
+// -- Classic BT scan (Linux only) --
+#ifdef __linux__
+static void do_bt_scan(double timeout_s) {
+    int dev_id = hci_get_route(nullptr);
+    if (dev_id < 0) {
+        std::cerr << "No Bluetooth adapter found (hci_get_route).\n";
+        return;
+    }
+    int sock = hci_open_dev(dev_id);
+    if (sock < 0) {
+        std::cerr << "Cannot open HCI device: " << strerror(errno) << "\n";
+        return;
+    }
+
+    // Duration in 1.28s units
+    int duration = std::max(1, (int)(timeout_s / 1.28));
+    int max_rsp = 255;
+    inquiry_info* ii = nullptr;
+
+    std::cout << "Scanning for Classic BT devices (" << (int)timeout_s << "s)...\n\n";
+
+    int num_rsp = hci_inquiry(dev_id, duration, max_rsp, nullptr, &ii, IREQ_CACHE_FLUSH);
+    if (num_rsp < 0) {
+        std::cerr << "HCI inquiry failed: " << strerror(errno) << "\n";
+        close(sock);
+        return;
+    }
+
+    for (int i = 0; i < num_rsp; i++) {
+        char addr_str[19]{};
+        ba2str(&ii[i].bdaddr, addr_str);
+
+        char name[248]{};
+        if (hci_read_remote_name(sock, &ii[i].bdaddr, sizeof(name), name, 0) < 0)
+            std::strcpy(name, "(unknown)");
+
+        uint32_t cod = (ii[i].dev_class[2] << 16) |
+                       (ii[i].dev_class[1] << 8)  |
+                        ii[i].dev_class[0];
+
+        std::cout << hr() << "\n";
+        std::cout << "  Name   : " << name << "\n";
+        std::cout << "  Address: " << addr_str << "\n";
+        std::cout << "  CoD    : 0x" << std::hex << std::setw(6) << std::setfill('0')
+                  << cod << std::dec << "\n";
+        std::cout << "\n";
+    }
+
+    std::cout << hr('=') << "\n";
+    std::cout << "Found " << num_rsp << " Classic BT device(s).\n";
+    std::cout << "\nNext step:\n  bt_kiss_bridge --bt --inspect <ADDRESS>\n";
+
+    bt_free(ii);
+    close(sock);
+}
+#else
+static void do_bt_scan([[maybe_unused]] double timeout_s) {
+    std::cerr << "Classic Bluetooth scan is not yet supported on macOS.\n";
+}
+#endif
+
+// Dispatch scan based on transport preference
+static void do_scan(double timeout_s, BridgeConfig::Transport transport) {
+    if (transport == BridgeConfig::BT) {
+        do_bt_scan(timeout_s);
+    } else if (transport == BridgeConfig::BLE) {
+        do_ble_scan(timeout_s);
+    } else {
+        // AUTO: scan both
+        do_ble_scan(timeout_s);
+#ifdef __linux__
+        std::cout << "\n";
+        do_bt_scan(timeout_s);
+#endif
+    }
+}
+
+// =========================================================================
+// INSPECT modes
+// =========================================================================
+
+// -- BLE inspect (all platforms) --
+static void do_ble_inspect(const std::string& address) {
     auto opt = get_adapter();
     if (!opt) return;
     auto& adapter = *opt;
 
-    std::cout << "Searching for " << address << "...\n";
+    std::cout << "Searching for " << address << " (BLE)...\n";
     auto popt = find_peripheral(adapter, address, 10000);
     if (!popt) { std::cerr << "Device not found.\n"; return; }
     auto& p = *popt;
@@ -686,7 +1185,7 @@ static void do_inspect(const std::string& address) {
 
     std::cout << hr('=') << "\n";
     std::cout << "\nSuggested bridge command:\n";
-    std::cout << "  ble_kiss_bridge \\\n"
+    std::cout << "  bt_kiss_bridge --ble \\\n"
               << "      --device   " << address << " \\\n"
               << "      --service  " << (best_svc.empty()   ? "<SERVICE-UUID>"  : best_svc)   << " \\\n"
               << "      --write    " << (best_write.empty() ? "<WRITE-CHAR-UUID>": best_write) << " \\\n"
@@ -694,24 +1193,135 @@ static void do_inspect(const std::string& address) {
     p.disconnect();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// BRIDGE (device) mode
-// ─────────────────────────────────────────────────────────────────────────────
-struct BridgeConfig {
-    std::string address, service_uuid, write_uuid, read_uuid;
-    std::string link_path   = "/tmp/kiss"; // symlink → PTY slave (empty = no link)
-    int    mtu              = 517;
-    double timeout          = 10.0;
-    int    ble_ka_ms        = 5000;        // BLE keep-alive interval ms (0=off)
-    int    server_port      = 0;           // TCP server port (0 = disabled)
-    std::string server_host;               // bind address (empty = all interfaces)
-    bool   monitor          = false;       // print per-frame hex + AX.25 decode
-    bool   show_keepalive   = false;       // show BLE keep-alive in monitor output
-    std::optional<bool> force_response;    // nullopt = auto-detect
-};
+// -- Classic BT inspect (Linux only) --
+#ifdef __linux__
+static void do_bt_inspect(const std::string& address) {
+    bdaddr_t target;
+    str2ba(address.c_str(), &target);
 
-static void do_bridge(const BridgeConfig& cfg) {
-    // ── PTY is created only when NOT in TCP-server mode ───────────────────
+    bdaddr_t any_addr;
+    bacpy(&any_addr, BDADDR_ANY);
+
+    std::cout << "Connecting SDP to " << address << "...\n";
+    sdp_session_t* session = sdp_connect(&any_addr, &target, SDP_RETRY_IF_BUSY);
+    if (!session) {
+        std::cerr << "SDP connect failed: " << strerror(errno) << "\n";
+        return;
+    }
+
+    // Search for all public services
+    uuid_t pub_uuid;
+    sdp_uuid16_create(&pub_uuid, PUBLIC_BROWSE_GROUP);
+
+    sdp_list_t* search_list = sdp_list_append(nullptr, &pub_uuid);
+    uint32_t range = 0x0000FFFF;
+    sdp_list_t* attrid_list = sdp_list_append(nullptr, &range);
+
+    sdp_list_t* response_list = nullptr;
+    int err = sdp_service_search_attr_req(session, search_list,
+                                           SDP_ATTR_REQ_RANGE, attrid_list,
+                                           &response_list);
+    sdp_list_free(search_list, nullptr);
+    sdp_list_free(attrid_list, nullptr);
+
+    if (err < 0) {
+        std::cerr << "SDP search failed: " << strerror(errno) << "\n";
+        sdp_close(session);
+        return;
+    }
+
+    std::cout << "\nServices on " << address << ":\n\n";
+    int svc_count = 0;
+    int spp_channel = -1;
+
+    for (sdp_list_t* r = response_list; r; r = r->next) {
+        sdp_record_t* rec = (sdp_record_t*)r->data;
+        ++svc_count;
+
+        // Service name
+        char name_buf[256]{};
+        if (sdp_get_service_name(rec, name_buf, sizeof(name_buf)) < 0)
+            std::strcpy(name_buf, "(unnamed)");
+
+        std::cout << hr() << "\n";
+        std::cout << "  Service: " << name_buf << "\n";
+
+        // Service class UUIDs
+        sdp_list_t* svc_class_list = nullptr;
+        if (sdp_get_service_classes(rec, &svc_class_list) == 0) {
+            for (sdp_list_t* sc = svc_class_list; sc; sc = sc->next) {
+                uuid_t* uuid = (uuid_t*)sc->data;
+                char uuid_str[64]{};
+                sdp_uuid2strn(uuid, uuid_str, sizeof(uuid_str));
+                std::cout << "  UUID   : " << uuid_str
+                          << "  (" << uuid_name(uuid_str) << ")\n";
+            }
+            sdp_list_free(svc_class_list, free);
+        }
+
+        // Protocol descriptors -- find RFCOMM channel
+        sdp_list_t* proto_list = nullptr;
+        if (sdp_get_access_protos(rec, &proto_list) == 0) {
+            for (sdp_list_t* p = proto_list; p; p = p->next) {
+                sdp_list_t* pds = (sdp_list_t*)p->data;
+                for (sdp_list_t* d = pds; d; d = d->next) {
+                    sdp_data_t* pd = (sdp_data_t*)d->data;
+                    for (; pd; pd = pd->next) {
+                        if (pd->dtd == SDP_UUID16 &&
+                            sdp_uuid_to_proto(&pd->val.uuid) == RFCOMM_UUID) {
+                            pd = pd->next;
+                            if (pd) {
+                                int ch = pd->val.uint8;
+                                std::cout << "  RFCOMM : channel " << ch << "\n";
+                                // Track first SPP channel
+                                if (spp_channel < 0) spp_channel = ch;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            sdp_list_free(proto_list, nullptr);
+        }
+
+        std::cout << "\n";
+        sdp_record_free(rec);
+    }
+    sdp_list_free(response_list, nullptr);
+    sdp_close(session);
+
+    std::cout << hr('=') << "\n";
+    std::cout << "Found " << svc_count << " service(s).\n";
+
+    if (spp_channel >= 0) {
+        std::cout << "\nSuggested bridge command:\n";
+        std::cout << "  bt_kiss_bridge --bt --device " << address
+                  << " --channel " << spp_channel << "\n";
+    }
+}
+#else
+static void do_bt_inspect([[maybe_unused]] const std::string& address) {
+    std::cerr << "Classic Bluetooth inspect is not yet supported on macOS.\n";
+}
+#endif
+
+// Dispatch inspect based on transport preference
+static void do_inspect(const std::string& address, BridgeConfig::Transport transport) {
+    if (transport == BridgeConfig::BT) {
+        do_bt_inspect(address);
+    } else if (transport == BridgeConfig::BLE) {
+        do_ble_inspect(address);
+    } else {
+        // AUTO: try BLE
+        do_ble_inspect(address);
+    }
+}
+
+// =========================================================================
+// BRIDGE (device) mode -- transport-agnostic
+// =========================================================================
+static void do_bridge(const BridgeConfig& cfg, RadioTransport& transport) {
+    // -- PTY is created only when NOT in TCP-server mode --
     int master_fd = -1, slave_fd = -1;
     std::string slave_path;
 
@@ -733,20 +1343,26 @@ static void do_bridge(const BridgeConfig& cfg) {
 
     std::cout << hr('=') << "\n";
     if (tcp_mode)
-        std::cout << "  BLE KISS TCP Server Bridge"
+        std::cout << "  " << transport.label() << " KISS TCP Server Bridge"
                   << (cfg.monitor ? " + AX.25 Monitor" : "") << "\n";
     else
-        std::cout << "  BLE KISS Serial Bridge"
+        std::cout << "  " << transport.label() << " KISS Serial Bridge"
                   << (cfg.monitor ? " + AX.25 Monitor" : "") << "\n";
     std::cout << hr('=') << "\n";
     std::cout << "  Device     : " << cfg.address << "\n";
-    std::cout << "  Service    : " << cfg.service_uuid << "\n";
-    if (tcp_mode) {
-        std::cout << "  Read char  : " << cfg.read_uuid << "  (notify -> TCP clients)\n";
-        std::cout << "  Write char : " << cfg.write_uuid << "  (TCP clients -> BLE)\n";
-    } else {
-        std::cout << "  Read char  : " << cfg.read_uuid << "  (notify -> PTY)\n";
-        std::cout << "  Write char : " << cfg.write_uuid << "  (PTY -> BLE)\n";
+    std::cout << "  Transport  : " << transport.label() << "\n";
+    if (cfg.transport == BridgeConfig::BLE) {
+        std::cout << "  Service    : " << cfg.service_uuid << "\n";
+        if (tcp_mode) {
+            std::cout << "  Read char  : " << cfg.read_uuid << "  (notify -> TCP clients)\n";
+            std::cout << "  Write char : " << cfg.write_uuid << "  (TCP clients -> BLE)\n";
+        } else {
+            std::cout << "  Read char  : " << cfg.read_uuid << "  (notify -> PTY)\n";
+            std::cout << "  Write char : " << cfg.write_uuid << "  (PTY -> BLE)\n";
+        }
+    } else if (cfg.transport == BridgeConfig::BT) {
+        std::cout << "  RFCOMM ch  : " << (cfg.bt_channel > 0
+                     ? std::to_string(cfg.bt_channel) : "auto (SDP)") << "\n";
     }
     std::cout << hr() << "\n";
     if (!tcp_mode) {
@@ -756,14 +1372,14 @@ static void do_bridge(const BridgeConfig& cfg) {
         std::cout << "\n";
         std::cout << "  Example:\n      ax25tnc -c W1AW -r W1BBS-1 " << display_path << "\n";
     }
-    std::cout << hr() << "\n  Connecting to BLE...\n";
+    std::cout << hr() << "\n  Connecting to " << transport.label() << "...\n";
     std::cout.flush();
 
-    // ── Signal handlers ────────────────────────────────────────────────────
+    // -- Signal handlers --
     signal(SIGINT,  sigint_handler);
     signal(SIGTERM, sigint_handler);
 
-    // ── TCP server setup (once — survives BLE reconnects) ─────────────────
+    // -- TCP server setup (once -- survives reconnects) --
     int server_sock = -1;
     std::vector<int> tcp_clients;
     std::mutex mx;
@@ -824,107 +1440,41 @@ static void do_bridge(const BridgeConfig& cfg) {
         }
     }
 
-    // ── Reconnect loop ─────────────────────────────────────────────────────
-    // Up to MAX_RECONNECTS re-attempts after an unexpected BLE disconnect.
-    // PTY, symlink and TCP server remain open so clients do not need to
-    // restart.  Ctrl-C (SIGINT) breaks the loop immediately.
+    // -- Reconnect loop --
     static constexpr int MAX_RECONNECTS  = 10;
     static constexpr int RECONNECT_PAUSE = 5000; // ms between attempts
 
     for (int attempt = 0; attempt <= MAX_RECONNECTS && g_running; ++attempt) {
 
         if (attempt > 0) {
-            std::cout << "\n[" << ts() << "]  BLE reconnect "
+            std::cout << "\n[" << ts() << "]  " << transport.label() << " reconnect "
                       << attempt << "/" << MAX_RECONNECTS
-                      << " — waiting " << RECONNECT_PAUSE / 1000 << " s...\n";
+                      << " -- waiting " << RECONNECT_PAUSE / 1000 << " s...\n";
             std::cout.flush();
-            // Interruptible sleep — wakes immediately on SIGINT
+            // Interruptible sleep
             for (int i = 0; i < RECONNECT_PAUSE / 100 && g_running; ++i)
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             if (!g_running) break;
-            std::cout << "[" << ts() << "]  Scanning for " << cfg.address << "...\n";
+            std::cout << "[" << ts() << "]  Reconnecting to " << cfg.address << "...\n";
             std::cout.flush();
         } else {
-            std::cout << "  Connecting to BLE...\n";
+            std::cout << "  Connecting to " << transport.label() << "...\n";
             std::cout.flush();
         }
 
-        g_ble_disc = false;   // reset for this session
+        g_transport_disc = false;   // reset for this session
 
-        // ── Find adapter and peripheral ───────────────────────────────────
-        auto opt = get_adapter();
-        if (!opt) {
-            std::cerr << "  No Bluetooth adapter available.\n";
-            break;   // no point retrying without an adapter
-        }
-        auto& adapter = *opt;
-
-        auto popt = find_peripheral(adapter, cfg.address,
-                                    (int)(cfg.timeout * 1000), cfg.service_uuid);
-        if (!popt) {
-            std::cerr << "[" << ts() << "]  Device " << cfg.address
-                      << " not found.\n";
-            continue;   // retry
-        }
-        auto& peripheral = *popt;
-
-        try { peripheral.connect(); }
-        catch (const std::exception& e) {
-            std::cerr << "[" << ts() << "]  Connect failed: " << e.what() << "\n";
-            continue;   // retry
-        }
-
-        // ── Capability check ──────────────────────────────────────────────
-        bool can_wwr = false, can_wr = false;
-        for (auto& svc : peripheral.services()) {
-            if (lower(svc.uuid()) != lower(cfg.service_uuid)) continue;
-            for (auto& chr : svc.characteristics()) {
-                if (lower(chr.uuid()) != lower(cfg.write_uuid)) continue;
-                can_wwr = chr.can_write_command();
-                can_wr  = chr.can_write_request();
-            }
-        }
-        bool use_response = cfg.force_response.has_value()
-                          ? *cfg.force_response
-                          : (!can_wwr && can_wr);
-
-        uint16_t mtu_val = 23;
-        try { mtu_val = peripheral.mtu(); } catch (...) {}
-        if (mtu_val < 23) mtu_val = 23;
-        int chunk_size = std::max(1, std::min(cfg.mtu, (int)mtu_val) - 3);
-
-        std::cout << "  Connected.  MTU=" << mtu_val
-                  << "  chunk=" << chunk_size << "b"
-                  << "  wwr=" << (can_wwr ? "yes" : "no")
-                  << "  response=" << (use_response ? "yes" : "no") << "\n";
-        if (cfg.ble_ka_ms > 0)
-            std::cout << "  BLE keep-alive: " << cfg.ble_ka_ms / 1000
-                      << "s  (KISS null writes)\n";
-        if (tcp_mode)
-            std::cout << "  Mode       : TCP server only (no PTY)\n";
-        std::cout << (cfg.monitor ? "  Monitor on.  Ctrl-C to stop.\n"
-                                  : "  Running.     Ctrl-C to stop.\n");
-        std::cout.flush();
-
-        // ── Per-session KISS decoders (reset each reconnect) ──────────────
-        KissDecoder decoder;
-        KissDecoder tx_decoder;
-
-        // ── Disconnect callback ───────────────────────────────────────────
-        // Sets g_ble_disc (NOT g_running) so the outer loop can retry.
-        peripheral.set_callback_on_disconnected([&]() {
+        // Disconnect callback
+        transport.set_on_disconnect([&]() {
             std::lock_guard<std::mutex> lk(mx);
-            std::cout << "\n  [BLE disconnected]\n";
+            std::cout << "\n  [" << transport.label() << " disconnected]\n";
             std::cout.flush();
-            g_ble_disc = true;
+            g_transport_disc = true;
         });
 
-        // ── BLE → PTY + TCP clients ───────────────────────────────────────
-        peripheral.notify(cfg.service_uuid, cfg.read_uuid,
-            [&](SimpleBLE::ByteArray raw) {
-                const uint8_t* d = raw.data();
-                size_t n = raw.size();
-
+        // For callback-based transports (BLE): set receive handler
+        if (transport.read_fd() < 0) {
+            transport.set_on_receive([&](const uint8_t* d, size_t n) {
                 std::lock_guard<std::mutex> lk(mx);
 
                 if (master_fd >= 0 && ::write(master_fd, d, n) < 0)
@@ -947,24 +1497,28 @@ static void do_bridge(const BridgeConfig& cfg) {
                 ++rx_frames;
 
                 if (cfg.monitor) {
+                    // Use a thread-local decoder so we don't need another lock
+                    static thread_local KissDecoder decoder;
                     std::string t = ts();
                     auto frames = decoder.feed(d, n);
 
                     if (frames.empty()) {
-                        std::cout << DIM() << "[" << t << "]  <- BLE  "
+                        std::cout << DIM() << "[" << t << "]  <- " << transport.label() << "  "
                                   << n << " bytes (buffering)\n"
                                   << hex_dump(d, n, "           ") << RESET();
                     }
                     for (auto& kf : frames) {
                         if (kf.type == 0 && !kf.payload.empty()) {
                             auto ax = decode_ax25(kf.payload.data(), kf.payload.size());
-                            std::cout << "[" << t << "]  <- BLE  " << ax.summary << "\n";
+                            std::cout << "[" << t << "]  <- " << transport.label()
+                                      << "  " << ax.summary << "\n";
                             print_frame_detail(ax, kf.payload.data(), kf.payload.size());
                         } else {
                             static constexpr const char* cmd_names[] =
                                 {"DATA","TXDELAY","P","SLOTTIME","TXTAIL",
                                  "FULLDUPLEX","SETHW","?","?","?","?","?","?","?","?","RETURN"};
-                            std::cout << DIM() << "[" << t << "]  <- BLE  KISS cmd="
+                            std::cout << DIM() << "[" << t << "]  <- " << transport.label()
+                                      << "  KISS cmd="
                                       << cmd_names[kf.type & 0xF] << " port=" << kf.port
                                       << "  " << kf.payload.size() << " bytes\n";
                             if (!kf.payload.empty())
@@ -975,56 +1529,22 @@ static void do_bridge(const BridgeConfig& cfg) {
                     std::cout.flush();
                 }
             });
+        }
 
-        using SteadyClock = std::chrono::steady_clock;
-        std::atomic<SteadyClock::time_point> last_ble_write{SteadyClock::now()};
+        if (!transport.connect()) continue; // retry
 
-        // ── Async BLE write queue + writer thread ────────────────────────
-        // Moves BLE writes off the main loop so notifications (BLE→PTY)
-        // are never blocked by write_request() completions on the
-        // CoreBluetooth dispatch queue.
-        std::mutex                        ble_tx_mx;
-        std::condition_variable           ble_tx_cv;
-        std::deque<std::vector<uint8_t>>  ble_tx_queue;
-        std::atomic<bool>                 ble_tx_stop{false};
+        if (tcp_mode)
+            std::cout << "  Mode       : TCP server only (no PTY)\n";
+        std::cout << (cfg.monitor ? "  Monitor on.  Ctrl-C to stop.\n"
+                                  : "  Running.     Ctrl-C to stop.\n");
+        std::cout.flush();
 
-        std::thread ble_writer([&]() {
-            while (!ble_tx_stop) {
-                std::vector<uint8_t> pkt;
-                {
-                    std::unique_lock<std::mutex> lk(ble_tx_mx);
-                    ble_tx_cv.wait_for(lk, std::chrono::milliseconds(50),
-                        [&]{ return !ble_tx_queue.empty() || ble_tx_stop.load(); });
-                    if (ble_tx_queue.empty()) continue;
-                    pkt = std::move(ble_tx_queue.front());
-                    ble_tx_queue.pop_front();
-                }
-                try {
-                    for (int i = 0; i < (int)pkt.size(); i += chunk_size) {
-                        int clen = std::min(chunk_size, (int)pkt.size() - i);
-                        SimpleBLE::ByteArray chunk(pkt.data() + i, pkt.data() + i + clen);
-                        if (use_response)
-                            peripheral.write_request(cfg.service_uuid, cfg.write_uuid, chunk);
-                        else
-                            peripheral.write_command(cfg.service_uuid, cfg.write_uuid, chunk);
-                    }
-                    last_ble_write.store(SteadyClock::now());
-                } catch (const std::exception& e) {
-                    std::lock_guard<std::mutex> lk(mx);
-                    std::cerr << "  BLE write error: " << e.what() << "\n";
-                }
-            }
-        });
+        // Per-session KISS decoders (reset each reconnect)
+        KissDecoder rx_decoder;  // for fd-based transport reads
+        KissDecoder tx_decoder;
 
-        // Non-blocking enqueue — never blocks the caller
-        auto ble_write = [&](const uint8_t* data, int len) {
-            std::lock_guard<std::mutex> lk(ble_tx_mx);
-            ble_tx_queue.emplace_back(data, data + len);
-            ble_tx_cv.notify_one();
-        };
-
-        // ── PTY → BLE session loop ────────────────────────────────────────
-        while (g_running && !g_ble_disc && peripheral.is_connected()) {
+        // -- Main select loop --
+        while (g_running && !g_transport_disc && transport.is_connected()) {
             fd_set rfds;
             FD_ZERO(&rfds);
             int max_fd = 0;
@@ -1047,22 +1567,25 @@ static void do_bridge(const BridgeConfig& cfg) {
                 max_fd = std::max(max_fd, fd);
             }
 
+            // If transport has a readable fd (BT), add it
+            int tfd = transport.read_fd();
+            if (tfd >= 0) {
+                FD_SET(tfd, &rfds);
+                max_fd = std::max(max_fd, tfd);
+            }
+
             struct timeval tv{0, 100000};  // 100 ms
             bool got_any = select(max_fd + 1, &rfds, nullptr, nullptr, &tv) > 0;
 
-            // BLE keep-alive
-            if (cfg.ble_ka_ms > 0) {
-                auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                   SteadyClock::now() - last_ble_write.load()).count();
-                if (elapsed >= cfg.ble_ka_ms) {
-                    static const uint8_t kiss_null[] = {0xC0, 0xC0};
-                    ble_write(kiss_null, 2);  // non-blocking enqueue
-                    if (cfg.monitor && cfg.show_keepalive) {
-                        std::lock_guard<std::mutex> lk(mx);
-                        std::cout << "\n" << hr() << "\n";
-                        std::cout << "[" << ts() << "]  BLE keep-alive  (KISS null)\n";
-                        std::cout.flush();
-                    }
+            // BLE keep-alive (only for BLE transport)
+            auto* ble_tp = dynamic_cast<BleTransport*>(&transport);
+            if (ble_tp) {
+                bool sent = ble_tp->maybe_keepalive();
+                if (sent && cfg.monitor && cfg.show_keepalive) {
+                    std::lock_guard<std::mutex> lk(mx);
+                    std::cout << "\n" << hr() << "\n";
+                    std::cout << "[" << ts() << "]  BLE keep-alive  (KISS null)\n";
+                    std::cout.flush();
                 }
             }
 
@@ -1089,7 +1612,7 @@ static void do_bridge(const BridgeConfig& cfg) {
                 }
             }
 
-            // Read from TCP clients → BLE
+            // Read from TCP clients -> transport
             for (int fd : clients_snap) {
                 if (!FD_ISSET(fd, &rfds)) continue;
                 uint8_t tbuf[4096];
@@ -1140,10 +1663,78 @@ static void do_bridge(const BridgeConfig& cfg) {
                     }
                     std::cout.flush();
                 }
-                ble_write(tbuf, (int)tn);  // non-blocking enqueue
+                transport.write(tbuf, (size_t)tn);
             }
 
-            // Read from PTY → BLE (serial mode only)
+            // Read from transport fd -> PTY + TCP clients (fd-based transports: BT)
+            if (tfd >= 0 && FD_ISSET(tfd, &rfds)) {
+                uint8_t rbuf[4096];
+                ssize_t rn = ::read(tfd, rbuf, sizeof(rbuf));
+                if (rn <= 0) {
+                    // Transport read error -- treat as disconnect
+                    if (rn == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+                        std::lock_guard<std::mutex> lk(mx);
+                        std::cout << "\n  [" << transport.label() << " read error / disconnected]\n";
+                        std::cout.flush();
+                        g_transport_disc = true;
+                        continue;
+                    }
+                } else {
+                    std::lock_guard<std::mutex> lk(mx);
+
+                    if (master_fd >= 0 && ::write(master_fd, rbuf, (size_t)rn) < 0)
+                        std::cerr << "  PTY write error: " << strerror(errno) << "\n";
+
+                    std::vector<int> dead;
+                    for (int cfd : tcp_clients) {
+                        if (::write(cfd, rbuf, (size_t)rn) < 0) dead.push_back(cfd);
+                    }
+                    for (int cfd : dead) {
+                        tcp_clients.erase(
+                            std::remove(tcp_clients.begin(), tcp_clients.end(), cfd),
+                            tcp_clients.end());
+                        ::close(cfd);
+                        if (cfg.monitor)
+                            std::cout << "[" << ts() << "]  TCP client fd=" << cfd
+                                      << " removed (write error)\n";
+                    }
+
+                    ++rx_frames;
+
+                    if (cfg.monitor) {
+                        std::string t = ts();
+                        auto frames = rx_decoder.feed(rbuf, (size_t)rn);
+
+                        if (frames.empty()) {
+                            std::cout << DIM() << "[" << t << "]  <- " << transport.label()
+                                      << "  " << rn << " bytes (buffering)\n"
+                                      << hex_dump(rbuf, (size_t)rn, "           ") << RESET();
+                        }
+                        for (auto& kf : frames) {
+                            if (kf.type == 0 && !kf.payload.empty()) {
+                                auto ax = decode_ax25(kf.payload.data(), kf.payload.size());
+                                std::cout << "[" << t << "]  <- " << transport.label()
+                                          << "  " << ax.summary << "\n";
+                                print_frame_detail(ax, kf.payload.data(), kf.payload.size());
+                            } else {
+                                static constexpr const char* cmd_names[] =
+                                    {"DATA","TXDELAY","P","SLOTTIME","TXTAIL",
+                                     "FULLDUPLEX","SETHW","?","?","?","?","?","?","?","?","RETURN"};
+                                std::cout << DIM() << "[" << t << "]  <- " << transport.label()
+                                          << "  KISS cmd="
+                                          << cmd_names[kf.type & 0xF] << " port=" << kf.port
+                                          << "  " << kf.payload.size() << " bytes\n";
+                                if (!kf.payload.empty())
+                                    std::cout << hex_dump(kf.payload.data(), kf.payload.size(), "           ");
+                                std::cout << RESET();
+                            }
+                        }
+                        std::cout.flush();
+                    }
+                }
+            }
+
+            // Read from PTY -> transport (serial mode only)
             if (master_fd < 0 || !FD_ISSET(master_fd, &rfds)) continue;
 
             uint8_t buf[4096];
@@ -1179,21 +1770,14 @@ static void do_bridge(const BridgeConfig& cfg) {
                 }
                 std::cout.flush();
             }
-            ble_write(buf, (int)nr);  // non-blocking enqueue
+            transport.write(buf, (size_t)nr);
         }  // end session main loop
 
-        // ── Stop BLE writer thread ───────────────────────────────────────
-        ble_tx_stop = true;
-        ble_tx_cv.notify_one();
-        if (ble_writer.joinable()) ble_writer.join();
+        transport.disconnect();
 
-        // ── Per-session BLE cleanup ───────────────────────────────────────
-        try { peripheral.unsubscribe(cfg.service_uuid, cfg.read_uuid); } catch (...) {}
-        try { peripheral.disconnect(); } catch (...) {}
+        if (!g_running) break;   // SIGINT -- stop immediately
 
-        if (!g_running) break;   // SIGINT — stop immediately
-
-        // g_ble_disc is true here: outer for-loop will retry if attempts remain
+        // g_transport_disc is true here: outer for-loop will retry if attempts remain
         if (attempt == MAX_RECONNECTS) {
             std::cout << "[" << ts()
                       << "]  Max reconnect attempts reached.  Giving up.\n";
@@ -1201,7 +1785,7 @@ static void do_bridge(const BridgeConfig& cfg) {
 
     }  // end reconnect loop
 
-    // ── Final cleanup (TCP server, PTY) ──────────────────────────────────
+    // -- Final cleanup (TCP server, PTY) --
     if (server_sock >= 0) { ::close(server_sock); }
     {
         std::lock_guard<std::mutex> lk(mx);
@@ -1219,58 +1803,78 @@ static void do_bridge(const BridgeConfig& cfg) {
     std::cout << hr() << "\n";
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// =========================================================================
 // main
-// ─────────────────────────────────────────────────────────────────────────────
+// =========================================================================
 static void usage(const char* prog) {
     std::cerr <<
-        "BLE KISS TNC bridge + AX.25 monitor\n\n"
+        "Bluetooth KISS TNC bridge + AX.25 monitor (BLE + Classic BT)\n\n"
         "Usage:\n"
-        "  " << prog << " --scan [--timeout <s>]\n"
-        "  " << prog << " --inspect <ADDRESS>\n"
-        "  " << prog << " --device <ADDRESS>\n"
+        "  " << prog << " --scan [--timeout <s>] [--ble|--bt]\n"
+        "  " << prog << " --inspect <ADDRESS> [--ble|--bt]\n"
+        "  " << prog << " --ble --device <ADDRESS>\n"
         "             --service <UUID> --write <UUID> --read <UUID>\n"
         "             [--mtu <bytes>] [--write-with-response] [--monitor]\n"
         "             [--ble-ka <secs>]\n"
         "             PTY mode  : [--link <path>]          (default)\n"
+        "             TCP mode  : --server-port <port> [--server-host <host>]\n"
+        "  " << prog << " --bt --device <ADDRESS> [--channel <N>]\n"
+        "             [--monitor]\n"
+        "             PTY mode  : [--link <path>]          (default)\n"
         "             TCP mode  : --server-port <port> [--server-host <host>]\n\n"
+        "Transport selection:\n"
+        "  --ble                  Use Bluetooth Low Energy (GATT)\n"
+        "  --bt                   Use Classic Bluetooth (RFCOMM)\n"
+        "                         (Linux only; requires libbluetooth-dev)\n\n"
         "Transport modes (mutually exclusive):\n"
         "  PTY mode (default)     A virtual serial port is created; connect with:\n"
         "                           ax25tnc -c W1AW -r W1BBS-1 /tmp/kiss\n"
         "  TCP mode               --server-port enables a TCP KISS server;\n"
         "                         NO PTY is created.  Connect with:\n"
         "                           ax25tnc -c W1AW -r W1BBS-1 localhost:<port>\n\n"
-        "Options (device mode):\n"
+        "Options (BLE device mode):\n"
+        "  --service <UUID>       GATT service UUID\n"
+        "  --write <UUID>         GATT write characteristic UUID\n"
+        "  --read <UUID>          GATT notify characteristic UUID\n"
+        "  --write-with-response  Force write-with-response (vs write-without-response)\n"
+        "  --ble-ka <secs>        BLE keep-alive: send KISS null every N seconds\n"
+        "                         when idle to prevent TNC inactivity disconnect\n"
+        "                         Default: 5  (use 0 to disable)\n\n"
+        "Options (Classic BT device mode):\n"
+        "  --channel <N>          RFCOMM channel number (0 = auto-detect via SDP)\n\n"
+        "Options (all device modes):\n"
         "  --link <path>          (PTY mode) symlink pointing to the PTY slave\n"
         "                         Default: /tmp/kiss  (use --link '' to disable)\n"
         "  --server-port <port>   (TCP mode) listen for KISS-over-TCP clients;\n"
         "                         disables PTY creation entirely\n"
         "  --server-host <host>   (TCP mode) bind to this address (default: all)\n"
-        "  --ble-ka <secs>        BLE keep-alive: send KISS null every N seconds\n"
-        "                         when idle to prevent TNC inactivity disconnect\n"
-        "                         Default: 5  (use 0 to disable)\n"
+        "  --mtu <bytes>          Max BLE chunk cap (default 517)\n"
         "  --monitor              Rich frame monitor: hexdump-C + AX.25 ctrl decode\n"
         "                         Same format as ax25kiss/ax25tnc (dim detail lines)\n"
         "  --show-keepalive       Show BLE keep-alive messages in monitor output\n"
         "                         (hidden by default to reduce noise)\n\n"
         "Examples:\n"
+        "  # Scan for all Bluetooth devices\n"
         "  " << prog << " --scan --timeout 15\n"
-        "  " << prog << " --inspect AA:BB:CC:DD:EE:FF\n"
-        "  # PTY mode (serial bridge)\n"
-        "  " << prog << " --device AA:BB:CC:DD:EE:FF \\\n"
+        "  " << prog << " --scan --ble\n"
+        "  " << prog << " --scan --bt\n\n"
+        "  # Inspect device services\n"
+        "  " << prog << " --ble --inspect AA:BB:CC:DD:EE:FF\n"
+        "  " << prog << " --bt  --inspect AA:BB:CC:DD:EE:FF\n\n"
+        "  # BLE bridge (PTY mode)\n"
+        "  " << prog << " --ble --device AA:BB:CC:DD:EE:FF \\\n"
         "             --service 00000001-ba2a-46c9-ae49-01b0961f68bb \\\n"
         "             --write   00000003-ba2a-46c9-ae49-01b0961f68bb \\\n"
         "             --read    00000002-ba2a-46c9-ae49-01b0961f68bb \\\n"
-        "             --link /tmp/kiss --monitor\n"
-        "  # TCP mode (no PTY)\n"
-        "  " << prog << " --device AA:BB:CC:DD:EE:FF \\\n"
-        "             --service 00000001-ba2a-46c9-ae49-01b0961f68bb \\\n"
-        "             --write   00000003-ba2a-46c9-ae49-01b0961f68bb \\\n"
-        "             --read    00000002-ba2a-46c9-ae49-01b0961f68bb \\\n"
+        "             --link /tmp/kiss --monitor\n\n"
+        "  # Classic BT bridge (auto-detect RFCOMM channel)\n"
+        "  " << prog << " --bt --device AA:BB:CC:DD:EE:FF --monitor\n\n"
+        "  # Classic BT bridge (explicit channel, TCP mode)\n"
+        "  " << prog << " --bt --device AA:BB:CC:DD:EE:FF --channel 1 \\\n"
         "             --server-port 8001 --monitor\n\n"
         "Build:\n"
-        "  make ble-deps        # clone + build SimpleBLE (one time)\n"
-        "  make ble_kiss_bridge\n";
+        "  make ble-deps          # clone + build SimpleBLE (one time)\n"
+        "  make bt_kiss_bridge\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -1292,8 +1896,11 @@ int main(int argc, char* argv[]) {
         else if (a == "--ble-ka"            && i+1 < argc) { cfg.ble_ka_ms    = (int)(std::stod(argv[++i]) * 1000); }
         else if (a == "--server-port"       && i+1 < argc) { cfg.server_port  = std::stoi(argv[++i]); }
         else if (a == "--server-host"       && i+1 < argc) { cfg.server_host  = argv[++i]; }
-        else if (a == "--write-with-response")             { cfg.force_response = true; }
-        else if (a == "--monitor")                         { cfg.monitor        = true; }
+        else if (a == "--channel"           && i+1 < argc) { cfg.bt_channel   = std::stoi(argv[++i]); }
+        else if (a == "--ble")                              { cfg.transport    = BridgeConfig::BLE; }
+        else if (a == "--bt")                               { cfg.transport    = BridgeConfig::BT; }
+        else if (a == "--write-with-response")              { cfg.force_response = true; }
+        else if (a == "--monitor")                          { cfg.monitor        = true; }
         else if (a == "--show-keepalive")                   { cfg.show_keepalive = true; }
         else if (a == "--link"              && i+1 < argc) { cfg.link_path = argv[++i]; link_explicit = true; }
         else { std::cerr << "Unknown argument: " << a << "\n"; usage(argv[0]); return 1; }
@@ -1301,7 +1908,7 @@ int main(int argc, char* argv[]) {
 
     cfg.timeout = timeout;
 
-    // In TCP mode the default /tmp/kiss symlink is irrelevant — clear it
+    // In TCP mode the default /tmp/kiss symlink is irrelevant -- clear it
     // unless the user explicitly asked for --link (which is an error).
     if (cfg.server_port > 0) {
         if (link_explicit) {
@@ -1313,14 +1920,43 @@ int main(int argc, char* argv[]) {
     }
 
     if (mode.empty()) { usage(argv[0]); return 1; }
-    if (mode == "device" &&
-        (cfg.service_uuid.empty() || cfg.write_uuid.empty() || cfg.read_uuid.empty())) {
-        std::cerr << "--device requires --service, --write, and --read\n";
-        return 1;
+
+    // -- Scan / Inspect modes --
+    if (mode == "scan") {
+        do_scan(timeout, cfg.transport);
+        return 0;
+    }
+    if (mode == "inspect") {
+        do_inspect(cfg.address, cfg.transport);
+        return 0;
     }
 
-    if      (mode == "scan")    do_scan(timeout);
-    else if (mode == "inspect") do_inspect(cfg.address);
-    else                        do_bridge(cfg);
+    // -- Device (bridge) mode --
+    // Auto-detect transport if not specified
+    if (cfg.transport == BridgeConfig::AUTO) {
+        if (!cfg.service_uuid.empty())
+            cfg.transport = BridgeConfig::BLE;
+        else if (cfg.bt_channel > 0)
+            cfg.transport = BridgeConfig::BT;
+        else {
+            std::cerr << "Cannot auto-detect transport.  Use --ble (with --service/--write/--read)\n"
+                         "or --bt (with optional --channel).\n";
+            return 1;
+        }
+    }
+
+    // Validate required options per transport
+    if (cfg.transport == BridgeConfig::BLE) {
+        if (cfg.service_uuid.empty() || cfg.write_uuid.empty() || cfg.read_uuid.empty()) {
+            std::cerr << "--ble --device requires --service, --write, and --read\n";
+            return 1;
+        }
+        BleTransport ble(cfg);
+        do_bridge(cfg, ble);
+    } else {
+        BtTransport bt(cfg.address, cfg.bt_channel);
+        do_bridge(cfg, bt);
+    }
+
     return 0;
 }

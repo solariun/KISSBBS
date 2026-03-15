@@ -236,12 +236,12 @@ info "Building core binaries..."
 make -j"$(nproc)" bbs ax25kiss ax25tnc basic_tool
 success "Core binaries built"
 
-info "Building BLE bridge (optional)..."
-if make -j"$(nproc)" ble-deps 2>/dev/null && make -j"$(nproc)" ble_kiss_bridge 2>/dev/null; then
-    success "BLE KISS bridge built"
+info "Building BT bridge (optional)..."
+if make -j"$(nproc)" ble-deps 2>/dev/null && make -j"$(nproc)" bt_kiss_bridge 2>/dev/null; then
+    success "BT KISS bridge built"
     BLE_BRIDGE_BUILT=1
 else
-    warn "BLE KISS bridge build failed — this is optional, continuing"
+    warn "BT KISS bridge build failed — this is optional, continuing"
     BLE_BRIDGE_BUILT=0
 fi
 
@@ -309,7 +309,7 @@ Wants=bluetooth.target
 [Service]
 Type=simple
 User=${SERVICE_USER}
-ExecStart=${BIN_DIR}/ble_kiss_bridge \\
+ExecStart=${BIN_DIR}/bt_kiss_bridge \\
     --device ${BLE_DEVICE} \\
     --service ${BLE_SERVICE} \\
     --write ${BLE_WRITE} \\
@@ -438,10 +438,10 @@ for bin in bbs ax25kiss ax25tnc basic_tool; do
         echo -e "  ${RED}✗${RESET} ${bin}"
     fi
 done
-if [[ -f "${BIN_DIR}/ble_kiss_bridge" ]]; then
-    echo -e "  ${GREEN}✓${RESET} ble_kiss_bridge"
+if [[ -f "${BIN_DIR}/bt_kiss_bridge" ]]; then
+    echo -e "  ${GREEN}✓${RESET} bt_kiss_bridge"
 else
-    echo -e "  ${YELLOW}○${RESET} ble_kiss_bridge (not built)"
+    echo -e "  ${YELLOW}○${RESET} bt_kiss_bridge (not built)"
 fi
 
 echo ""

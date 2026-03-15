@@ -19,7 +19,7 @@ env:
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 # REF_NAME resolves to the tag (v1.2.3) or the manual version input.
-# Each platform job builds the core apps, optionally ble_kiss_bridge, then
+# Each platform job builds the core apps, optionally bt_kiss_bridge, then
 # uploads a .tar.gz artifact.  The final "release" job collects everything and
 # publishes the GitHub Release.
 
@@ -50,9 +50,9 @@ jobs:
       - name: Build core apps
         run: make bbs ax25kiss ax25tnc basic_tool
 
-      - name: Build ble_kiss_bridge
+      - name: Build bt_kiss_bridge
         continue-on-error: true
-        run: make ble_kiss_bridge
+        run: make bt_kiss_bridge
 
       - name: Run tests
         run: make test
@@ -63,7 +63,8 @@ jobs:
           PKG="ax25-${REF}-linux-x86_64"
           mkdir -p "$PKG"
           cp bbs ax25kiss ax25tnc basic_tool "$PKG"/
-          [ -f ble_kiss_bridge ] && cp ble_kiss_bridge "$PKG"/ || true
+          [ -f bt_kiss_bridge ] && cp bt_kiss_bridge "$PKG"/ || true
+          [ -f bt_kiss_bridge ] && ln -sf bt_kiss_bridge "$PKG"/ble_kiss_bridge || true
           cp README.md LICENSE "$PKG"/ 2>/dev/null || true
           tar czf "${PKG}.tar.gz" "$PKG"
 
@@ -99,9 +100,9 @@ jobs:
       - name: Build core apps
         run: make bbs ax25kiss ax25tnc basic_tool
 
-      - name: Build ble_kiss_bridge
+      - name: Build bt_kiss_bridge
         continue-on-error: true
-        run: make ble_kiss_bridge
+        run: make bt_kiss_bridge
 
       - name: Run tests
         run: make test
@@ -112,7 +113,8 @@ jobs:
           PKG="ax25-${REF}-linux-arm64"
           mkdir -p "$PKG"
           cp bbs ax25kiss ax25tnc basic_tool "$PKG"/
-          [ -f ble_kiss_bridge ] && cp ble_kiss_bridge "$PKG"/ || true
+          [ -f bt_kiss_bridge ] && cp bt_kiss_bridge "$PKG"/ || true
+          [ -f bt_kiss_bridge ] && ln -sf bt_kiss_bridge "$PKG"/ble_kiss_bridge || true
           cp README.md LICENSE "$PKG"/ 2>/dev/null || true
           tar czf "${PKG}.tar.gz" "$PKG"
 
@@ -208,8 +210,8 @@ jobs:
       - name: Build core apps
         run: make bbs ax25kiss ax25tnc basic_tool
 
-      - name: Build ble_kiss_bridge
-        run: make ble_kiss_bridge
+      - name: Build bt_kiss_bridge
+        run: make bt_kiss_bridge
 
       - name: Run tests
         run: make test
@@ -219,7 +221,8 @@ jobs:
           REF="${{ github.ref_name || inputs.version }}"
           PKG="ax25-${REF}-macos-arm64"
           mkdir -p "$PKG"
-          cp bbs ax25kiss ax25tnc basic_tool ble_kiss_bridge "$PKG"/
+          cp bbs ax25kiss ax25tnc basic_tool bt_kiss_bridge "$PKG"/
+          ln -sf bt_kiss_bridge "$PKG"/ble_kiss_bridge
           cp README.md LICENSE "$PKG"/ 2>/dev/null || true
           tar czf "${PKG}.tar.gz" "$PKG"
 
@@ -232,7 +235,7 @@ jobs:
             ax25kiss
             ax25tnc
             basic_tool
-            ble_kiss_bridge
+            bt_kiss_bridge
           retention-days: 7
 
       - uses: actions/upload-artifact@v4
@@ -250,7 +253,7 @@ jobs:
   #   • The macOS system libsqlite3 is a universal dylib — safe to link from
   #     either arch without the brew arm64-only copy.
   #   • SimpleBLE is rebuilt for x86_64 via -DCMAKE_OSX_ARCHITECTURES=x86_64
-  #     (best-effort; ble_kiss_bridge falls back to arm64-only if it fails).
+  #     (best-effort; bt_kiss_bridge falls back to arm64-only if it fails).
   # ============================================================================
   macos-universal:
     name: macOS Universal
@@ -283,7 +286,7 @@ jobs:
           mkdir -p bins/x86_64
           cp bbs ax25kiss ax25tnc basic_tool bins/x86_64/
 
-      - name: Build ble_kiss_bridge x86_64 (best-effort)
+      - name: Build bt_kiss_bridge x86_64 (best-effort)
         continue-on-error: true
         run: |
           cmake -S vendor/simpleble/simpleble \
@@ -294,10 +297,10 @@ jobs:
                 -DCMAKE_OSX_ARCHITECTURES=x86_64
           cmake --build vendor/simpleble/build-x86_64 \
                 --config Release -j$(sysctl -n hw.logicalcpu)
-          make ble_kiss_bridge \
+          make bt_kiss_bridge \
             CXX="clang++ -arch x86_64" \
             BLE_LIB=vendor/simpleble/build-x86_64/lib/libsimpleble.a
-          cp ble_kiss_bridge bins/x86_64/
+          cp bt_kiss_bridge bins/x86_64/
 
       - name: Create universal binaries with lipo
         run: |
@@ -305,7 +308,7 @@ jobs:
           PKG="ax25-${REF}-macos-universal"
           mkdir -p "$PKG"
           chmod +x bins/arm64/* bins/x86_64/* 2>/dev/null || true
-          for BIN in bbs ax25kiss ax25tnc basic_tool ble_kiss_bridge; do
+          for BIN in bbs ax25kiss ax25tnc basic_tool bt_kiss_bridge; do
             ARM="bins/arm64/$BIN"
             X86="bins/x86_64/$BIN"
             if [ -f "$ARM" ] && [ -f "$X86" ]; then
@@ -316,6 +319,7 @@ jobs:
               echo "$BIN: arm64 only (x86_64 cross-build skipped)"
             fi
           done
+          [ -f "$PKG/bt_kiss_bridge" ] && ln -sf bt_kiss_bridge "$PKG"/ble_kiss_bridge || true
           cp README.md LICENSE "$PKG"/ 2>/dev/null || true
           tar czf "${PKG}.tar.gz" "$PKG"
 
