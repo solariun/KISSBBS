@@ -1251,6 +1251,11 @@ ble_handle_t ble_connect(const char* address,
         return nullptr;
     }
 
+    // Preventive disconnect — clear any stale connection (ignore errors)
+    dbus_call_void(conn, "org.bluez", dev_path.c_str(),
+                   "org.bluez.Device1", "Disconnect", 3000);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
     // Connect
     if (!dbus_call_void(conn, "org.bluez", dev_path.c_str(),
                         "org.bluez.Device1", "Connect", 30000)) {

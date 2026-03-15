@@ -633,6 +633,10 @@ ble_handle_t ble_connect(const char* address,
             return nullptr;
         }
 
+        // Preventive disconnect — clear any stale connection (ignore errors)
+        [mgr cancelPeripheralConnection:target];
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
         // Connect
         del.servicesResolved = NO;
         del.didConnect = NO;
