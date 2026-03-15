@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  KISSBBS — AX.25 BBS Station Installer
+#  KISSBBS — AX.25 BBS Station Installer (Linux)
 #  Installs and configures a complete AX.25 BBS on a clean Linux system
 #  (Raspberry Pi OS, Ubuntu, Debian).
 #
 #  Usage:
 #    1. Edit the CONFIGURATION section below with your station values
-#    2. Run:  sudo bash install.sh
+#    2. Run:  sudo bash install_linux_bbs.sh
 # =============================================================================
 set -euo pipefail
 
@@ -227,7 +227,7 @@ if [[ -d "${INSTALL_DIR}/.git" ]]; then
     git pull origin "${KISSBBS_BRANCH}"
 
     # Re-exec the updated install.sh if it changed (avoids running stale script)
-    UPDATED_SCRIPT="${INSTALL_DIR}/resources/install.sh"
+    UPDATED_SCRIPT="${INSTALL_DIR}/resources/install_linux_bbs.sh"
     if [[ -f "${UPDATED_SCRIPT}" ]] && ! cmp -s "$0" "${UPDATED_SCRIPT}"; then
         info "install.sh updated — re-executing from repository..."
         exec bash "${UPDATED_SCRIPT}" "$@"
@@ -418,7 +418,7 @@ Wants=kissbbs-kissattach.service
 [Service]
 Type=simple
 User=${SERVICE_USER}
-ExecStart=/usr/bin/linpac
+ExecStart=/usr/bin/linpac -d
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

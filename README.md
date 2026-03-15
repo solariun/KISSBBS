@@ -30,31 +30,115 @@ make test     # runs 170 tests — must all pass
 
 ---
 
-## Table of Contents
+## Linux BBS Installation — One-Command Setup
 
-0. [Quick Start](#quick-start)
-1. [Background — AX.25 and KISS](#1-background--ax25-and-kiss)
-2. [Architecture Overview](#2-architecture-overview)
-3. [Object Relationship Diagram](#3-object-relationship-diagram)
-4. [UML Class Diagram](#4-uml-class-diagram)
-5. [AX.25 State Machine](#5-ax25-state-machine)
-6. [Connection Sequence Diagram](#6-connection-sequence-diagram)
-7. [Building](#7-building)
-8. [API Reference](#8-api-reference)
-9. [Usage Examples](#9-usage-examples)
-10. [Running Tests](#10-running-tests)
-11. [BBS Example](#11-bbs-example)
-12. [INI Configuration](#12-ini-configuration)
-13. [BASIC Scripting](#13-basic-scripting)
-14. [APRS Helpers (ax25::aprs)](#14-aprs-helpers-ax25aprs)
-15. [ax25tnc — TNC Terminal Client](#15-ax25tnc--tnc-terminal-client)
-16. [ble_kiss_monitor.py — BLE KISS Scanner & AX.25 Monitor](#16-ble_kiss_monitorpy--ble-kiss-scanner--ax25-monitor)
-17. [bt_kiss_bridge — Bluetooth KISS Bridge (BLE + Classic BT)](#17-bt_kiss_bridge--bluetooth-kiss-bridge-ble--classic-bt)
-18. [basic_tool — Offline BASIC Interpreter / REPL Debugger](#18-basic_tool--offline-basic-interpreter--repl-debugger)
+KISSBBS provides a complete automated installer that turns any Linux box
+(Raspberry Pi, Pi Zero, Ubuntu, Debian) into a fully operational AX.25 BBS
+station.  Fully compatible with **Raspberry Pi** (all models including
+**Pi Zero / Pi Zero W**) — perfect for building a portable, low-power packet
+radio station.
+
+### Why KISSBBS?
+
+- **`bt_kiss_bridge`** — Use inexpensive Bluetooth radios (BLE or Classic BT) as
+  packet modems.  No expensive dedicated TNC hardware required; a handheld radio
+  like the Vero VR-N7600 or Kenwood TH-D75 connected via Bluetooth becomes your
+  station modem.  The bridge creates a virtual KISS PTY so every AX.25 tool on
+  Linux (kissattach, linpac, our BBS) can use it transparently.
+- **`bbs`** — A native multi-connection AX.25 BBS with INI config, scriptable
+  via BASIC, SQLite database, APRS beacons, and per-connection state machines.
+  *Currently we also install **linpac** (a popular AX.25 terminal) as an
+  alternative; in future releases linpac will be replaced entirely by our BBS.*
+- **`ax25tnc`** — A standalone TNC terminal that can connect to remote stations
+  or accept incoming connections, working as a simple peer-to-peer link with
+  other HAMs.  Great for testing and casual QSOs.
+- **BASIC scripting** — Both `bbs` and `ax25tnc` can run BASIC scripts to
+  automate welcome messages, menus, mail handling, and more.
+  See [§14 BASIC Scripting](#14-basic-scripting) for the full language reference.
+
+### Running the installer
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/solariun/KISSBBS
+cd KISSBBS
+
+# 2. Edit the configuration section at the top of the script
+#    (callsign, SSID, BLE device MAC, etc.)
+nano resources/install_linux_bbs.sh
+
+# 3. Run the installer as root
+sudo bash resources/install_linux_bbs.sh
+```
+
+The installer will:
+1. Install all system packages (build tools, AX.25 stack, Bluetooth, linpac)
+2. Build and install all KISSBBS binaries
+3. Configure the AX.25 port in `/etc/ax25/axports`
+4. Generate `bbs.ini` with your station settings
+5. Create four **systemd services** (all **disabled** by default):
+
+| Service | Description |
+|---------|-------------|
+| `kissbbs-ble-bridge` | BLE/BT KISS bridge — connects your Bluetooth radio |
+| `kissbbs-kissattach` | Attaches the KISS PTY to the AX.25 kernel stack |
+| `kissbbs-bbs`        | The KISSBBS BBS server |
+| `kissbbs-linpac`     | Linpac AX.25 terminal (daemon mode) |
+
+### Enabling services
+
+All services are created **disabled** so you can review and test before going
+live.  Enable them in order:
+
+```bash
+# 1. Start the BLE bridge (if using Bluetooth radio)
+sudo systemctl enable --now kissbbs-ble-bridge
+
+# 2. Attach KISS to the AX.25 stack
+sudo systemctl enable --now kissbbs-kissattach
+
+# 3. Start the BBS (or linpac, or both)
+sudo systemctl enable --now kissbbs-bbs
+sudo systemctl enable --now kissbbs-linpac   # optional — linpac terminal
+
+# View logs
+journalctl -u kissbbs-ble-bridge -f
+journalctl -u kissbbs-bbs -f
+```
+
+> **Tip:** `ax25tnc` is also installed and can be used standalone for direct
+> peer-to-peer connections with other HAMs — no BBS needed.  Both `bbs` and
+> `ax25tnc` support BASIC scripting for automated interactions.
+> See [§14 BASIC Scripting](#14-basic-scripting).
 
 ---
 
-## 1. Background — AX.25 and KISS
+## Table of Contents
+
+0. [Quick Start](#quick-start)
+1. [Linux BBS Installation](#linux-bbs-installation--one-command-setup)
+2. [Background — AX.25 and KISS](#2-background--ax25-and-kiss)
+3. [Architecture Overview](#3-architecture-overview)
+4. [Object Relationship Diagram](#4-object-relationship-diagram)
+5. [UML Class Diagram](#5-uml-class-diagram)
+6. [AX.25 State Machine](#6-ax25-state-machine)
+7. [Connection Sequence Diagram](#7-connection-sequence-diagram)
+8. [Building](#8-building)
+9. [API Reference](#9-api-reference)
+10. [Usage Examples](#10-usage-examples)
+11. [Running Tests](#11-running-tests)
+12. [BBS Example](#12-bbs-example)
+13. [INI Configuration](#13-ini-configuration)
+14. [BASIC Scripting](#14-basic-scripting)
+15. [APRS Helpers (ax25::aprs)](#15-aprs-helpers-ax25aprs)
+16. [ax25tnc — TNC Terminal Client](#16-ax25tnc--tnc-terminal-client)
+17. [ble_kiss_monitor.py — BLE KISS Scanner & AX.25 Monitor](#17-ble_kiss_monitorpy--ble-kiss-scanner--ax25-monitor)
+18. [bt_kiss_bridge — Bluetooth KISS Bridge (BLE + Classic BT)](#18-bt_kiss_bridge--bluetooth-kiss-bridge-ble--classic-bt)
+19. [basic_tool — Offline BASIC Interpreter / REPL Debugger](#19-basic_tool--offline-basic-interpreter--repl-debugger)
+
+---
+
+## 2. Background — AX.25 and KISS
 
 ### AX.25
 
@@ -132,7 +216,7 @@ ones.
 
 ---
 
-## 2. Architecture Overview
+## 3. Architecture Overview
 
 ```
 Your Application
@@ -161,7 +245,7 @@ different physical layer without touching the rest).
 
 ---
 
-## 3. Object Relationship Diagram
+## 4. Object Relationship Diagram
 
 ```
                               ┌─────────────────────────────────────────┐
@@ -268,7 +352,7 @@ different physical layer without touching the rest).
 
 ---
 
-## 4. UML Class Diagram
+## 5. UML Class Diagram
 
 ```mermaid
 classDiagram
@@ -409,7 +493,7 @@ classDiagram
 
 ---
 
-## 5. AX.25 State Machine
+## 6. AX.25 State Machine
 
 ```mermaid
 stateDiagram-v2
@@ -437,7 +521,7 @@ stateDiagram-v2
 
 ---
 
-## 6. Connection Sequence Diagram
+## 7. Connection Sequence Diagram
 
 ### Successful connect + data exchange + disconnect
 
@@ -486,7 +570,7 @@ sequenceDiagram
 
 ---
 
-## 7. Building
+## 8. Building
 
 ### Prerequisites
 
@@ -526,7 +610,7 @@ CXX=clang++ make
 
 ---
 
-## 8. API Reference
+## 9. API Reference
 
 ### `ax25::Addr`
 
@@ -665,7 +749,7 @@ conn->tick(ax25::now_ms());
 
 ---
 
-## 9. Usage Examples
+## 10. Usage Examples
 
 ### Minimal receiver — print every received frame
 
@@ -777,7 +861,7 @@ safely, and all 43 tests.
 
 ---
 
-## 10. Running Tests
+## 11. Running Tests
 
 ```bash
 make test
@@ -812,7 +896,7 @@ Expected output:
 
 ---
 
-## 11. BBS Example
+## 12. BBS Example
 
 `bbs.cpp` is a full-featured BBS that demonstrates the library in production use.
 Configuration can be supplied via command-line flags **or** a `bbs.ini` file.
@@ -970,7 +1054,7 @@ assert(sessions.empty());
 
 ---
 
-## 12. INI Configuration
+## 13. INI Configuration
 
 `bbs.ini` is an optional configuration file that sets all BBS parameters.
 Command-line flags always take precedence over file values.
@@ -1040,7 +1124,7 @@ for (auto& kv : cfg.section("ax25")) {
 
 ---
 
-## 13. BASIC Scripting
+## 14. BASIC Scripting
 
 The BBS ships a **QBASIC-style interpreter** (`basic.hpp` / `basic.cpp`) that lets
 you write BBS welcome screens, menus, and automated services without recompiling.
@@ -1061,7 +1145,7 @@ bbs.ini → welcome_script = welcome.bas
           interp.run();
 ```
 
-> **Offline testing:** Use [`basic_tool`](#18-basic_tool--offline-basic-interpreter--repl-debugger)
+> **Offline testing:** Use [`basic_tool`](#19-basic_tool--offline-basic-interpreter--repl-debugger)
 > to run and debug `.bas` scripts from the command line without a TNC or BLE connection.
 > ```bash
 > basic_tool --trace -v callsign\$=W1ABC -v bbs_name\$=MyBBS welcome.bas
@@ -2121,7 +2205,7 @@ interp.run();
 
 ---
 
-## 14. APRS Helpers (`ax25::aprs`)
+## 15. APRS Helpers (`ax25::aprs`)
 
 All APRS formatting utilities live in the `ax25::aprs` sub-namespace, making
 them available to any code that includes `ax25lib.hpp` — not just the BBS.
@@ -2184,7 +2268,7 @@ Full table: [APRS Symbol Reference](http://www.aprs.org/symbols.html)
 
 ---
 
-## 15. ax25tnc — TNC Terminal Client
+## 16. ax25tnc — TNC Terminal Client
 
 `ax25tnc` is an interactive TNC terminal that provides a modern command-line
 interface to AX.25 packet radio.  By default it starts in **TNC mode** — an
@@ -2508,7 +2592,7 @@ END
 
 ---
 
-## 16. ble_kiss_monitor.py — BLE KISS Scanner & AX.25 Monitor
+## 17. ble_kiss_monitor.py — BLE KISS Scanner & AX.25 Monitor
 
 `ble_kiss_monitor.py` is a pure-Python companion tool for debugging and
 monitoring AX.25/KISS traffic through Bluetooth Low Energy TNCs (Mobilinkd,
@@ -2619,7 +2703,7 @@ Use `--inspect` to confirm UUIDs for your specific device.
 
 ---
 
-## 17. bt_kiss_bridge — Bluetooth KISS Bridge (BLE + Classic BT)
+## 18. bt_kiss_bridge — Bluetooth KISS Bridge (BLE + Classic BT)
 
 `bt_kiss_bridge` is a native C++17 Bluetooth KISS bridge supporting both
 **BLE** (GATT) and **Classic Bluetooth** (RFCOMM/SPP).  It replaces
@@ -2956,7 +3040,7 @@ the bridge automatically attempts to reconnect:
 
 ---
 
-## 18. basic_tool — Offline BASIC Interpreter / REPL Debugger
+## 19. basic_tool — Offline BASIC Interpreter / REPL Debugger
 
 `basic_tool` is a standalone CLI that runs and debugs `.bas` BBS scripts offline —
 no TNC, no BLE, no radio link required.  It wraps the same `Basic` engine used
