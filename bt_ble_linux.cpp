@@ -33,6 +33,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <fcntl.h>
 #include <unistd.h>
 #include <vector>
 
@@ -811,25 +812,6 @@ static DBusMessage* build_write_msg(const std::string& char_path,
     }
     dbus_message_iter_close_container(&args, &dict);
     return msg;
-}
-
-// Synchronous write — used during connect phase (no dispatch thread running).
-static bool gatt_write_value(DBusConnection* conn, const std::string& char_path,
-                              const uint8_t* data, size_t len,
-                              bool with_response)
-{
-    DBusMessage* msg = build_write_msg(char_path, data, len, with_response);
-    if (!msg) return false;
-
-    DBusError err;
-    dbus_error_init(&err);
-    DBusMessage* reply = dbus_connection_send_with_reply_and_block(
-                             conn, msg, 5000, &err);
-    dbus_message_unref(msg);
-    bool ok = (reply != nullptr) && !dbus_error_is_set(&err);
-    if (reply) dbus_message_unref(reply);
-    dbus_error_free(&err);
-    return ok;
 }
 
 // Async write — safe to call while the dispatch thread is running.
