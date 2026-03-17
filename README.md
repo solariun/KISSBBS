@@ -46,13 +46,16 @@ radio station.
   like the Vero VR-N7600 or Kenwood TH-D75 connected via Bluetooth becomes your
   station modem.  The bridge creates a virtual KISS PTY so every AX.25 tool on
   Linux (kissattach, linpac, our BBS) can use it transparently.
+  See [§19 bt_kiss_bridge](#19-bt_kiss_bridge--bluetooth-kiss-bridge-ble--classic-bt).
 - **`bbs`** — A native multi-connection AX.25 BBS with INI config, scriptable
   via BASIC, SQLite database, APRS beacons, and per-connection state machines.
   *Currently we also install **linpac** (a popular AX.25 terminal) as an
   alternative; in future releases linpac will be replaced entirely by our BBS.*
+  See [§13 BBS Example](#13-bbs-example) and [§14 INI Configuration](#14-ini-configuration).
 - **`ax25tnc`** — A standalone TNC terminal that can connect to remote stations
   or accept incoming connections, working as a simple peer-to-peer link with
   other HAMs.  Great for testing and casual QSOs.
+  See [§17 ax25tnc](#17-ax25tnc--tnc-terminal-client).
 - **`ax25sim`** — A PTY-based TNC simulator that creates a virtual serial port
   at `/tmp/kiss_sim`.  Develop and test BBS scripts, protocol tuning, and
   connection handling entirely on your workstation — no TNC, no radio, no

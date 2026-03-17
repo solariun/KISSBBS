@@ -17,6 +17,7 @@
 #include "ax25dump.hpp"
 #include "ini.hpp"
 #include "basic.hpp"
+#include "script_finder.hpp"
 #include <gtest/gtest.h>
 
 #include <atomic>
@@ -2233,6 +2234,148 @@ TEST(CtrlDetail, ByteCountInOutput) {
     // The frame size should always appear at the end
     EXPECT_NE(ctrl_detail(0x00,   1).find("(1 bytes)"),   std::string::npos);
     EXPECT_NE(ctrl_detail(0x00, 256).find("(256 bytes)"), std::string::npos);
+}
+
+// =============================================================================
+// ScriptFinder tests
+// =============================================================================
+
+// Helper: create a temp directory with .bas files for testing
+#include <cstdio>
+#include <sys/stat.h>
+#include <fstream>
+
+static std::string make_test_scripts_dir() {
+    char tmpl[] = "/tmp/sf_test_XXXXXX";
+    std::string dir = mkdtemp(tmpl);
+    // Create a few .bas files
+    std::ofstream(dir + "/hello.bas")  << "10 PRINT \"HELLO\"\n";
+    std::ofstream(dir + "/world.bas")  << "10 PRINT \"WORLD\"\n";
+    std::ofstream(dir + "/sim_echo.bas") << "10 REM echo\n";
+    std::ofstream(dir + "/readme.txt") << "not a script\n";
+    return dir;
+}
+
+static void cleanup_test_dir(const std::string& dir) {
+    // Remove test files
+    remove((dir + "/hello.bas").c_str());
+    remove((dir + "/world.bas").c_str());
+    remove((dir + "/sim_echo.bas").c_str());
+    remove((dir + "/readme.txt").c_str());
+    rmdir(dir.c_str());
+}
+
+TEST(ScriptFinder, FindAllScripts) {
+    std::string dir = make_test_scripts_dir();
+    ScriptFinder sf;
+    sf.set_default_dir(dir);
+    auto all = sf.find();
+    EXPECT_EQ(all.size(), 3u);  // hello.bas, sim_echo.bas, world.bas
+    cleanup_test_dir(dir);
+}
+
+TEST(ScriptFinder, FindByRegex) {
+    std::string dir = make_test_scripts_dir();
+    ScriptFinder sf;
+    sf.set_default_dir(dir);
+    auto matches = sf.find("sim.*");
+    EXPECT_EQ(matches.size(), 1u);
+    EXPECT_NE(matches[0].find("sim_echo.bas"), std::string::npos);
+    cleanup_test_dir(dir);
+}
+
+TEST(ScriptFinder, FindByRegexNoMatch) {
+    std::string dir = make_test_scripts_dir();
+    ScriptFinder sf;
+    sf.set_default_dir(dir);
+    auto matches = sf.find("nonexistent");
+    EXPECT_TRUE(matches.empty());
+    cleanup_test_dir(dir);
+}
+
+TEST(ScriptFinder, ResolveExactFile) {
+    std::string dir = make_test_scripts_dir();
+    ScriptFinder sf;
+    sf.set_default_dir(dir);
+    // Resolve exact filename in search dir
+    std::string path = sf.resolve("hello.bas");
+    EXPECT_FALSE(path.empty());
+    EXPECT_NE(path.find("hello.bas"), std::string::npos);
+    cleanup_test_dir(dir);
+}
+
+TEST(ScriptFinder, ResolveWithoutExtension) {
+    std::string dir = make_test_scripts_dir();
+    ScriptFinder sf;
+    sf.set_default_dir(dir);
+    // Resolve name without .bas extension
+    std::string path = sf.resolve("hello");
+    EXPECT_FALSE(path.empty());
+    EXPECT_NE(path.find("hello.bas"), std::string::npos);
+    cleanup_test_dir(dir);
+}
+
+TEST(ScriptFinder, ResolveRegexSingleMatch) {
+    std::string dir = make_test_scripts_dir();
+    ScriptFinder sf;
+    sf.set_default_dir(dir);
+    // Regex that matches exactly one file
+    std::string path = sf.resolve("sim_e");
+    EXPECT_FALSE(path.empty());
+    EXPECT_NE(path.find("sim_echo.bas"), std::string::npos);
+    cleanup_test_dir(dir);
+}
+
+TEST(ScriptFinder, ResolveRegexMultipleReturnsEmpty) {
+    std::string dir = make_test_scripts_dir();
+    ScriptFinder sf;
+    sf.set_default_dir(dir);
+    // Regex matching multiple files should return empty (needs interactive picker)
+    std::string path = sf.resolve(".*o.*");  // matches hello.bas, world.bas, sim_echo.bas
+    EXPECT_TRUE(path.empty());
+    cleanup_test_dir(dir);
+}
+
+TEST(ScriptFinder, CliPathHigherPriority) {
+    std::string dir1 = make_test_scripts_dir();
+    // Create second dir with different content
+    char tmpl2[] = "/tmp/sf_test2_XXXXXX";
+    std::string dir2 = mkdtemp(tmpl2);
+    std::ofstream(dir2 + "/hello.bas") << "10 PRINT \"FROM DIR2\"\n";
+
+    ScriptFinder sf;
+    sf.add_search_path(dir2);  // CLI path = highest priority
+    sf.set_default_dir(dir1);  // default = lowest priority
+
+    std::string path = sf.resolve("hello.bas");
+    EXPECT_FALSE(path.empty());
+    // Should find hello.bas from dir2 first
+    EXPECT_EQ(path.substr(0, dir2.size()), dir2);
+
+    remove((dir2 + "/hello.bas").c_str());
+    rmdir(dir2.c_str());
+    cleanup_test_dir(dir1);
+}
+
+TEST(ScriptFinder, EnvPathMiddlePriority) {
+    // Can't easily test env var without setenv, but test search_dirs order
+    ScriptFinder sf;
+    sf.add_search_path("/cli/path");
+    sf.set_default_dir("/default/path");
+    auto dirs = sf.search_dirs();
+    EXPECT_GE(dirs.size(), 2u);
+    EXPECT_EQ(dirs.front(), "/cli/path");
+    EXPECT_EQ(dirs.back(), "/default/path");
+}
+
+TEST(ScriptFinder, ResolveAbsolutePath) {
+    std::string dir = make_test_scripts_dir();
+    ScriptFinder sf;
+    // No search paths configured — resolve by absolute path
+    std::string abs = dir + "/hello.bas";
+    std::string path = sf.resolve(abs);
+    EXPECT_EQ(path, abs);
+    cleanup_test_dir(dir);
 }
 
 // Main — GoogleTest entry point

@@ -65,6 +65,7 @@
 #include <vector>
 
 #include "basic.hpp"
+#include "script_finder.hpp"
 
 // ── ANSI colour helpers ────────────────────────────────────────────────────────
 static bool g_color = true;
@@ -640,6 +641,7 @@ int main(int argc, char** argv) {
     bool        trace      = false;
     bool        open_repl  = false;
     std::string file;
+    ScriptFinder scripts;
     std::vector<VarSpec>      vars;
     std::vector<MapSpec>      maps;
     std::vector<QueueSpec>    queues;
@@ -652,6 +654,8 @@ int main(int argc, char** argv) {
             trace = true;
         } else if (a == "-r" || a == "--repl") {
             open_repl = true;
+        } else if (a == "--bas-path" && i + 1 < argc) {
+            scripts.add_search_path(argv[++i]);
         } else if (a == "--no-color") {
             g_color = false;
         } else if (a == "-h" || a == "--help") {
@@ -691,11 +695,14 @@ int main(int argc, char** argv) {
     signal(SIGINT, on_signal);
 
     if (!file.empty()) {
-        // ── Run mode: load file and execute ───────────────────────────────
+        // ── Run mode: resolve, load file and execute ──────────────────────
+        std::string resolved = scripts.resolve(file);
+        if (resolved.empty()) resolved = file;  // fallback to literal for error msg
+
         Basic b;
         g_interp = &b;
 
-        if (!b.load_file(file)) {
+        if (!b.load_file(resolved)) {
             std::cerr << RED() << "Error: cannot load '" << file << "'"
                       << RESET() << "\n";
             return 1;

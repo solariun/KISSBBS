@@ -25,6 +25,7 @@
 #include "ax25lib.hpp"
 #include "basic.hpp"
 #include "ini.hpp"
+#include "script_finder.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -186,10 +187,11 @@ public:
     // Defaults are populated in the constructor; INI [commands] overrides/adds.
     BBS(const std::string& name, Router& router,
         const std::string& beacon_text, int beacon_interval_s,
-        const std::string& db_path, const IniConfig& cfg)
+        const std::string& db_path, const IniConfig& cfg,
+        const ScriptFinder& script_finder = ScriptFinder())
         : name_(name), beacon_text_(beacon_text), db_path_(db_path),
           router_(router), beacon_interval_s_(beacon_interval_s),
-          next_beacon_(0), running_(false)
+          next_beacon_(0), running_(false), scripts_(script_finder)
     {
         // ── Default built-in commands ──────────────────────────────────────
         commands_["W"]     = "w";       // Unix 'w' — who/uptime
@@ -287,6 +289,7 @@ private:
     int          beacon_interval_s_;
     time_t       next_beacon_;
     bool         running_;
+    ScriptFinder scripts_;
 
     std::map<std::string, std::string>               commands_;   // CMD → .bas | shell cmd
     std::map<std::string, std::unique_ptr<Session>>  sessions_;
@@ -373,7 +376,9 @@ private:
             interp.set_str("arg" + std::to_string(i) + "$", args[i]);
         interp.set_num("argc", (double)args.size());
 
-        if (!interp.load_file(path)) {
+        std::string resolved = scripts_.resolve(path);
+        if (resolved.empty()) resolved = path;
+        if (!interp.load_file(resolved)) {
             ses.println("*** Script not found: " + path);
         } else {
             interp.run();
@@ -788,6 +793,7 @@ int main(int argc, char* argv[]) {
     std::string ini_file;
     std::string ui_dest, ui_text, aprs_text;
     bool one_shot_ui = false, one_shot_aprs = false;
+    ScriptFinder script_finder;
 
     // Pre-scan for BBS-specific long options
     std::vector<char*> remaining;
@@ -800,6 +806,7 @@ int main(int argc, char* argv[]) {
         else if (a == "-u"     && i+1 < argc) beacon_text = argv[++i];
         else if (a == "-B"     && i+1 < argc) beacon_int = std::atoi(argv[++i]);
         else if (a == "-C"     && i+1 < argc) ini_file = argv[++i];
+        else if (a == "--bas-path" && i+1 < argc) script_finder.add_search_path(argv[++i]);
         else remaining.push_back(argv[i]);
     }
 
@@ -864,7 +871,7 @@ int main(int argc, char* argv[]) {
         << " Beacon     : " << (beacon_int>0 ? std::to_string(beacon_int)+"s" : "off") << "\n"
         << "====================================\n";
 
-    BBS bbs(bbs_name, router, beacon_text, beacon_int, db_path, cfg_file);
+    BBS bbs(bbs_name, router, beacon_text, beacon_int, db_path, cfg_file, script_finder);
     g_bbs = &bbs;
     signal(SIGINT, sig_handler); signal(SIGTERM, sig_handler); signal(SIGCHLD, SIG_DFL);
     bbs.run();

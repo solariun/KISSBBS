@@ -74,6 +74,7 @@
 #include "ax25lib.hpp"
 #include "ax25dump.hpp"
 #include "basic.hpp"
+#include "script_finder.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -169,7 +170,8 @@ struct AppCfg {
     int         txdelay  = 400;           // KISS TX delay ms
     Config      ax25;                     // ax25lib Config (mycall, mtu, etc.)
     int         baud     = 9600;
-    std::string script;                   // path to BASIC script (-s); empty = interactive
+    std::string script;                   // BASIC script name/path/pattern (-s); empty = interactive
+    ScriptFinder scripts;                 // script search paths (--bas-path, KISSBBS_BASIC_PATH)
     int         ka_ms    = 60000;         // app-level keep-alive interval ms (0=off)
     bool        debug    = false;         // verbose routing debug output (-D)
 };
@@ -263,11 +265,12 @@ static bool parse_args(int argc, char* argv[], AppCfg& cfg) {
 
     // Long options
     static struct option longopts[] = {
-        {"mtu",     required_argument, nullptr, 1001},
-        {"txdelay", required_argument, nullptr, 1002},
-        {"pid",     required_argument, nullptr, 1003},
-        {"script",  required_argument, nullptr, 's'},
-        {"ka",      required_argument, nullptr, 1004},
+        {"mtu",      required_argument, nullptr, 1001},
+        {"txdelay",  required_argument, nullptr, 1002},
+        {"pid",      required_argument, nullptr, 1003},
+        {"script",   required_argument, nullptr, 's'},
+        {"bas-path", required_argument, nullptr, 1005},
+        {"ka",       required_argument, nullptr, 1004},
         {nullptr, 0, nullptr, 0}
     };
 
@@ -302,6 +305,7 @@ static bool parse_args(int argc, char* argv[], AppCfg& cfg) {
         case 1002: cfg.txdelay    = std::atoi(optarg); break;
         case 1003: cfg.pid        = static_cast<uint8_t>(std::strtoul(optarg, nullptr, 16)); break;
         case 's':  cfg.script     = optarg; break;
+        case 1005: cfg.scripts.add_search_path(optarg); break;
         case 1004: cfg.ka_ms     = std::atoi(optarg) * 1000; break;
         case 'h':  print_usage(argv[0]); return false;
         default:   print_usage(argv[0]); return false;
@@ -629,8 +633,10 @@ static int run_connect(Kiss& kiss, Router& router, const AppCfg& cfg) {
         interp.set_str("LOCAL$",    cfg.ax25.mycall.str());
         interp.set_str("CALLSIGN$", cfg.remote);   // alias expected by BBS scripts
 
-        // ── Load and run ─────────────────────────────────────────────────────
-        if (!interp.load_file(cfg.script)) {
+        // ── Resolve and load script ───────────────────────────────────────────
+        std::string script_path = cfg.scripts.resolve(cfg.script);
+        if (script_path.empty()) script_path = cfg.script;  // fallback to literal
+        if (!interp.load_file(script_path)) {
             std::cerr << "Error: cannot open script: " << cfg.script << "\n";
         } else {
             interp.run();
@@ -750,7 +756,9 @@ static int run_connect(Kiss& kiss, Router& router, const AppCfg& cfg) {
                     interp.set_str("REMOTE$",   cfg.remote);
                     interp.set_str("LOCAL$",    cfg.ax25.mycall.str());
                     interp.set_str("CALLSIGN$", cfg.remote);
-                    if (!interp.load_file(fname)) {
+                    std::string spath = cfg.scripts.resolve(fname);
+                    if (spath.empty()) spath = fname;
+                    if (!interp.load_file(spath)) {
                         std::cout << RED() << "[Error: cannot open: " << fname << "]"
                                   << RESET() << "\n" << std::flush;
                     } else {

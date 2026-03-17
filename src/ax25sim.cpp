@@ -57,6 +57,7 @@
 #include "ax25lib.hpp"
 #include "ax25dump.hpp"
 #include "basic.hpp"
+#include "script_finder.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -67,12 +68,10 @@
 #include <deque>
 #include <iomanip>
 #include <iostream>
-#include <regex>
 #include <sstream>
 #include <string>
 #include <vector>
 
-#include <dirent.h>
 #include <getopt.h>
 #include <signal.h>
 #include <sys/select.h>
@@ -131,7 +130,7 @@ struct Stats {
 // ─────────────────────────────────────────────────────────────────────────────
 struct SimCfg {
     std::string link_path  = "/tmp/kiss_sim";
-    std::string script_dir = ".";
+    ScriptFinder scripts;
     int         txdelay    = 400;
     Config      ax25;
     bool        monitor    = true;
@@ -272,36 +271,7 @@ static void show_status(const SimCfg& cfg, const Connection* conn,
               << "\n\n" << std::flush;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// BASIC script file listing with regex matching
-// ─────────────────────────────────────────────────────────────────────────────
-static std::vector<std::string> find_scripts(const std::string& dir,
-                                              const std::string& pattern) {
-    std::vector<std::string> results;
-    DIR* d = opendir(dir.c_str());
-    if (!d) return results;
-
-    std::regex re;
-    bool use_regex = !pattern.empty();
-    if (use_regex) {
-        try { re = std::regex(pattern, std::regex::icase | std::regex::ECMAScript); }
-        catch (...) { use_regex = false; }
-    }
-
-    struct dirent* entry;
-    while ((entry = readdir(d)) != nullptr) {
-        std::string name(entry->d_name);
-        if (name.size() < 5) continue;
-        std::string ext = name.substr(name.size() - 4);
-        for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        if (ext != ".bas") continue;
-        if (use_regex && !std::regex_search(name, re)) continue;
-        results.push_back(name);
-    }
-    closedir(d);
-    std::sort(results.begin(), results.end());
-    return results;
-}
+// (Script discovery is handled by ScriptFinder in lib/script_finder.hpp)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Run a BASIC script (adapted from ax25tnc.cpp)
@@ -416,64 +386,19 @@ static void run_basic_script(
 static void handle_basic_cmd(const std::string& arg,
                               Connection* conn, int pty_fd,
                               SimCfg& cfg, Router& router, Stats& st) {
-    auto select_and_run = [&](const std::vector<std::string>& scripts) {
-        for (std::size_t i = 0; i < scripts.size(); ++i)
-            std::cout << "  " << GREEN() << "[" << (i + 1) << "]" << RESET()
-                      << " " << scripts[i] << "\n";
-        std::cout << "Select [1-" << scripts.size() << "]: " << std::flush;
-        std::string choice;
-        if (stdin_readline(choice, 30000)) {
-            int n = std::atoi(choice.c_str());
-            if (n >= 1 && n <= static_cast<int>(scripts.size())) {
-                std::string path = cfg.script_dir + "/" + scripts[static_cast<std::size_t>(n - 1)];
-                run_basic_script(path, conn, pty_fd, cfg, router, st);
-            } else {
-                std::cout << YELLOW() << "Invalid selection." << RESET() << "\n" << std::flush;
-            }
-        }
+    auto out_fn = [](const std::string& s) {
+        std::cout << s << "\n" << std::flush;
+    };
+    auto readline_fn = [](const std::string& prompt, int tmo) -> std::string {
+        std::cout << prompt << std::flush;
+        std::string line;
+        stdin_readline(line, tmo);
+        return line;
     };
 
-    // No argument → list all
-    if (arg.empty()) {
-        auto scripts = find_scripts(cfg.script_dir, "");
-        if (scripts.empty()) {
-            std::cout << YELLOW() << "No .bas files found in " << cfg.script_dir
-                      << RESET() << "\n" << std::flush;
-            return;
-        }
-        select_and_run(scripts);
-        return;
-    }
-
-    // Try exact match
-    std::string path = cfg.script_dir + "/" + arg;
-    if (access(path.c_str(), R_OK) == 0) {
+    std::string path = cfg.scripts.resolve_interactive(arg, out_fn, readline_fn);
+    if (!path.empty())
         run_basic_script(path, conn, pty_fd, cfg, router, st);
-        return;
-    }
-
-    // Try with .bas extension
-    if (arg.size() < 4 || arg.substr(arg.size() - 4) != ".bas") {
-        path = cfg.script_dir + "/" + arg + ".bas";
-        if (access(path.c_str(), R_OK) == 0) {
-            run_basic_script(path, conn, pty_fd, cfg, router, st);
-            return;
-        }
-    }
-
-    // Treat as regex pattern
-    auto scripts = find_scripts(cfg.script_dir, arg);
-    if (scripts.empty()) {
-        std::cout << YELLOW() << "No .bas files matching '" << arg << "' in "
-                  << cfg.script_dir << RESET() << "\n" << std::flush;
-        return;
-    }
-    if (scripts.size() == 1) {
-        std::string only = cfg.script_dir + "/" + scripts[0];
-        run_basic_script(only, conn, pty_fd, cfg, router, st);
-        return;
-    }
-    select_and_run(scripts);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -765,9 +690,10 @@ static bool parse_sim_command(
 // ─────────────────────────────────────────────────────────────────────────────
 static bool parse_args(int argc, char* argv[], SimCfg& cfg) {
     static const struct option long_opts[] = {
-        {"mtu",     required_argument, nullptr, 'M'},
-        {"txdelay", required_argument, nullptr, 'T'},
-        {"help",    no_argument,       nullptr, 'h'},
+        {"mtu",      required_argument, nullptr, 'M'},
+        {"txdelay",  required_argument, nullptr, 'T'},
+        {"bas-path", required_argument, nullptr, 'S'},
+        {"help",     no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
 
@@ -776,7 +702,8 @@ static bool parse_args(int argc, char* argv[], SimCfg& cfg) {
         switch (ch) {
         case 'c': cfg.ax25.mycall = Addr::make(optarg); break;
         case 'l': cfg.link_path = optarg; break;
-        case 's': cfg.script_dir = optarg; break;
+        case 's': cfg.scripts.set_default_dir(optarg); break;
+        case 'S': cfg.scripts.add_search_path(optarg); break;
         case 'w': cfg.ax25.window = std::atoi(optarg); break;
         case 't': cfg.ax25.t1_ms = std::atoi(optarg); break;
         case 'k': cfg.ax25.t3_ms = std::atoi(optarg); break;
@@ -796,6 +723,7 @@ static bool parse_args(int argc, char* argv[], SimCfg& cfg) {
                       << "  -c CALL         Callsign (default: N0SIM)\n"
                       << "  -l PATH         PTY symlink path (default: /tmp/kiss_sim)\n"
                       << "  -s DIR          Script directory (default: .)\n"
+                      << "  --bas-path DIR  Extra script search path (repeatable, highest priority)\n"
                       << "  -w N            Window size 1-7 (default: 3)\n"
                       << "  -t MS           T1 retransmit timer ms (default: 3000)\n"
                       << "  -k MS           T3 keep-alive timer ms (default: 60000)\n"
@@ -803,7 +731,9 @@ static bool parse_args(int argc, char* argv[], SimCfg& cfg) {
                       << "  --mtu N         MTU bytes (default: 128)\n"
                       << "  --txdelay N     TX delay ms (default: 400)\n"
                       << "  -p PATH         Digipeater path (comma-separated)\n"
-                      << "  -h              Show this help\n";
+                      << "  -h              Show this help\n\n"
+                      << "Environment:\n"
+                      << "  KISSBBS_BASIC_PATH   Default script search directory\n";
             return false;
         default:
             return false;
@@ -885,7 +815,7 @@ static int run_sim(Kiss& kiss, Router& router, SimCfg& cfg,
     std::cout << BOLD() << "AX.25 TNC Simulator" << RESET() << "\n"
               << "  PTY      : " << pty_path << "\n"
               << "  Callsign : " << cfg.ax25.mycall.str() << "\n"
-              << "  Scripts  : " << cfg.script_dir << "/\n"
+              << "  Scripts  : " << cfg.scripts.search_dirs().front() << "/\n"
               << "Type " << BOLD() << "//h" << RESET() << " for help. Listening for connections.\n\n"
               << std::flush;
     print_prompt(cfg, conn, outgoing, 0);
