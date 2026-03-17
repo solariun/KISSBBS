@@ -6,7 +6,8 @@ A self-contained C++11 library implementing the AX.25 amateur-radio link-layer
 protocol over KISS-mode TNCs.  Includes a full-featured BBS with INI config,
 a QBASIC-style scripting engine (functions, structs, DO/LOOP, SELECT CASE, SQLite · TCP · HTTP),
 a complete TNC terminal client (`ax25tnc`), an offline BASIC debugger (`basic_tool`),
-remote shell access, an interactive KISS terminal, and a 170-test GoogleTest suite.
+a PTY-based TNC simulator (`ax25sim`) for hardware-free testing,
+remote shell access, an interactive KISS terminal, and a comprehensive GoogleTest suite.
 
 ---
 
@@ -24,8 +25,8 @@ brew install googletest sqlite
 sudo apt-get install libgtest-dev libsqlite3-dev libdbus-1-dev libbluetooth-dev pkg-config
 
 # 3. Build everything + run tests
-make          # builds: bbs  ax25kiss  ax25tnc  basic_tool  bt_kiss_bridge
-make test     # runs 170 tests — must all pass
+make          # builds: bbs  ax25kiss  ax25tnc  basic_tool  bt_kiss_bridge  ax25sim
+make test     # runs the GoogleTest suite — all must pass
 ```
 
 ---
@@ -52,9 +53,20 @@ radio station.
 - **`ax25tnc`** — A standalone TNC terminal that can connect to remote stations
   or accept incoming connections, working as a simple peer-to-peer link with
   other HAMs.  Great for testing and casual QSOs.
+- **`ax25sim`** — A PTY-based TNC simulator that creates a virtual serial port
+  at `/tmp/kiss_sim`.  Develop and test BBS scripts, protocol tuning, and
+  connection handling entirely on your workstation — no TNC, no radio, no
+  Bluetooth adapter.  Catch bugs before they hit the air.
+  See [§2 Development Workflow](#2-development-workflow--best-practices) and
+  [§21 ax25sim](#21-ax25sim--ax25-tnc-simulator).
+- **`basic_tool`** — Offline BASIC interpreter and REPL debugger.  Write and
+  test BBS scripts without connecting to anything — line-by-line trace,
+  variable overrides, and interactive inspection.  The fastest way to iterate
+  on script logic.
+  See [§20 basic_tool](#20-basic_tool--offline-basic-interpreter--repl-debugger).
 - **BASIC scripting** — Both `bbs` and `ax25tnc` can run BASIC scripts to
   automate welcome messages, menus, mail handling, and more.
-  See [§14 BASIC Scripting](#14-basic-scripting) for the full language reference.
+  See [§15 BASIC Scripting](#15-basic-scripting) for the full language reference.
 
 ### Running the installer
 
@@ -109,7 +121,7 @@ journalctl -u kissbbs-bbs -f
 > **Tip:** `ax25tnc` is also installed and can be used standalone for direct
 > peer-to-peer connections with other HAMs — no BBS needed.  Both `bbs` and
 > `ax25tnc` support BASIC scripting for automated interactions.
-> See [§14 BASIC Scripting](#14-basic-scripting).
+> See [§15 BASIC Scripting](#15-basic-scripting).
 
 ---
 
@@ -117,28 +129,185 @@ journalctl -u kissbbs-bbs -f
 
 0. [Quick Start](#quick-start)
 1. [Linux BBS Installation](#linux-bbs-installation--one-command-setup)
-2. [Background — AX.25 and KISS](#2-background--ax25-and-kiss)
-3. [Architecture Overview](#3-architecture-overview)
-4. [Object Relationship Diagram](#4-object-relationship-diagram)
-5. [UML Class Diagram](#5-uml-class-diagram)
-6. [AX.25 State Machine](#6-ax25-state-machine)
-7. [Connection Sequence Diagram](#7-connection-sequence-diagram)
-8. [Building](#8-building)
-9. [API Reference](#9-api-reference)
-10. [Usage Examples](#10-usage-examples)
-11. [Running Tests](#11-running-tests)
-12. [BBS Example](#12-bbs-example)
-13. [INI Configuration](#13-ini-configuration)
-14. [BASIC Scripting](#14-basic-scripting)
-15. [APRS Helpers (ax25::aprs)](#15-aprs-helpers-ax25aprs)
-16. [ax25tnc — TNC Terminal Client](#16-ax25tnc--tnc-terminal-client)
-17. [ble_kiss_monitor.py — BLE KISS Scanner & AX.25 Monitor](#17-ble_kiss_monitorpy--ble-kiss-scanner--ax25-monitor)
-18. [bt_kiss_bridge — Bluetooth KISS Bridge (BLE + Classic BT)](#18-bt_kiss_bridge--bluetooth-kiss-bridge-ble--classic-bt)
-19. [basic_tool — Offline BASIC Interpreter / REPL Debugger](#19-basic_tool--offline-basic-interpreter--repl-debugger)
+2. [Development Workflow & Best Practices](#2-development-workflow--best-practices)
+3. [Background — AX.25 and KISS](#3-background--ax25-and-kiss)
+4. [Architecture Overview](#4-architecture-overview)
+5. [Object Relationship Diagram](#5-object-relationship-diagram)
+6. [UML Class Diagram](#6-uml-class-diagram)
+7. [AX.25 State Machine](#7-ax25-state-machine)
+8. [Connection Sequence Diagram](#8-connection-sequence-diagram)
+9. [Building](#9-building)
+10. [API Reference](#10-api-reference)
+11. [Usage Examples](#11-usage-examples)
+12. [Running Tests](#12-running-tests)
+13. [BBS Example](#13-bbs-example)
+14. [INI Configuration](#14-ini-configuration)
+15. [BASIC Scripting](#15-basic-scripting)
+16. [APRS Helpers (ax25::aprs)](#16-aprs-helpers-ax25aprs)
+17. [ax25tnc — TNC Terminal Client](#17-ax25tnc--tnc-terminal-client)
+18. [ble_kiss_monitor.py — BLE KISS Scanner & AX.25 Monitor](#18-ble_kiss_monitorpy--ble-kiss-scanner--ax25-monitor)
+19. [bt_kiss_bridge — Bluetooth KISS Bridge (BLE + Classic BT)](#19-bt_kiss_bridge--bluetooth-kiss-bridge-ble--classic-bt)
+20. [basic_tool — Offline BASIC Interpreter / REPL Debugger](#20-basic_tool--offline-basic-interpreter--repl-debugger)
+21. [ax25sim — AX.25 TNC Simulator](#21-ax25sim--ax25-tnc-simulator)
 
 ---
 
-## 2. Background — AX.25 and KISS
+## 2. Development Workflow & Best Practices
+
+This section describes how to use `ax25sim` and `basic_tool` together for an
+efficient development and testing workflow — no radio hardware required.
+
+### Why use the simulator?
+
+- **No hardware needed** — Test connections, protocol behavior, and scripts
+  without a TNC, radio, or Bluetooth adapter.
+- **Instant feedback** — PTY connections are local; no RF propagation delay,
+  no channel contention, no interference.
+- **Reproducible** — Every test runs in the same conditions.  No weather,
+  QRM, or fading to confuse debugging.
+- **Safe** — No accidental transmissions on air while developing.
+- **Full protocol fidelity** — The simulator uses the same `Kiss`, `Router`,
+  and `Connection` classes as the real tools.  If it works on the simulator,
+  it will work on real hardware.
+
+### Recommended workflow
+
+#### 1. Develop scripts offline with `basic_tool`
+
+Use `basic_tool` to write and debug BASIC scripts before deploying them to the
+BBS or TNC:
+
+```bash
+# Edit your script
+vim my_menu.bas
+
+# Test it standalone (stdin/stdout for I/O)
+basic_tool my_menu.bas
+
+# Debug with line trace
+basic_tool --trace my_menu.bas
+
+# Override variables to simulate different stations
+basic_tool -v callsign\$=W1ABC -v bbs_name\$=TestBBS my_menu.bas
+
+# Drop into REPL after running to inspect state
+basic_tool --repl my_menu.bas
+```
+
+**Advantages of `basic_tool`:**
+- Catches syntax errors and logic bugs before connecting to anything
+- `--trace` shows exactly which lines execute and in what order
+- Variables can be overridden to test edge cases
+- REPL mode lets you inspect and modify state interactively
+- SQLite, HTTP, and socket operations work normally
+
+#### 2. Test with the simulator
+
+Once your script works in `basic_tool`, test it with real AX.25 framing:
+
+```bash
+# Terminal 1: start the simulator
+./ax25sim -c MYBBS -s .
+
+# Terminal 2: connect with ax25tnc
+./ax25tnc -c TESTER -r MYBBS /tmp/kiss_sim
+```
+
+Now you have a full AX.25 connection.  Data flows through KISS framing,
+windowed I-frames, and the connection state machine — exactly as it would
+over the air.
+
+Run scripts in the simulator:
+
+```text
+# In the ax25sim terminal:
+//b my_menu           # regex match — finds my_menu.bas
+//b sim_chat          # start the chat simulation
+//b                   # list all available scripts
+```
+
+#### 3. Test the BBS
+
+Start the full BBS server against the simulator:
+
+```bash
+# Terminal 1: simulator acts as the "radio"
+./ax25sim -c RADIO
+
+# Terminal 2: BBS connects to the simulator's PTY
+./bbs -c MYBBS /tmp/kiss_sim
+
+# Terminal 3: a client connects through the same PTY (or a second simulator)
+./ax25tnc -c VISITOR -r MYBBS /tmp/kiss_sim
+```
+
+#### 4. Tune parameters
+
+Use the simulator to test protocol edge cases:
+
+```bash
+# Start with restrictive parameters
+./ax25sim -c W1SIM -w 1 --mtu 64 -t 1000
+```
+
+```text
+# In the simulator console
+//b sim_stress
+
+# Adjust on the fly
+//win 7
+//mtu 256
+//t1 5000
+//b sim_stress
+```
+
+Compare throughput with different window sizes and MTU values.
+
+#### 5. Monitor and debug
+
+The simulator provides real-time visibility into protocol activity:
+
+```text
+//mon on              # show all frames (on by default)
+//hex on              # show hex dump of frame contents
+//s                   # show connection stats (frames TX/RX, bytes, retries)
+```
+
+Frame monitor shows every SABM, UA, I-frame, RR, and DISC — invaluable for
+debugging connection issues.
+
+### Tips
+
+- **Start simple**: test scripts with `basic_tool` first, then promote to
+  `ax25sim`, then to real hardware.
+- **Use `--trace`**: when a script misbehaves, `basic_tool --trace` shows
+  every line executed.  Pipe stderr to a file for post-mortem analysis.
+- **Override variables**: use `-v` flags in `basic_tool` to simulate different
+  callers, BBS names, or conditions without editing the script.
+- **Watch frame flow**: `//mon on` in `ax25sim` shows the AX.25 handshake
+  (SABM→UA→I-frames→DISC) in real time.
+- **Stress test early**: run `sim_stress.bas` to verify your windowing and
+  flow control before going on-air.
+- **Keep the PTY path consistent**: the default `/tmp/kiss_sim` works for
+  most setups.  If running multiple simulators, use `-l /tmp/kiss_sim2`.
+- **Test both directions**: use `//c <call>` to test outgoing connections and
+  let other tools connect to you for incoming connections.
+- **Automate with shell scripts**: chain `basic_tool` runs in a test script
+  to validate all your `.bas` files in one go:
+  ```bash
+  for f in *.bas; do
+      echo "--- Testing $f ---"
+      basic_tool "$f" < /dev/null || echo "FAILED: $f"
+  done
+  ```
+
+See [§20 basic_tool](#20-basic_tool--offline-basic-interpreter--repl-debugger)
+and [§21 ax25sim](#21-ax25sim--ax25-tnc-simulator) for full reference
+documentation on these tools.
+
+---
+
+## 3. Background — AX.25 and KISS
 
 ### AX.25
 
@@ -216,7 +385,7 @@ ones.
 
 ---
 
-## 3. Architecture Overview
+## 4. Architecture Overview
 
 ```
 Your Application
@@ -245,7 +414,7 @@ different physical layer without touching the rest).
 
 ---
 
-## 4. Object Relationship Diagram
+## 5. Object Relationship Diagram
 
 ```
                               ┌─────────────────────────────────────────┐
@@ -352,7 +521,7 @@ different physical layer without touching the rest).
 
 ---
 
-## 5. UML Class Diagram
+## 6. UML Class Diagram
 
 ```mermaid
 classDiagram
@@ -493,7 +662,7 @@ classDiagram
 
 ---
 
-## 6. AX.25 State Machine
+## 7. AX.25 State Machine
 
 ```mermaid
 stateDiagram-v2
@@ -521,7 +690,7 @@ stateDiagram-v2
 
 ---
 
-## 7. Connection Sequence Diagram
+## 8. Connection Sequence Diagram
 
 ### Successful connect + data exchange + disconnect
 
@@ -570,7 +739,7 @@ sequenceDiagram
 
 ---
 
-## 8. Building
+## 9. Building
 
 ### Prerequisites
 
@@ -610,7 +779,7 @@ CXX=clang++ make
 
 ---
 
-## 9. API Reference
+## 10. API Reference
 
 ### `ax25::Addr`
 
@@ -749,7 +918,7 @@ conn->tick(ax25::now_ms());
 
 ---
 
-## 10. Usage Examples
+## 11. Usage Examples
 
 ### Minimal receiver — print every received frame
 
@@ -861,7 +1030,7 @@ safely, and all 43 tests.
 
 ---
 
-## 11. Running Tests
+## 12. Running Tests
 
 ```bash
 make test
@@ -896,7 +1065,7 @@ Expected output:
 
 ---
 
-## 12. BBS Example
+## 13. BBS Example
 
 `bbs.cpp` is a full-featured BBS that demonstrates the library in production use.
 Configuration can be supplied via command-line flags **or** a `bbs.ini` file.
@@ -1054,7 +1223,7 @@ assert(sessions.empty());
 
 ---
 
-## 13. INI Configuration
+## 14. INI Configuration
 
 `bbs.ini` is an optional configuration file that sets all BBS parameters.
 Command-line flags always take precedence over file values.
@@ -1124,7 +1293,7 @@ for (auto& kv : cfg.section("ax25")) {
 
 ---
 
-## 14. BASIC Scripting
+## 15. BASIC Scripting
 
 The BBS ships a **QBASIC-style interpreter** (`basic.hpp` / `basic.cpp`) that lets
 you write BBS welcome screens, menus, and automated services without recompiling.
@@ -1145,7 +1314,7 @@ bbs.ini → welcome_script = welcome.bas
           interp.run();
 ```
 
-> **Offline testing:** Use [`basic_tool`](#19-basic_tool--offline-basic-interpreter--repl-debugger)
+> **Offline testing:** Use [`basic_tool`](#20-basic_tool--offline-basic-interpreter--repl-debugger)
 > to run and debug `.bas` scripts from the command line without a TNC or BLE connection.
 > ```bash
 > basic_tool --trace -v callsign\$=W1ABC -v bbs_name\$=MyBBS welcome.bas
@@ -2205,7 +2374,7 @@ interp.run();
 
 ---
 
-## 15. APRS Helpers (`ax25::aprs`)
+## 16. APRS Helpers (`ax25::aprs`)
 
 All APRS formatting utilities live in the `ax25::aprs` sub-namespace, making
 them available to any code that includes `ax25lib.hpp` — not just the BBS.
@@ -2268,7 +2437,7 @@ Full table: [APRS Symbol Reference](http://www.aprs.org/symbols.html)
 
 ---
 
-## 16. ax25tnc — TNC Terminal Client
+## 17. ax25tnc — TNC Terminal Client
 
 `ax25tnc` is an interactive TNC terminal that provides a modern command-line
 interface to AX.25 packet radio.  By default it starts in **TNC mode** — an
@@ -2592,7 +2761,7 @@ END
 
 ---
 
-## 17. ble_kiss_monitor.py — BLE KISS Scanner & AX.25 Monitor
+## 18. ble_kiss_monitor.py — BLE KISS Scanner & AX.25 Monitor
 
 `ble_kiss_monitor.py` is a pure-Python companion tool for debugging and
 monitoring AX.25/KISS traffic through Bluetooth Low Energy TNCs (Mobilinkd,
@@ -2703,7 +2872,7 @@ Use `--inspect` to confirm UUIDs for your specific device.
 
 ---
 
-## 18. bt_kiss_bridge — Bluetooth KISS Bridge (BLE + Classic BT)
+## 19. bt_kiss_bridge — Bluetooth KISS Bridge (BLE + Classic BT)
 
 `bt_kiss_bridge` is a native C++17 Bluetooth KISS bridge supporting both
 **BLE** (GATT) and **Classic Bluetooth** (RFCOMM/SPP).  It replaces
@@ -3040,7 +3209,7 @@ the bridge automatically attempts to reconnect:
 
 ---
 
-## 19. basic_tool — Offline BASIC Interpreter / REPL Debugger
+## 20. basic_tool — Offline BASIC Interpreter / REPL Debugger
 
 `basic_tool` is a standalone CLI that runs and debugs `.bas` BBS scripts offline —
 no TNC, no BLE, no radio link required.  It wraps the same `Basic` engine used
@@ -3278,3 +3447,132 @@ interp.run();
 - `SEND_APRS` and `SEND_UI` do nothing by default (callbacks are not set);
   assign `on_send_aprs` / `on_send_ui` if you need them.
 - Ctrl-C calls `interrupt()` on the running interpreter for a clean stop.
+
+---
+
+## 21. ax25sim — AX.25 TNC Simulator
+
+`ax25sim` creates a **PTY-based virtual serial port** that emulates a KISS TNC,
+allowing you to test all KISSBBS tools (`bbs`, `ax25tnc`, `basic_tool`) without
+any radio hardware.  It provides an interactive terminal with colorful prompts,
+frame monitoring, hex dump display, full parameter tuning, and BASIC script
+execution.
+
+### How it works
+
+```
+User (stdin/stdout)  ←→  ax25sim  ←→  [Kiss + Router]  ←→  PTY master
+                                                               ↕
+                                                          PTY slave (/tmp/kiss_sim)
+                                                               ↕
+                                                       bbs / ax25tnc / etc.
+```
+
+1. `ax25sim` creates a PTY pair via `openpty()` and symlinks the slave end to
+   `/tmp/kiss_sim` (configurable with `-l`).
+2. A `Kiss` instance runs on the PTY master; a `Router` on top handles
+   connections, UI frames, and APRS.
+3. Other KISSBBS tools open `/tmp/kiss_sim` as if it were a real serial device.
+4. You interact via stdin with `//`-prefixed commands.
+
+### Build
+
+```bash
+make ax25sim        # or just: make  (included in the default all target)
+```
+
+### Usage
+
+```bash
+ax25sim [OPTIONS]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-c CALL` | `N0SIM` | Simulator callsign |
+| `-l PATH` | `/tmp/kiss_sim` | PTY symlink path |
+| `-s DIR` | `.` | Script directory for `.bas` files |
+| `-w N` | `3` | Window size (1–7) |
+| `-t MS` | `3000` | T1 retransmit timer (ms) |
+| `-k MS` | `60000` | T3 keep-alive timer (ms) |
+| `-n N` | `10` | Max retry count (N2) |
+| `--mtu N` | `128` | I-frame MTU (bytes) |
+| `--txdelay N` | `400` | KISS TX delay (ms) |
+| `-p PATH` | *(none)* | Digipeater path, comma-separated |
+| `-h` | | Show help |
+
+### Example — start the simulator
+
+```bash
+# Terminal 1: start the simulator
+./ax25sim -c W1SIM
+
+# Terminal 2: connect with ax25tnc
+./ax25tnc -c N0CALL -r W1SIM /tmp/kiss_sim
+```
+
+The simulator prompt changes to show connection state:
+
+```
+[W1SIM]>                     # disconnected (white)
+[W1SIM→N0CALL]>             # connected outgoing (green)
+[N0CALL→W1SIM]>             # connected incoming (cyan)
+[W1SIM→N0CALL +2]>          # multiple connections (count shown)
+```
+
+### Commands
+
+All commands are prefixed with `//`.  Bare text (no prefix) is sent as an
+I-frame if a connection is active.
+
+| Command | Short | Description |
+|---------|-------|-------------|
+| `//help` | `//h` `//?` | Show command help |
+| `//quit` | `//q` | Exit simulator |
+| `//connect <call>` | `//c` | Initiate connection to remote callsign |
+| `//disconnect` | `//d` | Disconnect current session |
+| `//ui <dest> <text>` | | Send UI frame |
+| `//aprs <info>` | | Send APRS beacon |
+| `//mycall <call>` | `//myc` | Set or show callsign |
+| `//monitor [on\|off]` | `//mon` | Toggle frame monitor |
+| `//hex [on\|off]` | | Toggle hex dump display |
+| `//status` | `//s` | Show status, PTY path, and stats |
+| `//txdelay <ms>` | | Set KISS TX delay |
+| `//mtu <bytes>` | | Set I-frame MTU |
+| `//window <n>` | `//win` | Set window size (1–7) |
+| `//t1 <ms>` | | Set T1 retransmit timer |
+| `//t3 <ms>` | | Set T3 keep-alive timer |
+| `//n2 <n>` | | Set max retries |
+| `//persist <val>` | | Set KISS persistence (0–255) |
+| `//path <d1,d2>` | | Set digipeater path |
+| `//basic [file\|pattern]` | `//b` | Run BASIC script or list/select |
+
+### `//basic` / `//b` — script execution
+
+The `//basic` command provides flexible script loading:
+
+1. **`//b`** — Lists all `.bas` files in the script directory with numbered
+   selection.
+2. **`//b script.bas`** — Runs the file directly if it exists.
+3. **`//b foo`** — Tries `foo.bas`; if not found, uses `foo` as a regex pattern
+   (case-insensitive) to match available scripts.
+4. **Regex match** — Shows a numbered list of matches for the user to pick.
+5. **Single match** — Runs immediately.
+
+Scripts have access to the same callbacks as `ax25tnc`:
+
+| Callback | Purpose |
+|----------|---------|
+| `on_send` | Send I-frame data (or print to stdout if no connection) |
+| `on_recv` | Receive I-frame data (or read stdin if no connection) |
+| `on_send_aprs` | Send APRS beacon |
+| `on_send_ui` | Send UI frame |
+
+### Included scripts
+
+| Script | Description |
+|--------|-------------|
+| `sim_echo.bas` | Echo server — returns received text with `ECHO>` prefix. Send `BYE` to quit. |
+| `sim_chat.bas` | Simulated QSO partner — responds to amateur radio keywords (NAME, QTH, FREQ, RIG, WX, RST, BAND, ANT, PWR, INFO). |
+| `sim_stress.bas` | Sends 100 numbered padded messages for flow control and windowing testing. |
+
