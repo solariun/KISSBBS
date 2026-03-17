@@ -51,7 +51,7 @@ jobs:
 
       # ── Build core (no BLE) ────────────────────────────────────────────────
       - name: Build core apps
-        run: make bbs ax25kiss ax25tnc
+        run: make bbs ax25kiss ax25tnc ax25sim
 
       # ── Test suite ─────────────────────────────────────────────────────────
       - name: Run tests

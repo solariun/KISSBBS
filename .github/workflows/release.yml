@@ -46,7 +46,7 @@ jobs:
           sudo find build -name 'libgtest*.a' -exec cp {} /usr/lib/ \;
 
       - name: Build core apps
-        run: make bbs ax25kiss ax25tnc basic_tool
+        run: make bbs ax25kiss ax25tnc ax25sim basic_tool
 
       - name: Build bt_kiss_bridge
         continue-on-error: true
@@ -60,9 +60,9 @@ jobs:
           REF="${{ github.ref_name || inputs.version }}"
           PKG="ax25-${REF}-linux-x86_64"
           mkdir -p "$PKG"
-          cp bbs ax25kiss ax25tnc basic_tool "$PKG"/
-          [ -f bt_kiss_bridge ] && cp bt_kiss_bridge "$PKG"/ || true
-          [ -f bt_kiss_bridge ] && ln -sf bt_kiss_bridge "$PKG"/ble_kiss_bridge || true
+          cp bin/bbs bin/ax25kiss bin/ax25tnc bin/ax25sim bin/basic_tool "$PKG"/
+          [ -f bin/bt_kiss_bridge ] && cp bin/bt_kiss_bridge "$PKG"/ || true
+          [ -f bin/bt_kiss_bridge ] && ln -sf bt_kiss_bridge "$PKG"/ble_kiss_bridge || true
           cp README.md LICENSE "$PKG"/ 2>/dev/null || true
           tar czf "${PKG}.tar.gz" "$PKG"
 
@@ -94,7 +94,7 @@ jobs:
           sudo find build -name 'libgtest*.a' -exec cp {} /usr/lib/ \;
 
       - name: Build core apps
-        run: make bbs ax25kiss ax25tnc basic_tool
+        run: make bbs ax25kiss ax25tnc ax25sim basic_tool
 
       - name: Build bt_kiss_bridge
         continue-on-error: true
@@ -108,9 +108,9 @@ jobs:
           REF="${{ github.ref_name || inputs.version }}"
           PKG="ax25-${REF}-linux-arm64"
           mkdir -p "$PKG"
-          cp bbs ax25kiss ax25tnc basic_tool "$PKG"/
-          [ -f bt_kiss_bridge ] && cp bt_kiss_bridge "$PKG"/ || true
-          [ -f bt_kiss_bridge ] && ln -sf bt_kiss_bridge "$PKG"/ble_kiss_bridge || true
+          cp bin/bbs bin/ax25kiss bin/ax25tnc bin/ax25sim bin/basic_tool "$PKG"/
+          [ -f bin/bt_kiss_bridge ] && cp bin/bt_kiss_bridge "$PKG"/ || true
+          [ -f bin/bt_kiss_bridge ] && ln -sf bt_kiss_bridge "$PKG"/ble_kiss_bridge || true
           cp README.md LICENSE "$PKG"/ 2>/dev/null || true
           tar czf "${PKG}.tar.gz" "$PKG"
 
@@ -166,7 +166,7 @@ jobs:
 
       - name: Build core apps (cross)
         run: |
-          make bbs ax25kiss ax25tnc basic_tool \
+          make bbs ax25kiss ax25tnc ax25sim basic_tool \
             CXX=arm-linux-gnueabihf-g++ \
             PKG_CONFIG_PATH=/usr/lib/arm-linux-gnueabihf/pkgconfig
 
@@ -184,9 +184,9 @@ jobs:
           REF="${{ github.ref_name || inputs.version }}"
           PKG="ax25-${REF}-linux-armhf"
           mkdir -p "$PKG"
-          cp bbs ax25kiss ax25tnc basic_tool "$PKG"/
-          [ -f bt_kiss_bridge ] && cp bt_kiss_bridge "$PKG"/ || true
-          [ -f bt_kiss_bridge ] && ln -sf bt_kiss_bridge "$PKG"/ble_kiss_bridge || true
+          cp bin/bbs bin/ax25kiss bin/ax25tnc bin/ax25sim bin/basic_tool "$PKG"/
+          [ -f bin/bt_kiss_bridge ] && cp bin/bt_kiss_bridge "$PKG"/ || true
+          [ -f bin/bt_kiss_bridge ] && ln -sf bt_kiss_bridge "$PKG"/ble_kiss_bridge || true
           cp README.md LICENSE "$PKG"/ 2>/dev/null || true
           tar czf "${PKG}.tar.gz" "$PKG"
 
@@ -210,7 +210,7 @@ jobs:
         run: brew install googletest sqlite
 
       - name: Build core apps
-        run: make bbs ax25kiss ax25tnc basic_tool
+        run: make bbs ax25kiss ax25tnc ax25sim basic_tool
 
       - name: Build bt_kiss_bridge
         run: make bt_kiss_bridge
@@ -223,7 +223,7 @@ jobs:
           REF="${{ github.ref_name || inputs.version }}"
           PKG="ax25-${REF}-macos-arm64"
           mkdir -p "$PKG"
-          cp bbs ax25kiss ax25tnc basic_tool bt_kiss_bridge "$PKG"/
+          cp bin/bbs bin/ax25kiss bin/ax25tnc bin/ax25sim bin/basic_tool bin/bt_kiss_bridge "$PKG"/
           ln -sf bt_kiss_bridge "$PKG"/ble_kiss_bridge
           cp README.md LICENSE "$PKG"/ 2>/dev/null || true
           tar czf "${PKG}.tar.gz" "$PKG"
@@ -233,11 +233,12 @@ jobs:
         with:
           name: macos-arm64-bins
           path: |
-            bbs
-            ax25kiss
-            ax25tnc
-            basic_tool
-            bt_kiss_bridge
+            bin/bbs
+            bin/ax25kiss
+            bin/ax25tnc
+            bin/ax25sim
+            bin/basic_tool
+            bin/bt_kiss_bridge
           retention-days: 7
 
       - uses: actions/upload-artifact@v4
@@ -279,28 +280,33 @@ jobs:
           # Use the macOS system libsqlite3 (universal dylib) instead of the
           # brew arm64-only build so the cross-compile link succeeds.
           make clean
-          make bbs ax25kiss ax25tnc basic_tool \
-            CXXFLAGS="-std=c++11 -O2 -Wall -Wextra -Wpedantic -arch x86_64" \
+          make bbs ax25kiss ax25tnc ax25sim basic_tool \
+            CXXFLAGS="-std=c++11 -O2 -Wall -Wextra -Wpedantic -Ilib -arch x86_64" \
             SQLITE_FLAGS="-DHAVE_SQLITE3" \
             SQLITE_LIBS="-lsqlite3"
           mkdir -p bins/x86_64
-          cp bbs ax25kiss ax25tnc basic_tool bins/x86_64/
+          cp bin/bbs bin/ax25kiss bin/ax25tnc bin/ax25sim bin/basic_tool bins/x86_64/
 
       - name: Build bt_kiss_bridge x86_64 (best-effort)
         continue-on-error: true
         run: |
           make bt_kiss_bridge \
             CXX="clang++ -arch x86_64"
-          cp bt_kiss_bridge bins/x86_64/
+          cp bin/bt_kiss_bridge bins/x86_64/
 
       - name: Create universal binaries with lipo
         run: |
           REF="${{ github.ref_name || inputs.version }}"
           PKG="ax25-${REF}-macos-universal"
           mkdir -p "$PKG"
-          chmod +x bins/arm64/* bins/x86_64/* 2>/dev/null || true
-          for BIN in bbs ax25kiss ax25tnc basic_tool bt_kiss_bridge; do
-            ARM="bins/arm64/$BIN"
+          # The download-artifact flattens bin/ prefix, so binaries land directly in bins/arm64/
+          # Handle both cases: with and without bin/ subdirectory
+          for dir in bins/arm64 bins/arm64/bin; do
+            [ -d "$dir" ] && ARM_DIR="$dir"
+          done
+          chmod +x "$ARM_DIR"/* bins/x86_64/* 2>/dev/null || true
+          for BIN in bbs ax25kiss ax25tnc ax25sim basic_tool bt_kiss_bridge; do
+            ARM="$ARM_DIR/$BIN"
             X86="bins/x86_64/$BIN"
             if [ -f "$ARM" ] && [ -f "$X86" ]; then
               lipo -create -output "$PKG/$BIN" "$ARM" "$X86"

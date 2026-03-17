@@ -1,26 +1,19 @@
-# Build artefacts
-ax25lib.o
-bbs
-ax25kiss
-test_ax25lib
-ax25Client
+# Build output
+bin/
+build/
 
 # macOS metadata
 .DS_Store
+
+# Editor / IDE
 *.swp
 *.swo
-
-# Editor
 .vscode/
 .idea/
 *.orig
-bin/
-lib/
-**/*venv*
 
-# Dependency files
-*.d
-*.o
+# Python
+**/*venv*
 
 # Vendor build output
 vendor/
