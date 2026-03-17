@@ -219,7 +219,7 @@ over the air.
 
 Run scripts in the simulator:
 
-```bash
+```text
 # In the ax25sim terminal:
 //b my_menu           # regex match — finds my_menu.bas
 //b sim_chat          # start the chat simulation
