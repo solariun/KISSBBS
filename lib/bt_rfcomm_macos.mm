@@ -37,6 +37,54 @@ static NSString* normalize_address(const char* addr) {
     return s;
 }
 
+// Returns true if string looks like a MAC address (XX:XX:XX:XX:XX:XX or XX-XX...)
+static bool looks_like_mac(const char* s) {
+    // 17 chars, hex digits separated by : or -
+    int len = (int)strlen(s);
+    if (len != 17) return false;
+    for (int i = 0; i < 17; i++) {
+        if (i % 3 == 2) { if (s[i] != ':' && s[i] != '-') return false; }
+        else             { if (!isxdigit((unsigned char)s[i])) return false; }
+    }
+    return true;
+}
+
+// Resolve a name or MAC to an IOBluetoothDevice.
+// If address looks like a MAC, use deviceWithAddressString.
+// Otherwise search paired/known devices by name (case-insensitive substring).
+static IOBluetoothDevice* resolve_device(const char* address) {
+    if (looks_like_mac(address)) {
+        return [IOBluetoothDevice deviceWithAddressString:normalize_address(address)];
+    }
+    // Name-based lookup: search paired devices
+    NSString* target = [NSString stringWithUTF8String:address];
+    NSArray<IOBluetoothDevice*>* paired = [IOBluetoothDevice pairedDevices];
+    for (IOBluetoothDevice* dev in paired) {
+        NSString* name = [dev name];
+        if (!name) continue;
+        if ([name localizedCaseInsensitiveContainsString:target] ||
+            [name isEqualToString:target]) {
+            std::cout << "  Resolved \"" << address << "\" → "
+                      << [[dev addressString] UTF8String]
+                      << " (" << [name UTF8String] << ")\n";
+            return dev;
+        }
+    }
+    // Also check recently-found devices
+    NSArray<IOBluetoothDevice*>* recent = [IOBluetoothDevice recentDevices:20];
+    for (IOBluetoothDevice* dev in recent) {
+        NSString* name = [dev name];
+        if (!name) continue;
+        if ([name localizedCaseInsensitiveContainsString:target]) {
+            std::cout << "  Resolved \"" << address << "\" → "
+                      << [[dev addressString] UTF8String]
+                      << " (" << [name UTF8String] << ")  [recent]\n";
+            return dev;
+        }
+    }
+    return nil;
+}
+
 static std::string hr(char ch = '-') {
     return std::string(60, ch);
 }
@@ -234,10 +282,10 @@ static int sdp_find_spp_channel(IOBluetoothDevice* device,
 
 extern "C" bt_macos_handle_t bt_macos_connect(const char* address, int channel) {
     @autoreleasepool {
-        NSString* addr = normalize_address(address);
-        IOBluetoothDevice* device = [IOBluetoothDevice deviceWithAddressString:addr];
+        IOBluetoothDevice* device = resolve_device(address);
         if (!device) {
-            std::cerr << "  Cannot create IOBluetoothDevice for " << address << "\n";
+            std::cerr << "  Cannot find Bluetooth device \"" << address << "\".\n"
+                      << "  Make sure it is paired or pass the MAC address directly.\n";
             return nullptr;
         }
 
@@ -458,14 +506,17 @@ extern "C" void bt_macos_scan(double timeout_s) {
 
 extern "C" void bt_macos_inspect(const char* address) {
     @autoreleasepool {
-        NSString* addr = normalize_address(address);
-        IOBluetoothDevice* device = [IOBluetoothDevice deviceWithAddressString:addr];
+        IOBluetoothDevice* device = resolve_device(address);
         if (!device) {
-            std::cerr << "Cannot create device for " << address << "\n";
+            std::cerr << "Cannot find Bluetooth device \"" << address << "\".\n"
+                      << "  Make sure it is paired or pass the MAC address directly.\n";
             return;
         }
 
-        std::cout << "Querying SDP on " << address << "...\n";
+        std::string resolved = device.addressString
+                               ? std::string([device.addressString UTF8String])
+                               : std::string(address);
+        std::cout << "Querying SDP on " << resolved << "...\n";
         if (!perform_sdp_query(device)) {
             return;
         }

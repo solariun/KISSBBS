@@ -725,12 +725,20 @@ ble_handle_t ble_connect(const char* address,
         h->use_response = write_with_response ? true : (!h->can_wwr && can_wr);
 
         // MTU
+        // maximumWriteValueLengthForType already returns the usable payload size
+        // (CoreBluetooth subtracts the 3-byte ATT header internally).
+        // mtu_val is stored as ATT MTU (payload + 3) for display only.
+        // chunk_sz is the actual per-write payload cap:
+        //   - auto: BLE-reported payload (maxWrite)
+        //   - --mtu N: user specifies payload directly, capped to BLE max
         NSUInteger maxWrite = [target maximumWriteValueLengthForType:
             CBCharacteristicWriteWithoutResponse];
-        h->mtu_val = (int)(maxWrite + 3);
+        h->mtu_val  = (int)(maxWrite + 3);      // ATT MTU (display)
         if (h->mtu_val < 23) h->mtu_val = 23;
-        h->chunk_sz = std::max(1, std::min(mtu_cap > 0 ? mtu_cap : 517,
-                                           h->mtu_val) - 3);
+        int auto_chunk = (int)maxWrite;          // BLE-allowed payload
+        h->chunk_sz = mtu_cap > 0
+            ? std::max(1, std::min(mtu_cap, auto_chunk))   // user cap, never exceed BLE
+            : auto_chunk;
 
         std::cout << "  Connected.  MTU=" << h->mtu_val
                   << "  chunk=" << h->chunk_sz << "b"

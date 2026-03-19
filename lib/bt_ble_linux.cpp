@@ -1502,8 +1502,12 @@ ble_handle_t ble_connect(const char* address,
     }
     if (mtu_val == 0) mtu_val = 23; // fallback
     h->mtu_val = mtu_val;
-    h->chunk_sz = std::max(1, std::min(mtu_cap > 0 ? mtu_cap : 517,
-                                       (int)mtu_val) - 3);
+    // BlueZ reports ATT MTU; usable payload = mtu_val - 3.
+    // --mtu N means "payload cap = N", not ATT MTU, so don't subtract 3 from it.
+    int auto_chunk = std::max(1, (int)mtu_val - 3);
+    h->chunk_sz = mtu_cap > 0
+        ? std::max(1, std::min(mtu_cap, auto_chunk))  // user cap, never exceed BLE
+        : auto_chunk;
 
     std::cout << "  Connected.  MTU=" << mtu_val
               << "  chunk=" << h->chunk_sz << "b"
