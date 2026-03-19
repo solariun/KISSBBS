@@ -10,6 +10,8 @@
 // -- Modes ---------------------------------------------------------------
 //   --scan                       Scan for nearby devices
 //   --inspect <ADDR>             List services (GATT for BLE, SDP for BT)
+//   --test    <ADDR>             Send periodic KISS UI test frames, show RX
+//                  --call <CALLSIGN>            Source callsign (default: NOC4LL)
 //   --device  <ADDR>             Bridge mode (PTY or TCP)
 //                  --ble                        Force BLE transport
 //                  --bt                         Force Classic BT transport
@@ -1047,6 +1049,314 @@ static void do_inspect(const std::string& address, BridgeConfig::Transport trans
 }
 
 // =========================================================================
+// TEST mode -- connect to BLE/BT device and send periodic UI test frames
+// =========================================================================
+
+// Build a minimal AX.25 UI frame wrapped in KISS (FEND port 0 FEND)
+// Callsigns are 6 chars padded with spaces, shifted left 1 bit.
+static std::vector<uint8_t> build_kiss_ui(const std::string& src_call,
+                                           const std::string& dst_call,
+                                           const std::string& info)
+{
+    auto encode_call = [](std::string c, bool last) -> std::vector<uint8_t> {
+        c.resize(6, ' ');
+        std::vector<uint8_t> out;
+        for (char ch : c) out.push_back((uint8_t)((uint8_t)toupper(ch) << 1));
+        uint8_t ssid = last ? 0x61 : 0xE0;  // last=src, not-last=dst
+        out.push_back(ssid);
+        return out;
+    };
+
+    auto dst = encode_call(dst_call, false);
+    auto src = encode_call(src_call, true);
+
+    std::vector<uint8_t> frame;
+    frame.push_back(0xC0);  // FEND
+    frame.push_back(0x00);  // KISS: port 0, data
+    for (auto b : dst) frame.push_back(b);
+    for (auto b : src) frame.push_back(b);
+    frame.push_back(0x03);  // UI control
+    frame.push_back(0xF0);  // PID: no layer 3
+    for (char c : info) frame.push_back((uint8_t)c);
+    frame.push_back(0xC0);  // FEND
+    return frame;
+}
+
+static void test_hex_dump(const uint8_t* data, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        std::printf(" %02x", data[i]);
+        if ((i + 1) % 24 == 0 && i + 1 < len) std::printf("\n              ");
+    }
+    std::printf("\n");
+}
+
+static void do_test(const BridgeConfig& cfg, const std::string& call, double interval_s) {
+    std::cout << hr('=') << "\n"
+              << "  BLE KISS Test Mode\n"
+              << hr('=') << "\n"
+              << "  Device : " << cfg.address << "\n"
+              << hr() << "\n"
+              << "  Connecting...\n";
+    std::cout.flush();
+
+    BleTransport transport(cfg);
+    if (!transport.connect()) {
+        std::cerr << "[TEST] Connection failed.\n";
+        return;
+    }
+
+    if (cfg.ble_ka_ms > 0)
+        std::cout << "  BLE keep-alive: " << cfg.ble_ka_ms / 1000 << "s  (KISS null writes)\n";
+    std::cout << hr() << "\n"
+              << "  Sending UI test frames every " << (int)interval_s << "s.  Ctrl-C to stop.\n"
+              << "  RX data shown as hex dump.\n"
+              << hr() << "\n\n";
+    std::cout.flush();
+
+    signal(SIGINT,  sigint_handler);
+    signal(SIGTERM, sigint_handler);
+
+    int tx_count = 0, rx_count = 0;
+    auto next_tx = std::chrono::steady_clock::now();
+    auto next_ka = std::chrono::steady_clock::now()
+                 + std::chrono::milliseconds(cfg.ble_ka_ms > 0 ? cfg.ble_ka_ms : 5000);
+
+    uint8_t rx_buf[512];
+    int rx_fd = transport.read_fd();
+
+    while (g_running && transport.is_connected()) {
+        auto now = std::chrono::steady_clock::now();
+
+        // Send test frame
+        if (now >= next_tx) {
+            ++tx_count;
+            char info[32];
+            std::snprintf(info, sizeof(info), "Test %03d", tx_count);
+            auto frame = build_kiss_ui(call, "CQ", info);
+
+            std::printf("[%s]  TX >> #%d  %s>CQ [UI] \"%s\"  (%zuB)\n",
+                        ts().c_str(), tx_count, call.c_str(), info, frame.size());
+            std::printf("              ");
+            test_hex_dump(frame.data(), frame.size());
+            std::fflush(stdout);
+
+            transport.write(frame.data(), frame.size());
+            next_tx = now + std::chrono::milliseconds((long long)(interval_s * 1000));
+        }
+
+        // Keep-alive
+        if (cfg.ble_ka_ms > 0 && now >= next_ka) {
+            static const uint8_t ka[] = {0xC0, 0xC0};
+            transport.write(ka, 2);
+            next_ka = now + std::chrono::milliseconds(cfg.ble_ka_ms);
+        }
+
+        // Check for RX data
+        if (rx_fd >= 0) {
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(rx_fd, &rfds);
+            struct timeval tv{0, 50000};  // 50ms
+            int r = ::select(rx_fd + 1, &rfds, nullptr, nullptr, &tv);
+            if (r > 0 && FD_ISSET(rx_fd, &rfds)) {
+                ssize_t n = ::read(rx_fd, rx_buf, sizeof(rx_buf));
+                if (n > 0) {
+                    ++rx_count;
+                    std::printf("[%s]  RX << (%zdB):", ts().c_str(), n);
+                    test_hex_dump(rx_buf, (size_t)n);
+                    std::fflush(stdout);
+                }
+            }
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+
+    transport.disconnect();
+
+    std::cout << hr() << "\n"
+              << "  Test ended.  TX: " << tx_count << "  RX: " << rx_count << "\n"
+              << hr() << "\n";
+}
+
+// =========================================================================
+// SNIFF mode -- connect and show raw BLE/BT traffic with KISS/AX.25 decode
+// =========================================================================
+
+// Parse a hex string (spaces/colons optional) into bytes: "c0 00 82" or "c00082"
+static std::vector<uint8_t> parse_hex_bytes(const std::string& s) {
+    std::vector<uint8_t> out;
+    std::string clean;
+    for (char c : s) if (c != ' ' && c != ':' && c != '-') clean += c;
+    for (size_t i = 0; i + 1 < clean.size(); i += 2) {
+        try { out.push_back((uint8_t)std::stoul(clean.substr(i, 2), nullptr, 16)); }
+        catch (...) {}
+    }
+    return out;
+}
+
+// Print a hex line like:  "  00 c0 82 a4 64 98 9a 62  ..."  (16 per row)
+static void sniff_hex_block(const uint8_t* data, size_t len, const char* indent = "    ") {
+    for (size_t i = 0; i < len; ) {
+        std::printf("%s", indent);
+        size_t row = std::min(len - i, (size_t)16);
+        for (size_t j = 0; j < row; j++)
+            std::printf("%02x ", data[i + j]);
+        // pad short row
+        for (size_t j = row; j < 16; j++) std::printf("   ");
+        std::printf(" |");
+        for (size_t j = 0; j < row; j++) {
+            char c = (char)data[i + j];
+            std::printf("%c", (c >= 0x20 && c < 0x7F) ? c : '.');
+        }
+        std::printf("|\n");
+        i += row;
+    }
+}
+
+static void do_sniff(const BridgeConfig& cfg,
+                     const std::vector<uint8_t>& tx_once,  // send once on connect (may be empty)
+                     const std::vector<uint8_t>& tx_periodic, // repeat at interval (may be empty)
+                     double tx_interval_s)
+{
+    std::cout << hr('=') << "\n"
+              << "  BLE/BT Sniffer\n"
+              << hr('=') << "\n"
+              << "  Device  : " << cfg.address << "\n";
+    if (!cfg.service_uuid.empty()) std::cout << "  Service : " << cfg.service_uuid << "\n";
+    if (!cfg.write_uuid.empty())   std::cout << "  Write   : " << cfg.write_uuid << "\n";
+    if (!cfg.read_uuid.empty())    std::cout << "  Read    : " << cfg.read_uuid << "\n";
+    std::cout << hr() << "\n  Connecting...\n";
+    std::cout.flush();
+
+    // Pick transport
+    std::unique_ptr<RadioTransport> transport;
+    if (cfg.transport == BridgeConfig::BT) {
+#ifdef __linux__
+        transport = std::make_unique<BtTransport>(cfg.address, cfg.bt_channel);
+#else
+        std::cerr << "[SNIFF] Classic BT not supported on this platform.\n";
+        return;
+#endif
+    } else {
+        transport = std::make_unique<BleTransport>(cfg);
+    }
+
+    if (!transport->connect()) {
+        std::cerr << "[SNIFF] Connection failed.\n";
+        return;
+    }
+
+    std::cout << hr() << "\n"
+              << "  Connected.  All traffic shown below.  Ctrl-C to stop.\n";
+    if (!tx_once.empty()) {
+        std::cout << "  TX-once : " << tx_once.size() << " bytes after connect.\n";
+    }
+    if (!tx_periodic.empty()) {
+        std::cout << "  TX-loop : " << tx_periodic.size() << " bytes every "
+                  << tx_interval_s << "s.\n";
+    }
+    std::cout << hr() << "\n\n";
+    std::cout.flush();
+
+    signal(SIGINT,  sigint_handler);
+    signal(SIGTERM, sigint_handler);
+
+    KissDecoder decoder;
+    int rx_fd      = transport->read_fd();
+    int rx_frames  = 0, tx_frames = 0;
+    size_t rx_bytes = 0, tx_bytes = 0;
+
+    // Send once-on-connect payload
+    if (!tx_once.empty()) {
+        std::printf("[%s]  TX  %zu bytes (user tx-once)\n", ts().c_str(), tx_once.size());
+        sniff_hex_block(tx_once.data(), tx_once.size());
+        transport->write(tx_once.data(), tx_once.size());
+        ++tx_frames; tx_bytes += tx_once.size();
+    }
+
+    auto next_ka  = std::chrono::steady_clock::now()
+                  + std::chrono::milliseconds(cfg.ble_ka_ms > 0 ? cfg.ble_ka_ms : 5000);
+    auto next_tx  = std::chrono::steady_clock::now()
+                  + std::chrono::milliseconds((long long)(tx_interval_s * 1000));
+
+    uint8_t buf[1024];
+
+    while (g_running && transport->is_connected()) {
+        auto now = std::chrono::steady_clock::now();
+
+        // Periodic user TX
+        if (!tx_periodic.empty() && now >= next_tx) {
+            std::printf("[%s]  TX  %zu bytes (periodic)\n", ts().c_str(), tx_periodic.size());
+            sniff_hex_block(tx_periodic.data(), tx_periodic.size());
+            std::fflush(stdout);
+            transport->write(tx_periodic.data(), tx_periodic.size());
+            ++tx_frames; tx_bytes += tx_periodic.size();
+            next_tx = now + std::chrono::milliseconds((long long)(tx_interval_s * 1000));
+        }
+
+        // BLE keep-alive
+        if (cfg.ble_ka_ms > 0 && now >= next_ka) {
+            static const uint8_t ka[] = {0xC0, 0xC0};
+            transport->write(ka, 2);
+            next_ka = now + std::chrono::milliseconds(cfg.ble_ka_ms);
+        }
+
+        // Check for RX data
+        if (rx_fd < 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(rx_fd, &rfds);
+        struct timeval tv{0, 50000};
+        int sel = ::select(rx_fd + 1, &rfds, nullptr, nullptr, &tv);
+        if (sel <= 0 || !FD_ISSET(rx_fd, &rfds)) continue;
+
+        ssize_t n = ::read(rx_fd, buf, sizeof(buf));
+        if (n <= 0) break;
+
+        rx_bytes += (size_t)n;
+        std::printf("[%s]  RX  %zd bytes\n", ts().c_str(), n);
+        sniff_hex_block(buf, (size_t)n);
+        std::fflush(stdout);
+
+        // Decode KISS frames from this chunk
+        auto frames = decoder.feed(buf, (size_t)n);
+        for (auto& kf : frames) {
+            ++rx_frames;
+            if (kf.type == 0) {  // KISS data frame → AX.25
+                auto ax = decode_ax25(kf.payload.data(), kf.payload.size());
+                std::printf("  └─ KISS frame #%d  port=%d  AX.25 %s\n",
+                            rx_frames, kf.port, ax.summary.c_str());
+                print_frame_detail(ax, kf.payload.data(), kf.payload.size());
+            } else {
+                // KISS control (TXDELAY=1, P=2, SLOTTIME=3, etc.)
+                static constexpr std::pair<int,const char*> knames[] = {
+                    {1,"TXDELAY"},{2,"PERSIST"},{3,"SLOTTIME"},
+                    {4,"TXTAIL"},{5,"FULLDUPLEX"},{6,"SETHW"},{255,"RETURN"}};
+                const char* kname = "CMD?";
+                for (auto& [v,nm] : knames) if (kf.type == v) { kname = nm; break; }
+                uint8_t val = kf.payload.empty() ? 0 : kf.payload[0];
+                std::printf("  └─ KISS ctrl  port=%d  %s  val=%u (0x%02x)\n",
+                            kf.port, kname, val, val);
+            }
+            std::printf("\n");
+            std::fflush(stdout);
+        }
+    }
+
+    transport->disconnect();
+
+    std::printf("\n%s\n", hr().c_str());
+    std::printf("  Sniffer ended.  RX: %zu bytes / %d frames   TX: %zu bytes / %d frames\n",
+                rx_bytes, rx_frames, tx_bytes, tx_frames);
+    std::printf("%s\n", hr().c_str());
+}
+
+// =========================================================================
 // BRIDGE (device) mode -- transport-agnostic
 // =========================================================================
 static void do_bridge(const BridgeConfig& cfg, RadioTransport& transport) {
@@ -1484,6 +1794,8 @@ static void usage(const char* prog) {
         "Usage:\n"
         "  " << prog << " --scan [--timeout <s>] [--ble|--bt]\n"
         "  " << prog << " --inspect <ADDRESS> [--ble|--bt]\n"
+        "  " << prog << " --sniff <ADDRESS> [--ble|--bt] [--service U] [--write U] [--read U]\n"
+        "             [--tx <hexbytes>] [--tx-interval <secs>]\n"
         "  " << prog << " --ble --device <ADDRESS>\n"
         "             --service <UUID> --write <UUID> --read <UUID>\n"
         "             [--mtu <bytes>] [--write-with-response] [--monitor]\n"
@@ -1525,6 +1837,11 @@ static void usage(const char* prog) {
         "                         Same format as ax25kiss/ax25tnc (dim detail lines)\n"
         "  --show-keepalive       Show BLE keep-alive messages in monitor output\n"
         "                         (hidden by default to reduce noise)\n\n"
+        "Sniff mode options:\n"
+        "  --sniff <ADDRESS>      Connect and show all raw RX bytes + KISS/AX.25 decode\n"
+        "  --tx <hexbytes>        Send these bytes once after connect (e.g. \"c0 c0\")\n"
+        "  --tx-interval <secs>   Repeat --tx payload every N seconds (default: no repeat)\n"
+        "                         Use --service/--write/--read to narrow to specific UUIDs\n\n"
         "Examples:\n"
         "  # Scan for all Bluetooth devices\n"
         "  " << prog << " --scan --timeout 15\n"
@@ -1550,6 +1867,10 @@ static void usage(const char* prog) {
 
 int main(int argc, char* argv[]) {
     std::string mode;
+    std::string test_call    = "NOC4LL";
+    double test_interval     = 2.0;
+    std::string sniff_tx_hex;        // --tx hex string for sniff mode
+    double sniff_tx_interval = 0.0;  // --tx-interval (0 = no repeat)
     BridgeConfig cfg;
     double timeout = 10.0;
     bool link_explicit = false;   // true only when --link is explicitly passed
@@ -1558,7 +1879,12 @@ int main(int argc, char* argv[]) {
         std::string a = argv[i];
         if      (a == "--scan")    { mode = "scan"; }
         else if (a == "--inspect"           && i+1 < argc) { mode = "inspect"; cfg.address      = argv[++i]; }
+        else if (a == "--test"              && i+1 < argc) { mode = "test";    cfg.address      = argv[++i]; }
+        else if (a == "--sniff"             && i+1 < argc) { mode = "sniff";   cfg.address      = argv[++i]; }
+        else if (a == "--tx"                && i+1 < argc) { sniff_tx_hex     = argv[++i]; }
+        else if (a == "--tx-interval"       && i+1 < argc) { sniff_tx_interval= std::stod(argv[++i]); }
         else if (a == "--device"            && i+1 < argc) { mode = "device";  cfg.address      = argv[++i]; }
+        else if (a == "--call"              && i+1 < argc) { test_call        = argv[++i]; }
         else if (a == "--service"           && i+1 < argc) { cfg.service_uuid = argv[++i]; }
         else if (a == "--write"             && i+1 < argc) { cfg.write_uuid   = argv[++i]; }
         else if (a == "--read"              && i+1 < argc) { cfg.read_uuid    = argv[++i]; }
@@ -1592,13 +1918,31 @@ int main(int argc, char* argv[]) {
 
     if (mode.empty()) { usage(argv[0]); return 1; }
 
-    // -- Scan / Inspect modes --
+    // -- Scan / Inspect / Test modes --
     if (mode == "scan") {
         do_scan(timeout, cfg.transport);
         return 0;
     }
     if (mode == "inspect") {
         do_inspect(cfg.address, cfg.transport);
+        return 0;
+    }
+    if (mode == "test") {
+        cfg.timeout = timeout;
+        // Auto BLE for test mode (BLE preferred)
+        if (cfg.transport == BridgeConfig::AUTO)
+            cfg.transport = BridgeConfig::BLE;
+        do_test(cfg, test_call, test_interval);
+        return 0;
+    }
+    if (mode == "sniff") {
+        cfg.timeout = timeout;
+        if (cfg.transport == BridgeConfig::AUTO)
+            cfg.transport = BridgeConfig::BLE;
+        auto tx_once     = parse_hex_bytes(sniff_tx_hex);
+        auto tx_periodic = (sniff_tx_interval > 0) ? tx_once : std::vector<uint8_t>{};
+        if (sniff_tx_interval > 0) tx_once.clear();  // periodic only — don't also send once
+        do_sniff(cfg, tx_once, tx_periodic, sniff_tx_interval > 0 ? sniff_tx_interval : 2.0);
         return 0;
     }
 

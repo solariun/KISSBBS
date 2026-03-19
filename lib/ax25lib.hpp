@@ -200,9 +200,14 @@ std::vector<uint8_t> encode(const std::vector<uint8_t>& payload,
 class Decoder {
 public:
     std::vector<Frame> feed(const uint8_t* buf, std::size_t len);
+
+    // Called for bytes that arrive outside KISS frame boundaries (e.g. TNC command text)
+    void set_on_raw(std::function<void(uint8_t)> cb) { on_raw_ = std::move(cb); }
+
 private:
     bool in_frame_ = false, escaped_ = false;
     std::vector<uint8_t> buf_;
+    std::function<void(uint8_t)> on_raw_;
 };
 } // namespace kiss
 
@@ -299,6 +304,11 @@ public:
     // Register callback (called from poll() for each received AX.25 payload)
     void set_on_frame(std::function<void(std::vector<uint8_t>)> cb) {
         on_frame_ = std::move(cb);
+    }
+
+    // Called for each byte received outside KISS frame boundaries (e.g. TNC command text)
+    void set_on_raw(std::function<void(uint8_t)> cb) {
+        decoder_.set_on_raw(std::move(cb));
     }
 
     // Send raw AX.25 bytes as a KISS data frame (TNC adds flags + FCS)
@@ -489,11 +499,20 @@ private:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// TNC KISS initialization
+// Sends "KISS ON / RESTART / INTERFACE KISS / RESET" to a traditional TNC
+// in command mode, waits 2 s, then drains any response bytes.
+// Call with kiss.fd() right after opening the port, before set_txdelay().
+// ─────────────────────────────────────────────────────────────────────────────
+void tnc_kiss_init(int fd);
+
+// ─────────────────────────────────────────────────────────────────────────────
 // CLI parameter helper
 // ─────────────────────────────────────────────────────────────────────────────
 struct CLIParams {
     std::string device;
-    int         baud = 9600;
+    int         baud     = 9600;
+    bool        tnc_init = false;   // --tnc: send KISS ON / RESTART / INTERFACE KISS / RESET
     Config      cfg;
 
     // Parses standard AX.25 flags from argv.

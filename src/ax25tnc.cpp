@@ -145,7 +145,7 @@ struct Stats {
 // ─────────────────────────────────────────────────────────────────────────────
 // Operating modes
 // ─────────────────────────────────────────────────────────────────────────────
-enum class Mode { Tnc, Connect, Monitor, Unproto };
+enum class Mode { Tnc, Connect, Monitor, Unproto, Test };
 
 static Mode parse_mode(const char* s) {
     std::string m(s);
@@ -165,6 +165,7 @@ struct AppCfg {
     std::string dest     = "CQ";          // unproto destination
     Mode        mode     = Mode::Tnc;
     bool        tnc_mode = true;          // true when -m was NOT explicitly given
+    bool        kiss_tnc = false;         // --tnc: send KISS ON/RESTART/INTERFACE KISS/RESET
     bool        monitor  = false;         // extra monitor in connect/unproto
     uint8_t     pid      = 0xF0;          // UI frame PID
     int         txdelay  = 400;           // KISS TX delay ms
@@ -236,6 +237,7 @@ static void print_usage(const char* prog) {
         << "  -n N2        Max retry count (default: 10)\n"
         << "  --mtu N      I-frame MTU bytes (default: 128)\n"
         << "  --txdelay N  KISS TX delay ms (default: 400)\n"
+        << "  --tnc        Send KISS ON/RESTART/INTERFACE KISS/RESET before KISS (for legacy TNCs)\n"
         << "  --pid HEX    PID for UI frames (default: F0)\n"
         << "  -s FILE      BASIC script to run after connect (connect mode only)\n"
         << "  --ka SECS    App-level keep-alive: send CR every N seconds when idle (default: 60, 0=off)\n"
@@ -271,6 +273,8 @@ static bool parse_args(int argc, char* argv[], AppCfg& cfg) {
         {"script",   required_argument, nullptr, 's'},
         {"bas-path", required_argument, nullptr, 1005},
         {"ka",       required_argument, nullptr, 1004},
+        {"test",     no_argument,       nullptr, 1006},
+        {"tnc",      no_argument,       nullptr, 1007},
         {nullptr, 0, nullptr, 0}
     };
 
@@ -307,6 +311,8 @@ static bool parse_args(int argc, char* argv[], AppCfg& cfg) {
         case 's':  cfg.script     = optarg; break;
         case 1005: cfg.scripts.add_search_path(optarg); break;
         case 1004: cfg.ka_ms     = std::atoi(optarg) * 1000; break;
+        case 1006: cfg.mode = Mode::Test; mode_explicit = true; cfg.tnc_mode = false; break;
+        case 1007: cfg.kiss_tnc = true; break;
         case 'h':  print_usage(argv[0]); return false;
         default:   print_usage(argv[0]); return false;
         }
@@ -1539,6 +1545,50 @@ static int run_tnc(Kiss& kiss, Router& router, AppCfg& cfg) {
 }
 
 // =============================================================================
+// TEST MODE -- send periodic UI test frames, show RX
+// =============================================================================
+static int run_test(Kiss& kiss, Router& router, const AppCfg& cfg) {
+    int ser_fd = kiss.fd();
+    Addr src  = cfg.ax25.mycall;
+    Addr dest = Addr::make(cfg.dest.empty() ? "CQ" : cfg.dest);
+
+    // Override with NOC4LL if callsign is the default N0CALL
+    if (src.str() == "N0CALL") src = Addr::make("NOC4LL");
+
+    router.on_monitor = [](const Frame& f) { print_frame(f, "RX"); };
+
+    std::cout << GREEN() << "Test mode." << RESET()
+              << "  Sending " << src.str() << ">CQ every 2s.  Ctrl-C to exit.\n\n"
+              << std::flush;
+
+    int tx_count = 0, rx_count = 0;
+    using Clock = std::chrono::steady_clock;
+    auto next_tx = Clock::now();
+
+    while (!g_quit) {
+        auto now = Clock::now();
+        if (now >= next_tx) {
+            ++tx_count;
+            char info[32];
+            std::snprintf(info, sizeof(info), "Test %03d", tx_count);
+            router.send_ui(dest, cfg.pid, std::string(info), cfg.ax25.digis);
+            std::cout << "[" << timestamp() << "]  TX >> " << src.str() << ">CQ [UI] \""
+                      << info << "\"\n" << std::flush;
+            ++tx_count; --tx_count;  // suppress unused warn
+            next_tx = now + std::chrono::seconds(2);
+        }
+
+        struct timeval tv{ 0, 20000 };
+        fd_set fds; FD_ZERO(&fds); FD_SET(ser_fd, &fds);
+        select(ser_fd + 1, &fds, nullptr, nullptr, &tv);
+        router.poll();
+    }
+
+    std::cout << "\nTest ended.  TX: " << tx_count << "  RX: " << rx_count << "\n";
+    return 0;
+}
+
+// =============================================================================
 // main
 // =============================================================================
 int main(int argc, char* argv[]) {
@@ -1577,6 +1627,7 @@ int main(int argc, char* argv[]) {
                           << strerror(errno) << "\n";
                 return 1;
             }
+            if (cfg.kiss_tnc) tnc_kiss_init(kiss.fd());
         }
     }
     kiss.set_txdelay(cfg.txdelay);
@@ -1600,6 +1651,7 @@ int main(int argc, char* argv[]) {
     case Mode::Monitor: return run_monitor(kiss, router);
     case Mode::Unproto: return run_unproto(kiss, router, cfg);
     case Mode::Connect: return run_connect(kiss, router, cfg);
+    case Mode::Test:    return run_test(kiss, router, cfg);
     case Mode::Tnc:     return run_tnc(kiss, router, cfg);
     }
     return 0;

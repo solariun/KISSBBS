@@ -90,6 +90,7 @@ static std::string uuid_short_name(const std::string& uuid) {
 @property (nonatomic, assign) BOOL servicesResolved;
 @property (nonatomic, assign) BOOL didConnect;
 @property (nonatomic, assign) BOOL didFail;
+@property (nonatomic, assign) BOOL notifyDone;   // set by didUpdateNotificationState
 @property (nonatomic, strong) NSMutableArray<CBPeripheral*>* found;
 @property (nonatomic, strong) CBPeripheral* target;
 @property (nonatomic, assign) int discoveredServices;
@@ -208,7 +209,11 @@ didUpdateNotificationStateForCharacteristic:(CBCharacteristic*)characteristic
              error:(NSError*)error
 {
     (void)peripheral; (void)characteristic; (void)error;
-    // Notification subscription confirmed
+    // Notify subscription confirmed — signal waiter in ble_connect
+    if (!_notifyDone) {
+        _notifyDone = YES;
+        if (_semaphore) dispatch_semaphore_signal(_semaphore);
+    }
 }
 
 @end
@@ -452,9 +457,12 @@ void ble_inspect(const char* address, double timeout_s) {
         }
 
         std::string dev_name = target.name ? to_std(target.name) : address;
+        std::string dev_uuid = to_std([target.identifier UUIDString]);
         NSUInteger mtu = [target maximumWriteValueLengthForType:
                           CBCharacteristicWriteWithoutResponse] + 3;
-        std::cout << "Connected: " << dev_name << "  MTU=" << mtu << "\n\n";
+        std::cout << "Device : " << dev_name << "\n";
+        std::cout << "ID     : " << dev_uuid << "\n";
+        std::cout << "MTU    : " << mtu << "\n\n";
 
         std::string best_svc, best_write, best_read;
 
@@ -531,7 +539,7 @@ void ble_inspect(const char* address, double timeout_s) {
         std::cout << std::string(68, '=') << "\n";
         std::cout << "\nSuggested bridge command:\n";
         std::cout << "  bt_kiss_bridge --ble \\\n"
-                  << "      --device   " << address << " \\\n"
+                  << "      --device   " << dev_uuid << " \\\n"
                   << "      --service  "
                   << (best_svc.empty() ? "<SERVICE-UUID>" : best_svc) << " \\\n"
                   << "      --write    "
@@ -615,8 +623,9 @@ ble_handle_t ble_connect(const char* address,
         CBCentralManager* mgr = create_manager(del, q, 5.0);
         if (!mgr) return nullptr;
 
-        // Scan for target
-        [mgr scanForPeripheralsWithServices:nil options:nil];
+        // Scan for target (AllowDuplicates so recently-seen devices re-announce)
+        [mgr scanForPeripheralsWithServices:nil
+             options:@{CBCentralManagerScanOptionAllowDuplicatesKey: @YES}];
 
         CBPeripheral* target = nil;
         auto deadline = std::chrono::steady_clock::now()
@@ -635,7 +644,7 @@ ble_handle_t ble_connect(const char* address,
 
         // Preventive disconnect — clear any stale connection (ignore errors)
         [mgr cancelPeripheralConnection:target];
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
         // Connect
         del.servicesResolved = NO;
@@ -644,7 +653,7 @@ ble_handle_t ble_connect(const char* address,
         [mgr connectPeripheral:target options:nil];
 
         dispatch_semaphore_wait(sem,
-            dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC));
+            dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC));
 
         if (!del.didConnect || del.didFail) {
             std::cerr << "[BLE] Connect failed.\n";
@@ -654,7 +663,7 @@ ble_handle_t ble_connect(const char* address,
         // Wait for service discovery
         if (!del.servicesResolved) {
             dispatch_semaphore_wait(sem,
-                dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
+                dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC));
         }
 
         if (!del.servicesResolved) {
@@ -751,8 +760,22 @@ ble_handle_t ble_connect(const char* address,
         del.connectedFlag = &h->connected;
         h->connected = true;
 
-        // Subscribe to notifications
-        [target setNotifyValue:YES forCharacteristic:readChr];
+        // Subscribe to notifications and WAIT for confirmation (like SimpleBLE)
+        del.notifyDone = NO;
+        [target setNotifyValue:YES forCharacteristic:h->readChr];
+        // Poll up to 5s for didUpdateNotificationStateForCharacteristic
+        {
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!del.notifyDone &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            if (!del.notifyDone) {
+                std::cerr << "  [BLE] Warning: notify subscription timeout (proceeding anyway).\n";
+            }
+        }
+        // Settle: let radio transition into KISS data mode
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
         return static_cast<ble_handle_t>(h);
     }
@@ -811,9 +834,13 @@ void ble_write(ble_handle_t handle, const uint8_t* data, size_t len) {
     for (size_t off = 0; off < len; off += (size_t)cs) {
         size_t clen = std::min((size_t)cs, len - off);
         NSData* chunk = [NSData dataWithBytes:(data + off) length:clen];
-        [h->peripheral writeValue:chunk
-               forCharacteristic:h->writeChr
-                            type:wtype];
+        // Dispatch on CB queue — required by CoreBluetooth (same as SimpleBLE)
+        dispatch_async(h->queue, ^{
+            if (h->peripheral && h->writeChr)
+                [h->peripheral writeValue:chunk
+                       forCharacteristic:h->writeChr
+                                    type:wtype];
+        });
     }
 }
 

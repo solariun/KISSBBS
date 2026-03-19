@@ -849,6 +849,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "Cannot open serial: " << p.device << " -- " << strerror(errno) << "\n";
         return 1;
     }
+    if (p.tnc_init) tnc_kiss_init(kiss.fd());
     kiss.set_txdelay(p.cfg.txdelay * 10);
     kiss.set_persistence(p.cfg.persist);
     Router router(kiss, p.cfg);

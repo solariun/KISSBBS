@@ -1125,13 +1125,18 @@ void ble_inspect(const char* address, double timeout_s) {
     std::string dev_name = dbus_get_string_prop(conn, dev_path.c_str(),
                                                  "org.bluez.Device1", "Name");
     if (dev_name.empty()) dev_name = address;
+    std::string dev_mac = dbus_get_string_prop(conn, dev_path.c_str(),
+                                                "org.bluez.Device1", "Address");
+    if (dev_mac.empty()) dev_mac = address;
 
     uint16_t mtu = dbus_get_uint16_prop(conn, dev_path.c_str(),
                                          "org.bluez.Device1", "MTU", 23);
     // MTU might be on the characteristic instead (BlueZ >= 5.62)
     // We'll check per-char below
 
-    std::cout << "Connected: " << dev_name << "  MTU=" << mtu << "\n\n";
+    std::cout << "Device : " << dev_name << "\n";
+    std::cout << "ID     : " << dev_mac << "\n";
+    std::cout << "MTU    : " << mtu << "\n\n";
 
     auto services = enumerate_gatt(conn, dev_path);
 
@@ -1202,7 +1207,7 @@ void ble_inspect(const char* address, double timeout_s) {
     std::cout << std::string(68, '=') << "\n";
     std::cout << "\nSuggested bridge command:\n";
     std::cout << "  bt_kiss_bridge --ble \\\n"
-              << "      --device   " << address << " \\\n"
+              << "      --device   " << dev_mac << " \\\n"
               << "      --service  " << (best_svc.empty()   ? "<SERVICE-UUID>"   : best_svc) << " \\\n"
               << "      --write    " << (best_write.empty() ? "<WRITE-CHAR-UUID>": best_write) << " \\\n"
               << "      --read     " << (best_read.empty()  ? "<NOTIFY-CHAR-UUID>": best_read) << "\n";
@@ -1540,10 +1545,12 @@ ble_handle_t ble_connect(const char* address,
     dbus_connection_add_filter(conn, notify_filter, h, nullptr);
     dbus_connection_add_filter(conn, disconnect_filter, h, nullptr);
 
-    // Start notify on read characteristic
+    // Start notify on read characteristic (synchronous — BlueZ blocks until CCCD acknowledged)
     if (!gatt_start_notify(conn, r_path)) {
         std::cerr << "  Warning: StartNotify failed.\n";
     }
+    // Settle: let radio transition into KISS data mode after CCCD write
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
     h->connected = true;
 
@@ -1553,11 +1560,6 @@ ble_handle_t ble_connect(const char* address,
             dbus_connection_read_write_dispatch(h->conn_dispatch, 20);
         }
     });
-
-    // Wake-up: read first readable characteristic to poke the GATT server
-    if (!h->readable_char_paths.empty()) {
-        gatt_read_value(conn_write, h->readable_char_paths.front());
-    }
 
     return static_cast<ble_handle_t>(h);
 }

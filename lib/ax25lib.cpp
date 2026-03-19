@@ -11,6 +11,7 @@
 #include <iostream>
 #include <sstream>
 
+#include <sys/ioctl.h>
 #include <sys/select.h>
 
 // ─── getopt ──────────────────────────────────────────────────────────────────
@@ -97,7 +98,10 @@ std::vector<Frame> Decoder::feed(const uint8_t* buf, std::size_t len) {
                 frames.push_back(std::move(f));
                 in_frame_ = false; buf_.clear(); escaped_ = false;
             }
-        } else if (in_frame_) {
+        } else if (!in_frame_) {
+            // Byte outside a KISS frame — raw/text data (e.g. TNC command mode)
+            if (on_raw_) on_raw_(b);
+        } else {
             if (escaped_) {
                 if      (b == TFEND) buf_.push_back(FEND);
                 else if (b == TFESC) buf_.push_back(FESC);
@@ -845,13 +849,41 @@ void Router::route(std::vector<uint8_t> raw, Millis now) {
 }
 
 // =============================================================================
+// =============================================================================
+// tnc_kiss_init
+// =============================================================================
+void tnc_kiss_init(int fd) {
+    std::cerr << "[TNC] Sending KISS initialization commands...\n";
+    const char* cmds[] = { "KISS ON\r\n", "RESTART\r\n", "INTERFACE KISS\r\n", "RESET\r\n" };
+    for (const char* c : cmds) {
+        ::write(fd, c, ::strlen(c));
+        ::usleep(100000); // 100 ms between commands
+    }
+    std::cerr << "[TNC] Waiting 2s for TNC to enter KISS mode...\n";
+    ::usleep(2000000); // 2 s
+    // Drain any response bytes from the TNC (non-blocking check via FIONREAD)
+    char buf[256];
+    int  avail = 0;
+    while (::ioctl(fd, FIONREAD, &avail) == 0 && avail > 0) {
+        int r = (int)::read(fd, buf, std::min(avail, (int)sizeof(buf)));
+        if (r <= 0) break;
+        avail -= r;
+    }
+    std::cerr << "[TNC] Ready.\n";
+}
+
 // CLIParams
 // =============================================================================
 bool CLIParams::parse(int argc, char* argv[], const char* extra_usage) {
     optind = 1;
-    int opt;
-    while ((opt = getopt(argc, argv, "c:b:p:m:w:t:k:T:s:h")) != -1) {
+    static struct option longopts[] = {
+        {"tnc", no_argument, nullptr, 1},
+        {nullptr, 0, nullptr, 0}
+    };
+    int opt, idx = 0;
+    while ((opt = getopt_long(argc, argv, "c:b:p:m:w:t:k:T:s:h", longopts, &idx)) != -1) {
         switch (opt) {
+        case 1:   tnc_init  = true;            break;
         case 'c': cfg.mycall = Addr::make(optarg); break;
         case 'b': baud       = std::atoi(optarg);  break;
         case 'p': {
@@ -901,6 +933,7 @@ void CLIParams::print_help(const char* prog, const char* extra) {
         << "  -k <ms>         T3 keep-alive timer ms (default: 60000)\n"
         << "  -T <units>      KISS TX delay ×10 ms (default: 40)\n"
         << "  -s <0-255>      KISS persistence (default: 63)\n";
+    std::cerr << "  --tnc       Send KISS ON/RESTART/INTERFACE KISS/RESET to TNC before KISS\n";
     if (extra && *extra) std::cerr << extra;
 }
 

@@ -755,6 +755,41 @@ static int run_sim(Kiss& kiss, Router& router, SimCfg& cfg,
     std::string recv_buf;
     std::vector<Connection*> dead_conns;
 
+    // ── TNC command-mode handler ───────────────────────────────────────────────
+    // When a client sends --tnc init ("KISS ON\r\n" etc.) those bytes arrive
+    // outside KISS frame boundaries. We detect them, log them, and respond.
+    {
+        std::string tnc_line_buf;
+        kiss.set_on_raw([&pty_fd, &tnc_line_buf](uint8_t b) {
+            if (b == '\r') return;   // skip CR
+            if (b == '\n') {
+                // Process completed line
+                // Trim trailing spaces
+                while (!tnc_line_buf.empty() && tnc_line_buf.back() == ' ')
+                    tnc_line_buf.pop_back();
+                if (tnc_line_buf.empty()) return;
+
+                // Upper-case for comparison
+                std::string up = tnc_line_buf;
+                for (auto& c : up) c = static_cast<char>(std::toupper(
+                    static_cast<unsigned char>(c)));
+
+                std::cerr << DIM() << "[SIM] TNC cmd: " << tnc_line_buf << RESET() << "\n"
+                          << std::flush;
+
+                // Respond like a real TNC (last command in sequence is RESET)
+                if (up == "RESET" || up == "INTERFACE KISS") {
+                    const char* ack = "KISS mode active\r\n";
+                    ::write(pty_fd, ack, ::strlen(ack));
+                }
+
+                tnc_line_buf.clear();
+            } else {
+                tnc_line_buf += static_cast<char>(b);
+            }
+        });
+    }
+
     // ── Monitor hook (on by default) ──────────────────────────────────────────
     if (mon_on)
         router.on_monitor = [&](const Frame& f){ print_frame(f, ">>", cfg.hex_on); };
