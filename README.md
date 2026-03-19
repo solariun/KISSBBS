@@ -3265,28 +3265,34 @@ sending to the radio.
    (search "Additional Tools for Xcode", match your Xcode version).
 2. Mount the `.dmg` and copy `Hardware/PacketLogger.app` to `/Applications`.
 
-**Enable HCI logging:**
+**Capture (macOS Ventura / Sonoma and later — no extra setup needed):**
+
+1. Open **PacketLogger.app**
+2. Click **Start** (red record button) — capture begins immediately
+3. **Then** run `bt_kiss_bridge` in another terminal
+4. ATT packets appear in real-time
+
+> Starting PacketLogger **after** the connection is already established will
+> miss the initial handshake (CCCD write / notify subscription).  Always
+> start PacketLogger first.
+
+**Capture (macOS Monterey and earlier):**
 
 ```bash
 sudo defaults write /Library/Preferences/com.apple.Bluetooth \
     PacketLoggerLevel -int 4
-
-# Restart Bluetooth daemon to activate:
-sudo pkill bluetoothd
+# Toggle Bluetooth off/on in System Preferences to apply (safer than pkill).
 ```
 
-Open PacketLogger, then connect your radio via `bt_kiss_bridge`.  You will
-see `ATT Write Command` packets (GATT write-without-response) carrying your
-KISS frames, and `Handle Value Notification` packets for incoming data.
-This is the best way to verify that the CCCD subscription (notify enable)
-is being acknowledged by the peripheral before writes begin.
-
-To disable logging when done:
+Open PacketLogger, connect the radio, then remove the setting when done:
 
 ```bash
 sudo defaults delete /Library/Preferences/com.apple.Bluetooth PacketLoggerLevel
-sudo pkill bluetoothd
+# Toggle Bluetooth off/on again to restore defaults.
 ```
+
+> **Avoid `sudo pkill bluetoothd`** — it can leave the daemon in a bad state.
+> Use the Bluetooth toggle in System Settings / System Preferences instead.
 
 **Useful PacketLogger filters:**
 
