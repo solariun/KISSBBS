@@ -2,6 +2,29 @@
 bin/
 build/
 
+# Temporary / scratch directory
+tmp/
+
+# Stale root-level build artefacts (pre build/ era)
+*.o
+ax25client
+ble-serial
+bt_kiss_bridge
+test_ax25lib
+
+# Third-party / vendor trees (checked out locally, not tracked)
+simpleble/
+KISSet/
+
+# Python runtimes / virtual envs
+lib/python*/
+**/*venv*
+__pycache__/
+*.pyc
+
+# Resource scratch files
+resources/bt.txt
+
 # macOS metadata
 .DS_Store
 
@@ -11,9 +34,6 @@ build/
 .vscode/
 .idea/
 *.orig
-
-# Python
-**/*venv*
 
 # Vendor build output
 vendor/
