@@ -113,9 +113,108 @@ the same BLE UART service UUIDs as the VR-N76/VR-N7600.
 ./bt_kiss_bridge --ble --device "GA-5WB" --monitor
 ```
 
-### Verification procedure
+### Kenwood TH-D75A / TH-D74A (Classic Bluetooth)
 
-After configuring the radio, verify end-to-end operation:
+The TH-D75 and TH-D74 are dual-band handhelds with a built-in KISS TNC
+accessible over **Classic Bluetooth (RFCOMM/SPP)** — not BLE. Both models
+share the same menu structure and Bluetooth setup procedure.
+
+**Step 1 — Enable Bluetooth and pair:**
+
+1. Turn Bluetooth ON on the radio.
+2. **Menu 934** → **Bluetooth** → **Pairing Mode** — activate pairing.
+   The radio becomes discoverable for ~60 seconds.
+3. On your computer, pair with the radio (System Settings → Bluetooth on macOS,
+   `bluetoothctl` on Linux). Accept the pairing code on both sides.
+4. After pairing, the Bluetooth icon on the radio turns blue.
+
+> **Important:** the radio must be in **Pairing Mode** for `--scan` and
+> `--inspect` to find it. Once paired, normal connections work without
+> re-entering pairing mode.
+
+**Step 2 — Set KISS interface to Bluetooth:**
+
+| Menu | Setting | Value | Notes |
+|------|---------|-------|-------|
+| **983** | Interface → KISS | **Bluetooth** | Routes KISS TNC data over BT instead of USB. Without this, TX works but **RX is silent** — the TNC sends decoded frames to USB only. |
+
+This is the most critical setting. If KISS is set to USB (the default),
+the bridge can send data to the radio (TX) but never receives anything
+back (RX) because the TNC output goes to the USB port.
+
+**Step 3 — Activate KISS mode on the channel:**
+
+Press **[F]** then **[LIST]** (APRS key, keypad 5) to cycle through modes:
+
+| Display | Mode | Description |
+|---------|------|-------------|
+| *(blank)* | Off | TNC inactive |
+| APRS12 | APRS 1200 baud | Standalone APRS — radio handles everything internally |
+| APRS96 | APRS 9600 baud | Same, 9600 baud |
+| **KISS12** | **KISS 1200 baud** | **Use this for standard packet/APRS (1200 baud AFSK)** |
+| KISS96 | KISS 9600 baud | 9600 baud G3RUH FSK |
+
+Select **KISS12** for 1200 baud (standard APRS on 144.390 MHz / 144.800 MHz)
+or **KISS96** for 9600 baud.
+
+> **Note:** GPS NMEA output is disabled while KISS mode is active.
+> You cannot get GPS data and KISS data over the same BT connection.
+
+**Step 4 — Tune to the desired frequency:**
+
+Set the VFO or memory channel to the frequency you want to use
+(e.g., 144.390 MHz for APRS in North America, 144.800 MHz in Europe,
+or your local packet frequency).
+
+**RFCOMM SPP service:**
+
+The radio advertises two RFCOMM services via SDP:
+- **Channel 1** — Headset Audio Gateway (do not use for data)
+- **Channel 2** — Serial Port (SPP UUID `0x1101`) — **this is the data channel**
+
+The bridge auto-detects channel 2 via SDP when you omit `--channel`.
+
+**Scan, inspect, and connect:**
+
+```bash
+# Scan — radio MUST be in Pairing Mode for discovery
+./bt_kiss_bridge --bt --scan
+
+# Inspect SDP services (radio must be in Pairing Mode the first time)
+./bt_kiss_bridge --bt --inspect 10:CA:BF:XX:XX:XX
+
+# Connect — auto-detects RFCOMM channel via SDP
+./bt_kiss_bridge --bt --device 10:CA:BF:XX:XX:XX --monitor
+
+# Or specify channel explicitly (skips SDP)
+./bt_kiss_bridge --bt --device 10:CA:BF:XX:XX:XX --channel 2 --monitor
+```
+
+**Example session (TH-D75 with ax25send):**
+
+```bash
+# Terminal 1: start bridge
+./bt_kiss_bridge --bt --device 10:CA:BF:XX:XX:XX --monitor
+
+# Terminal 2: send APRS position
+ax25send -c PU1ABC /tmp/kiss --pos -23.55,-46.63 "TH-D75 Mobile"
+
+# Terminal 2: send UI frame
+ax25send -c PU1ABC /tmp/kiss --ui CQ "Hello from TH-D75"
+```
+
+Expected monitor output:
+
+```
+Connected.  RFCOMM channel=2
+...
+[22:56:41.130]  -> BT  PU1ABC -> APRS  [UI]   !2327.00S/04637.80W>TH-D75 Mobile
+[22:56:41.500]  <- BT  G2UGK -> PU1ABC  [SABM(P/F)]   ← received from air
+```
+
+### Verification procedure (BLE radios)
+
+After configuring a BLE radio, verify end-to-end operation:
 
 ```bash
 # 1. Scan to confirm the radio is advertising
@@ -139,6 +238,26 @@ Expected monitor output when a frame is transmitted:
 ...
 [20:18:26.661]  -> BLE  G2UGK-10 -> G2UGK  [SABM]
 ```
+
+### Verification procedure (Classic BT radios)
+
+```bash
+# 1. Put radio in Pairing Mode (Menu 934), then scan
+./bt_kiss_bridge --bt --scan
+
+# 2. Inspect SDP services
+./bt_kiss_bridge --bt --inspect XX:XX:XX:XX:XX:XX
+
+# 3. Start bridge with monitor
+./bt_kiss_bridge --bt --device XX:XX:XX:XX:XX:XX --monitor
+
+# 4. Confirm KISS12 is displayed on the radio, Menu 983 = Bluetooth
+
+# 5. In a second terminal, send a test frame
+ax25send -c YOURCALL /tmp/kiss --ui CQ "Test"
+```
+
+Expected: `-> BT` in the monitor confirms TX, `<- BT` confirms RX from air.
 
 If `-> BLE` frames appear but the radio does not key PTT, recheck
 **Lock Channel Data** and ensure **Digital Mode** is OFF.
