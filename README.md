@@ -31,6 +31,151 @@ make test     # runs the GoogleTest suite — all must pass
 
 ---
 
+## Compatible Radios — Initial Setup
+
+Before connecting `bt_kiss_bridge`, the radio must be configured correctly.
+The most common reason for a working BLE connection that produces no RF
+transmission is incorrect radio settings.
+
+> **Three settings must be correct for BLE KISS TNC operation:**
+> 1. **KISS TNC mode** — ON
+> 2. **Digital Mode** — OFF
+> 3. **Lock Channel Data** — ON
+
+### Why each setting matters
+
+| Setting | What it does | Effect if wrong |
+|---------|-------------|-----------------|
+| **KISS TNC** | Tells the radio to interpret data received via BLE as KISS-framed AX.25 and route it to the RF modem | Radio ignores BLE data entirely |
+| **Digital Mode** | Uses the audio DSP for digital voice codecs (DMR, C4FM, etc.) | Conflicts with KISS TNC — the same DSP hardware cannot do both; TNC frames are silently discarded |
+| **Lock Channel Data** | Locks the channel for data-only use; the radio automatically keys PTT when a KISS frame arrives via BLE | Radio receives the BLE frames but never keys PTT — no RF transmission |
+
+### Vero VR-N76 and VR-N7600
+
+The VR-N76 and VR-N7600 are BLE-capable dual-band handhelds with an integrated
+KISS TNC accessible over a BLE UART service.
+
+**Per-channel configuration** (settings are stored per memory channel):
+
+1. Open the channel you want to use for packet radio.
+2. In the channel settings, locate **Digital Mode** and set it to **OFF**.
+   Digital mode uses the same DSP pipeline as the KISS TNC — they are
+   mutually exclusive. Running both simultaneously results in silent
+   frame loss on the TNC path.
+3. Locate **KISS TNC** and set it to **ON** (sometimes labelled "TNC Mode"
+   or "Packet Mode"). This activates the BLE data interface.
+4. Locate **Lock Channel Data** (sometimes "CH Lock Data" or "Data Lock")
+   and set it to **ON**. This is the gating signal for automatic PTT —
+   without it the radio receives the BLE data but never transmits.
+5. Save the channel configuration.
+
+**BLE service UUIDs (both models):**
+
+```
+Service  : 00000001-ba2a-46c9-ae49-01b0961f68bb
+Notify   : 00000002-ba2a-46c9-ae49-01b0961f68bb  (read + notify)
+Write    : 00000003-ba2a-46c9-ae49-01b0961f68bb  (write + write-without-response)
+```
+
+**Bridge command (macOS — search by name):**
+```bash
+./bt_kiss_bridge --ble --device "VR-N76" --monitor
+# or for VR-N7600:
+./bt_kiss_bridge --ble --device "VR-N7600" --monitor
+```
+
+**Bridge command (Linux — use MAC address from --scan):**
+```bash
+./bt_kiss_bridge --ble --device 38:D2:XX:XX:XX:XX --monitor
+```
+
+### Retevis / Radioddity GA-5WB
+
+The GA-5WB is a BLE-equipped handheld with an embedded KISS TNC. It shares
+the same BLE UART service UUIDs as the VR-N76/VR-N7600.
+
+**Per-channel configuration:**
+
+1. Select the channel you want to use for packet.
+2. Set **Digital Mode** → **OFF**. The GA-5WB cannot run digital voice
+   and KISS TNC simultaneously on the same channel.
+3. Set **KISS TNC** (or "TNC Mode") → **ON**.
+4. Set **Lock Channel Data** → **ON**.
+   This is the most commonly missed setting. Without it, the radio
+   silently receives KISS frames from BLE but never keys the PA —
+   confirmed: SDR# shows zero RF even though the bridge reports frames sent.
+5. Confirm the radio shows a data-mode indicator on screen (varies by firmware).
+
+**BLE service UUIDs:** same as VR-N76 above.
+
+**Bridge command:**
+```bash
+./bt_kiss_bridge --ble --device "GA-5WB" --monitor
+```
+
+### Verification procedure
+
+After configuring the radio, verify end-to-end operation:
+
+```bash
+# 1. Scan to confirm the radio is advertising
+./bt_kiss_bridge --scan --ble --timeout 15
+
+# 2. Inspect GATT services (confirm the three UUIDs above are present)
+./bt_kiss_bridge --inspect "GA-5WB"      # macOS (by name)
+./bt_kiss_bridge --inspect 38:D2:XX:XX:XX:XX --ble   # Linux (by MAC)
+
+# 3. Start the bridge with monitor enabled
+./bt_kiss_bridge --ble --device "GA-5WB" --monitor
+
+# 4. In a second terminal, connect with ax25tnc or KISSet
+ax25tnc -c YOURCALL /tmp/kiss
+```
+
+Expected monitor output when a frame is transmitted:
+
+```
+[20:18:26.069]  Connected. MTU=155 chunk=auto wwr=yes response=no
+...
+[20:18:26.661]  -> BLE  G2UGK-10 -> G2UGK  [SABM]
+```
+
+If `-> BLE` frames appear but the radio does not key PTT, recheck
+**Lock Channel Data** and ensure **Digital Mode** is OFF.
+
+### --tnc-init flag
+
+Some radios (especially after a power cycle) need to be explicitly put
+into KISS mode via text commands before they will accept KISS frames.
+Use `--tnc-init` to send the standard TNC initialization sequence:
+
+```bash
+./bt_kiss_bridge --ble --device "GA-5WB" --tnc-init --monitor
+```
+
+This sends: `KISS ON\r` → `RESTART\r` → `INTERFACE KISS\r` → `RESET\r`,
+waits 2 seconds, then sends KISS parameter frames (TXDELAY, PERSISTENCE,
+SLOTTIME) one at a time. The sequence is compatible with KPC-3, TNC2,
+and clone firmwares.
+
+### KISSet (macOS packet radio client)
+
+[KISSet](https://github.com/pflarue/kisse) is a macOS AX.25 terminal
+that connects to `bt_kiss_bridge` via TCP:
+
+```bash
+# Start the bridge in TCP server mode
+./bt_kiss_bridge --ble --device "GA-5WB" --server-port 8100 --monitor
+
+# In KISSet: set TNC type = KISS, host = 127.0.0.1, port = 8100
+```
+
+KISSet sends KISS parameter frames (TXDELAY, PERSISTENCE, SLOTTIME,
+TXTAIL, FULLDUPLEX) automatically when it connects — these are normal
+and appear in `--monitor` output as `KISS cmd=TXDELAY val=...` lines.
+
+---
+
 ## Linux BBS Installation — One-Command Setup
 
 KISSBBS provides a complete automated installer that turns any Linux box
@@ -131,30 +276,30 @@ journalctl -u kissbbs-bbs -f
 ## Table of Contents
 
 0. [Quick Start](#quick-start)
-1. [Linux BBS Installation](#linux-bbs-installation--one-command-setup)
-2. [Development Workflow & Best Practices](#2-development-workflow--best-practices)
-3. [Background — AX.25 and KISS](#3-background--ax25-and-kiss)
-4. [Architecture Overview](#4-architecture-overview)
-5. [Object Relationship Diagram](#5-object-relationship-diagram)
-6. [UML Class Diagram](#6-uml-class-diagram)
-7. [AX.25 State Machine](#7-ax25-state-machine)
-8. [Connection Sequence Diagram](#8-connection-sequence-diagram)
-9. [Building](#9-building)
-10. [API Reference](#10-api-reference)
-11. [Usage Examples](#11-usage-examples)
-12. [Running Tests](#12-running-tests)
-13. [BBS Example](#13-bbs-example)
-14. [INI Configuration](#14-ini-configuration)
-15. [BASIC Scripting](#15-basic-scripting)
-16. [APRS Helpers (ax25::aprs)](#16-aprs-helpers-ax25aprs)
-17. [ax25tnc — TNC Terminal Client](#17-ax25tnc--tnc-terminal-client)
-18. [ble_kiss_monitor.py — BLE KISS Scanner & AX.25 Monitor](#18-ble_kiss_monitorpy--ble-kiss-scanner--ax25-monitor)
-19. [bt_kiss_bridge — Bluetooth KISS Bridge (BLE + Classic BT)](#19-bt_kiss_bridge--bluetooth-kiss-bridge-ble--classic-bt)
+1. [Compatible Radios — Initial Setup](#compatible-radios--initial-setup)
+2. [Linux BBS Installation](#linux-bbs-installation--one-command-setup)
+3. [Development Workflow & Best Practices](#2-development-workflow--best-practices)
+4. [Protocol Background (see DESIGN.md)](DESIGN.md)
+5. [Architecture Overview (see DESIGN.md)](DESIGN.md)
+6. [Object Relationship Diagram (see DESIGN.md)](DESIGN.md)
+7. [UML Class Diagram (see DESIGN.md)](DESIGN.md)
+8. [AX.25 State Machine (see DESIGN.md)](DESIGN.md)
+9. [Connection Sequence Diagram (see DESIGN.md)](DESIGN.md)
+10. [Building](#9-building)
+11. [API Reference](#10-api-reference)
+12. [Usage Examples](#11-usage-examples)
+13. [Running Tests](#12-running-tests)
+14. [BBS Example](#13-bbs-example)
+15. [INI Configuration](#14-ini-configuration)
+16. [BASIC Scripting](#15-basic-scripting)
+17. [APRS Helpers (ax25::aprs)](#16-aprs-helpers-ax25aprs)
+18. [ax25tnc — TNC Terminal Client](#17-ax25tnc--tnc-terminal-client)
+19. [ble_kiss_monitor.py — BLE KISS Scanner & AX.25 Monitor](#18-ble_kiss_monitorpy--ble-kiss-scanner--ax25-monitor)
+20. [bt_kiss_bridge — Bluetooth KISS Bridge (BLE + Classic BT)](#19-bt_kiss_bridge--bluetooth-kiss-bridge-ble--classic-bt)
     - [bt_sniffer — KISS proxy tap](#bt_sniffer--kiss-proxy-tap-all-platforms)
-    - [PacketLogger — HCI sniffer (macOS)](#packetlogger--hci-level-ble-sniffer-macos-only)
     - [btmon — HCI sniffer (Linux)](#btmon--hci-level-ble-sniffer-linux-only)
-20. [basic_tool — Offline BASIC Interpreter / REPL Debugger](#20-basic_tool--offline-basic-interpreter--repl-debugger)
-21. [ax25sim — AX.25 TNC Simulator](#21-ax25sim--ax25-tnc-simulator)
+21. [basic_tool — Offline BASIC Interpreter / REPL Debugger](#20-basic_tool--offline-basic-interpreter--repl-debugger)
+22. [ax25sim — AX.25 TNC Simulator](#21-ax25sim--ax25-tnc-simulator)
 
 ---
 
@@ -313,435 +458,41 @@ documentation on these tools.
 
 ---
 
-## 3. Background — AX.25 and KISS
+## 3. Background — AX.25, KISS and APRS
 
-### AX.25
-
-AX.25 is the link-layer protocol used in amateur (ham) radio packet networks.
-Think of it as a stripped-down Ethernet designed for half-duplex radio channels.
-
-**Addresses** — Every station has a *callsign* (up to 6 characters, e.g. `W1AW`)
-plus a 0–15 *SSID* suffix, written `W1AW-7`.  On the wire each address occupies
-exactly 7 bytes: the 6 callsign characters shifted left by one bit, followed by
-a flag byte carrying the SSID and housekeeping bits.
-
-**Frame types**
-
-| Type | Purpose |
-|------|---------|
-| UI (Unnumbered Information) | Connectionless datagram — used for APRS beacons |
-| SABM | Set Asynchronous Balanced Mode — opens a connection |
-| UA | Unnumbered Acknowledgement — accepts SABM or DISC |
-| DM | Disconnected Mode — rejects SABM |
-| DISC | Disconnect — closes a connection |
-| I-frame | Information frame — carries sequenced data |
-| RR | Receive Ready — acknowledges I-frames, resumes suspended flow |
-| REJ | Reject — requests retransmission from a given sequence number |
-
-**Connected mode** (what `Connection` implements) uses a sliding window
-(Go-Back-N, mod-8) with two timers:
-
-* **T1** — Retransmit timer.  Dynamically computed:
-  `max(t1_ms, window × mtu × 40000 / baud)`.  This ensures T1 is long enough
-  for the full window to transit slow links (BLE, 1200 baud, etc.).  Default
-  minimum is 15 000 ms.  If T1 expires before an ACK arrives the frame is
-  retransmitted with P=1 to poll the remote.  After *N2* retries the link is
-  declared failed.
-* **T3** — Keep-alive / inactivity timer.  If no data is exchanged within T3 the
-  station sends an RR poll (P=1) to verify the link is still alive.
-
-**P/F poll tracking** — The library tracks outstanding P=1 polls internally.
-When the window fills, the last I-frame is sent with P=1 to solicit an RR
-response from the remote.  Incoming RR/RNR with F=1 are matched against
-outstanding polls so the library never echoes back a spurious RR.  Applications
-never need to manage polling — it is fully transparent.
-
-**TX pacing** — Outgoing frames are spaced by TXDELAY (default 400 ms) to give
-half-duplex radios time for TX/RX turnaround.  After receiving a frame, the
-router also enforces a turnaround delay before responding.
-
-### KISS
-
-KISS ("Keep It Simple, Stupid") is a thin serial framing protocol that lets a
-computer talk to a TNC (Terminal Node Controller — the radio modem).
-
-The computer sends and receives raw AX.25 frames wrapped in a simple envelope:
-
-```
-FEND  CMD  DATA...  FEND
-```
-
-Special byte values are escaped inside DATA so they cannot be confused with
-envelope markers:
-
-| Raw byte | On wire |
-|----------|---------|
-| `0xC0` (FEND) | `0xDB 0xDC` |
-| `0xDB` (FESC) | `0xDB 0xDD` |
-
-The TNC handles everything physical: radio timing, flag bytes, and FCS
-checksums.  The library never sees or generates those.
-
-### APRS
-
-APRS (Automatic Packet Reporting System) is built on top of AX.25 UI frames
-with PID `0xF0`, sent to the destination callsign `APRS`.  The library lets you
-send position reports and person-to-person messages and receive/route incoming
-ones.
+AX.25, KISS, and APRS protocol background, frame formats, and timing details
+are documented in the [Design & Architecture Reference](DESIGN.md#1-ax25-protocol).
 
 ---
 
 ## 4. Architecture Overview
 
-```
-Your Application
-       │
-       ▼
-   ┌────────┐
-   │ Router │  Manages connections; routes incoming frames; exposes on_ui
-   └────────┘
-       │
-       ▼
-   ┌────────┐
-   │  Kiss  │  Transport-agnostic KISS framing layer
-   └────────┘
-       │  open(dev, baud)  ← serial port (Serial / termios)
-       │  open_fd(fd)      ← any POSIX fd: TCP socket, PTY, pipe
-       │
-    (wire / socket / PTY)
-       │
-      TNC  ──── Radio ──── Remote station
-```
-
-The layer stack is **intentionally thin**: each layer does exactly one job and
-calls the layer above via a `std::function` callback, making the stack easy to
-test (swap the serial layer with an in-memory hook) and easy to adapt (plug in a
-different physical layer without touching the rest).
+The full layer architecture diagram, component responsibilities, and design
+rationale are in [DESIGN.md — ax25lib Layer Architecture](DESIGN.md#4-ax25lib--layer-architecture).
 
 ---
 
 ## 5. Object Relationship Diagram
 
-```
-                              ┌─────────────────────────────────────────┐
-                              │              ax25lib.hpp/cpp             │
-                              └─────────────────────────────────────────┘
-
-  ┌──────────────────────────────────────────────────────────────────────────┐
-  │  ObjNode<T>  (template)  — self-managing intrusive node                  │
-  │  ─────────────────────────────────────────────────────────────────────── │
-  │  # ObjNode(ObjList<T>&)   ← protected; auto-inserts on construction      │
-  │  # ~ObjNode()              ← protected; auto-removes on destruction       │
-  │  - next_ : T*                                                             │
-  │  - prev_ : T*                                                             │
-  │  - list_ : ObjList<T>*                                                    │
-  └──────────────────────────────────────────────────────────────────────────┘
-          ▲ inherits
-          │
-  ┌───────────────────────────────────────────────────────────────────────┐
-  │  Connection  extends ObjNode<Connection>                               │
-  │  ─────────────────────────────────────────────────────────────────────│
-  │  Callbacks: on_connect, on_disconnect, on_data                         │
-  │  State: DISCONNECTED / CONNECTING / CONNECTED / DISCONNECTING          │
-  │  AX.25 vars: vs_, vr_, va_, retry_                                     │
-  │  Timers: T1 (retransmit), T3 (keep-alive)                              │
-  │  Queues: send_buf_, unacked_                                            │
-  │  ─────────────────────────────────────────────────────────────────────│
-  │  + send(data)                                                           │
-  │  + disconnect()                                                         │
-  │  + tick(now_ms)                                                         │
-  │  + has_unacked() → bool   (true if unacked_ or send_buf_ non-empty)    │
-  └───────────────────────────────────────────────────────────────────────┘
-          │ lives in (inserted/removed automatically via ObjNode ctor/dtor)
-          ▼
-  ┌───────────────────────────────────────────────────────────────────────┐
-  │  ObjList<Connection>  (intrusive doubly-linked list)                   │
-  │  ─────────────────────────────────────────────────────────────────────│
-  │  - head_, tail_, size_   (private)                                      │
-  │  - insert_back(item)     (called by ObjNode ctor — not public)          │
-  │  - erase(item)           (called by ObjNode dtor — not public)          │
-  │  + empty()  size()  begin()  end()  snapshot()                          │
-  └───────────────────────────────────────────────────────────────────────┘
-          │ owned by
-          ▼
-  ┌───────────────────────────────────────────────────────────────────────┐
-  │  Router                                                                │
-  │  ─────────────────────────────────────────────────────────────────────│
-  │  + connect(remote) → Connection*                                       │
-  │  + listen(on_accept)                                                   │
-  │  + send_ui(dest, pid, data)                                            │
-  │  + send_aprs(info)                                                     │
-  │  + poll()                                                              │
-  │  Callbacks: on_ui (all UI frames), on_monitor (all frames)             │
-  └───────────────────────────────────────────────────────────────────────┘
-          │ holds reference to
-          ▼
-  ┌───────────────────────────────────────────────────────────────────────┐
-  │  Kiss                                                                  │
-  │  ─────────────────────────────────────────────────────────────────────│
-  │  + open(device, baud)   ← serial port                                  │
-  │  + open_fd(fd)          ← any POSIX fd (TCP socket, PTY, pipe…)        │
-  │  + fd() → int           ← active file descriptor                       │
-  │  + is_open() → bool                                                     │
-  │  + send_frame(ax25_bytes)                                              │
-  │  + poll()  — reads fd, fires on_frame for each complete AX.25 frame    │
-  │  Hooks: on_send_hook (test/simulation), test_inject(payload)           │
-  └───────────────────────────────────────────────────────────────────────┘
-          │ owns
-          ▼
-  ┌───────────────────────────────────────────────────────────────────────┐
-  │  Serial                                                                │
-  │  ─────────────────────────────────────────────────────────────────────│
-  │  + open(dev, baud)   close()                                           │
-  │  + read(buf, len)    write(buf, len)                                   │
-  │  fd_ : int           (non-blocking POSIX file descriptor)              │
-  └───────────────────────────────────────────────────────────────────────┘
-
-  Supporting types (used by the layers above)
-
-  ┌──────────────┐   ┌───────────────────────────────────┐
-  │  Addr        │   │  Frame                             │
-  │  ────────────│   │  ─────────────────────────────────│
-  │  call[7]     │   │  dest, src : Addr                  │
-  │  ssid : int  │   │  digis : vector<Addr>              │
-  │  make(str)   │   │  ctrl, pid : uint8_t               │
-  │  encode()    │   │  info : vector<uint8_t>            │
-  │  decode()    │   │  type() → IFrame/UI/SABM/...       │
-  │  str()       │   │  encode() / decode()               │
-  └──────────────┘   └───────────────────────────────────┘
-
-  ┌────────────────────────────────────────────────────────────┐
-  │  kiss namespace                                             │
-  │  ──────────────────────────────────────────────────────────│
-  │  Constants: FEND, FESC, TFEND, TFESC                        │
-  │  encode(payload) → KISS-wrapped bytes                       │
-  │  Decoder::feed(buf, len) → vector<kiss::Frame>              │
-  └────────────────────────────────────────────────────────────┘
-
-  ┌────────────────────────────────────────────────────────────┐
-  │  Config                                                     │
-  │  ──────────────────────────────────────────────────────────│
-  │  mycall, digis, mtu, window, t1_ms, t3_ms, n2, …           │
-  └────────────────────────────────────────────────────────────┘
-```
+See [DESIGN.md — Object Relationship Diagram](DESIGN.md#5-object-relationship-diagram-ax25lib).
 
 ---
 
 ## 6. UML Class Diagram
 
-```mermaid
-classDiagram
-    class ObjNode~T~ {
-        #ObjNode(ObjList~T~)
-        #~ObjNode()
-        -T* next_
-        -T* prev_
-        -ObjList~T~* list_
-    }
-
-    class ObjList~T~ {
-        -T* head_
-        -T* tail_
-        -size_t size_
-        -insert_back(T*)
-        -erase(T*)
-        +empty() bool
-        +size() size_t
-        +snapshot() vector~T*~
-        +begin() iterator
-        +end() iterator
-    }
-
-    class Serial {
-        -int fd_
-        -termios orig_
-        +open(dev, baud) bool
-        +close()
-        +is_open() bool
-        +fd() int
-        +read(buf, len) ssize_t
-        +write(buf, len) ssize_t
-    }
-
-    class Kiss {
-        -Serial serial_
-        -int ext_fd_
-        -kiss_Decoder decoder_
-        -function on_frame_
-        +open(dev, baud) bool
-        +open_fd(fd) bool
-        +close()
-        +is_open() bool
-        +fd() int
-        +send_frame(ax25) bool
-        +set_txdelay(ms)
-        +set_persistence(val)
-        +poll()
-        +test_inject(ax25)
-        +on_send_hook
-    }
-
-    class Addr {
-        +char call[7]
-        +int ssid
-        +bool repeated
-        +make(str)$ Addr
-        +encode(last) vector
-        +decode(bytes)$ Addr
-        +str() string
-        +operator==()
-    }
-
-    class Frame {
-        +Addr dest
-        +Addr src
-        +vector~Addr~ digis
-        +uint8_t ctrl
-        +uint8_t pid
-        +vector~uint8_t~ info
-        +type() Type
-        +get_ns() int
-        +get_nr() int
-        +get_pf() bool
-        +encode()$ vector
-        +decode(raw, out)$ bool
-    }
-
-    class Config {
-        +Addr mycall
-        +vector~Addr~ digis
-        +int mtu
-        +int window
-        +int t1_ms
-        +int t3_ms
-        +int n2
-        +int txdelay
-        +int persist
-    }
-
-    class Connection {
-        +function on_connect
-        +function on_disconnect
-        +function on_data
-        -State state_
-        -Addr local_
-        -Addr remote_
-        -int vs_, vr_, va_, retry_
-        -bool t1_run_, t3_run_
-        -deque send_buf_
-        -deque unacked_
-        +send(data) bool
-        +disconnect()
-        +state() State
-        +connected() bool
-        +remote() Addr
-        +local() Addr
-        +tick(now)
-        +has_unacked() bool
-    }
-
-    class Router {
-        -Kiss kiss_
-        -Config cfg_
-        -ObjList~Connection~ conns_
-        -function on_accept_
-        +connect(remote) Connection*
-        +listen(on_accept)
-        +send_ui(dest, pid, data)
-        +send_aprs(info)
-        +poll()
-        +on_ui
-        +on_monitor
-        +connections() ObjList~Connection~
-    }
-
-    ObjNode~T~ <|-- Connection : inherits
-    ObjList~T~ "1" *-- "0..*" Connection : contains
-    Router "1" *-- "1" ObjList~Connection~ : owns
-    Router "1" --> "1" Kiss : uses
-    Kiss "1" *-- "1" Serial : owns
-    Connection "1" --> "1" Router : back-ref
-    Frame "1" *-- "2..*" Addr : has
-    Router "1" --> "1" Config : holds
-    Connection "1" --> "1" Config : holds copy
-```
+See [DESIGN.md — UML Class Diagram](DESIGN.md#6-uml-class-diagram-ax25lib).
 
 ---
 
 ## 7. AX.25 State Machine
 
-```mermaid
-stateDiagram-v2
-    [*] --> DISCONNECTED
-
-    DISCONNECTED --> CONNECTING : connect()\nsend SABM, start T1
-    CONNECTING --> CONNECTED   : rcv UA\nstop T1, start T3\nfire on_connect
-    CONNECTING --> DISCONNECTED : rcv DM\nor T1 × N2\nfire on_disconnect
-
-    CONNECTED --> DISCONNECTING : disconnect()\nsend DISC, start T1
-    DISCONNECTING --> DISCONNECTED : rcv UA\nor T1 × N2\nfire on_disconnect
-
-    CONNECTED --> DISCONNECTED  : rcv DISC\nsend UA\nfire on_disconnect
-    CONNECTED --> CONNECTED     : rcv I-frame\nsend RR, fire on_data
-    CONNECTED --> CONNECTED     : send(data)\nsend I-frames (window)
-    CONNECTED --> CONNECTED     : rcv RR\nslide window, send more I-frames
-    CONNECTED --> CONNECTED     : T1 expires (retry < N2)\nretransmit
-    CONNECTED --> CONNECTED     : T3 expires\nsend RR poll
-    CONNECTED --> DISCONNECTED  : T1 expires (retry >= N2)\nlink_failed, fire on_disconnect
-
-    DISCONNECTED --> CONNECTED  : rcv SABM (listening)\nsend UA\nfire on_accept then on_connect
-    DISCONNECTED --> DISCONNECTED : rcv SABM (not listening)\nsend DM
-    DISCONNECTED --> DISCONNECTED : rcv non-SABM (no connection)\nsend DM (AX.25 §4.3.3)
-```
+See [DESIGN.md — AX.25 State Machine](DESIGN.md#7-ax25-state-machine).
 
 ---
 
 ## 8. Connection Sequence Diagram
 
-### Successful connect + data exchange + disconnect
-
-```mermaid
-sequenceDiagram
-    participant A as Station A (initiator)
-    participant B as Station B (listener)
-
-    A->>B: SABM (Set Async Balanced Mode)
-    Note over A: state = CONNECTING, start T1
-    B-->>A: UA (Unnumbered Ack)
-    Note over A: state = CONNECTED, fire on_connect
-    Note over B: state = CONNECTED, fire on_connect
-
-    A->>B: I(N(S)=0, N(R)=0) "Hello"
-    Note over A: add to unacked, start T1
-    B-->>A: RR(N(R)=1)
-    Note over A: ack frame 0, slide window
-
-    B->>A: I(N(S)=0, N(R)=1) "World"
-    A-->>B: RR(N(R)=1)
-
-    A->>B: DISC
-    Note over A: state = DISCONNECTING
-    B-->>A: UA
-    Note over A,B: state = DISCONNECTED, fire on_disconnect
-```
-
-### T1 retransmit and link failure
-
-```mermaid
-sequenceDiagram
-    participant A
-    participant B
-
-    A->>B: I(N(S)=0)
-    Note over A: T1 starts
-    Note over B: (no response — link broken)
-    Note over A: T1 expires, retry=1 → retransmit
-    A->>B: I(N(S)=0) [retry 1]
-    Note over A: T1 expires, retry=2 → retransmit
-    A->>B: I(N(S)=0) [retry 2]
-    Note over A: T1 expires, retry=3 ≥ N2=3 → link_failed
-    Note over A: state=DISCONNECTED, fire on_disconnect
-```
+See [DESIGN.md — Connection Sequence Diagrams](DESIGN.md#8-connection-sequence-diagrams).
 
 ---
 
@@ -1170,62 +921,7 @@ user typing the command at the `Email>` (or BBS) prompt.
 
 ## Intrusive Container — Design Notes
 
-`ObjNode<T>` / `ObjList<T>` is an intrusive doubly-linked container inspired by
-the Linux kernel's `list_head`.  Unlike `std::list`, which heap-allocates a
-wrapper node for each element, the linkage (`next_`/`prev_` pointers) lives
-**inside** the object itself — no extra allocation needed.
-
-### Self-managing lifetime
-
-The key improvement over a plain `Node<T>` base class is that **`ObjNode<T>`
-owns the insert/remove responsibility** so developers never call `push_back` or
-`remove` explicitly:
-
-```cpp
-// T must inherit ObjNode<T>.
-// The constructor takes the list — insertion is automatic.
-struct MySession : ObjNode<MySession> {
-    std::string call;
-    MySession(ObjList<MySession>& list, std::string c)
-        : ObjNode<MySession>(list),   // ← inserts into list immediately
-          call(std::move(c)) {}
-    // destructor: ObjNode<MySession>::~ObjNode() fires automatically
-    //             → removes from list with O(1), no search
-};
-
-ObjList<MySession> sessions;
-{
-    MySession a(sessions, "W1AW");
-    MySession b(sessions, "N0CALL");
-    assert(sessions.size() == 2);
-}   // a and b destroyed → auto-removed
-assert(sessions.empty());
-
-// Heap allocation: delete triggers auto-remove too
-auto* s = new MySession(sessions, "PY2XXX");
-assert(sessions.size() == 1);
-delete s;          // ← safe: auto-removed from list before memory is freed
-assert(sessions.empty());
-```
-
-### API restrictions
-
-* **Default constructor is `= delete`** — every `ObjNode<T>` must bind to an
-  `ObjList<T>` at construction time.
-* **Copy and move are `= delete`** — nodes are identity-based, not value-based.
-* `ObjList<T>::insert_back` and `erase` are **private**, only callable by
-  `ObjNode<T>` (friend).  User code never calls them.
-* An object can belong to **one** list at a time (same trade-off as all
-  intrusive containers).
-
-### Advantages
-
-| Property | Benefit |
-|----------|---------|
-| Zero extra allocation | No wrapper `list_node` struct on the heap |
-| O(1) insert / remove | Pointer surgery only; no search |
-| Safety by construction | Can't forget to insert; can't double-free the link |
-| RAII-friendly | Scope exit or `delete` → automatic deregistration |
+> **Design notes** for `ObjNode<T>` / `ObjList<T>` are in [DESIGN.md — Intrusive Container](DESIGN.md#9-intrusive-container--design-notes-objnode--objlist).
 
 ---
 
@@ -2889,183 +2585,7 @@ Use `--inspect` to confirm UUIDs for your specific device.
 | **BLE** | Native: BlueZ D-Bus (Linux) / CoreBluetooth (macOS) | Linux + macOS | Mobilinkd TNC4, NinoTNC-BT, etc. |
 | **Classic BT** | BlueZ RFCOMM / IOBluetooth RFCOMM | Linux + macOS | Kenwood TH-D75, TH-D74, other SPP radios |
 
-### Object Relationship Diagram
-
-```
-  ┌──────────────────────────────────────────────────────────────────────────────┐
-  │  bt_kiss_bridge.cpp + bt_ble_native.h + bt_rfcomm_macos.h                   │
-  └──────────────────────────────────────────────────────────────────────────────┘
-
-  ┌──────────────────────────────────────────────────────────────────────────────┐
-  │  RadioTransport  «interface»                                                 │
-  │  ──────────────────────────────────────────────────────────────────────────  │
-  │  + connect() → bool                                                          │
-  │  + disconnect()                                                              │
-  │  + is_connected() → bool                                                     │
-  │  + write(data, len)                                                          │
-  │  + read_fd() → int           (≥0 = fd for select(), all transports)         │
-  │  + set_on_disconnect(cb)                                                     │
-  │  + label() → "BLE" | "BT"                                                   │
-  └──────────────────────────────────────────────────────────────────────────────┘
-          ▲ implements                          ▲ implements
-          │                                     │
-  ┌───────────────────────────────┐   ┌────────────────────────────────────────┐
-  │  BleTransport                 │   │  BtTransport                            │
-  │  ─────────────────────────── │   │  ────────────────────────────────────── │
-  │  ble_handle_t (native API)    │   │  Linux: BlueZ RFCOMM socket (fd_)       │
-  │  Async TX queue + writer thd  │   │  macOS: IOBluetooth RFCOMM + pipe() fd  │
-  │  Notify → pipe fd (RX)        │   │  Direct TX (::write / writeSync)        │
-  │  BLE keep-alive timer         │   │  SDP auto-detect SPP channel (0x1101)   │
-  │  read_fd() = pipe read fd     │   │  read_fd() = socket fd / pipe read fd   │
-  └───────────────────────────────┘   └────────────────────────────────────────┘
-                                              │
-                                      ┌───────┴──────────────┐
-                                      │                      │
-                              ┌──────────────┐    ┌─────────────────────────┐
-                              │ Linux (BlueZ) │    │ macOS (IOBluetooth)     │
-                              │ ──────────── │    │ ─────────────────────── │
-                              │ AF_BLUETOOTH  │    │ bt_rfcomm_macos.mm      │
-                              │ BTPROTO_RFCOMM│    │ C-linkage API (extern)  │
-                              │ socket fd     │    │ IOBluetoothRFCOMMChannel│
-                              │ SDP via BlueZ │    │ delegate → pipe() fd    │
-                              └──────────────┘    │ performSDPQuery         │
-                                                  └─────────────────────────┘
-
-  ┌──────────────────────────────────────────────────────────────────────────────┐
-  │  Bridge Core  (do_bridge)                                                    │
-  │  ──────────────────────────────────────────────────────────────────────────  │
-  │  PTY pair (/tmp/kiss symlink) ←──── mutual exclusive ────→ TCP server       │
-  │  select() loop: PTY + TCP clients + transport.read_fd()                      │
-  │  KISS + AX.25 monitor (--monitor)                                            │
-  │  Auto-reconnect (up to 10 retries, 5s pause)                                 │
-  └──────────────────────────────────────────────────────────────────────────────┘
-
-  ┌──────────────────────────────────────────────────────────────────────────────┐
-  │  Discovery                                                                   │
-  │  ──────────────────────────────────────────────────────────────────────────  │
-  │  do_ble_scan()  → native BLE scan (BlueZ D-Bus / CoreBluetooth)              │
-  │  do_bt_scan()   → HCI inquiry (Linux) / IOBluetoothDeviceInquiry (macOS)    │
-  │  do_ble_inspect()→ GATT service + characteristic enumeration                 │
-  │  do_bt_inspect() → SDP service browsing + RFCOMM channel extraction          │
-  │  do_scan(AUTO)   → scans both BLE + BT on Linux and macOS                   │
-  └──────────────────────────────────────────────────────────────────────────────┘
-```
-
-### UML Class Diagram
-
-```mermaid
-classDiagram
-    class RadioTransport {
-        <<interface>>
-        +connect() bool
-        +disconnect()
-        +is_connected() bool
-        +write(data, len)
-        +read_fd() int
-        +set_on_receive(cb)
-        +set_on_disconnect(cb)
-        +label() string
-    }
-
-    class BleTransport {
-        -ble_handle_t handle_
-        -thread writer_thread_
-        -mutex tx_mx_
-        -queue tx_queue_
-        -SteadyClock last_write_
-        -int chunk_size_
-        +connect() bool
-        +write(data, len)
-        +read_fd() int  «returns pipe fd»
-        +maybe_keepalive()
-        +label() string «BLE»
-    }
-
-    class BtTransport {
-        -string address_
-        -int channel_
-        -int fd_ «Linux: RFCOMM socket»
-        -bt_macos_handle_t handle_ «macOS: opaque»
-        -function on_disconnect_
-        +connect() bool
-        +write(data, len)
-        +read_fd() int «returns fd»
-        +label() string «BT»
-    }
-
-    class BridgeConfig {
-        +string address
-        +Transport transport «AUTO/BLE/BT»
-        +int server_port
-        +string server_host
-        +string link_path
-        +bool monitor
-        +int ble_ka_ms
-    }
-
-    class BtMacosHandle {
-        -IOBluetoothDevice* device
-        -IOBluetoothRFCOMMChannel* channel
-        -BtRfcommDelegate* delegate
-        -int pipe_read
-        -int pipe_write
-        -atomic~bool~ connected
-    }
-
-    class BtRfcommDelegate {
-        -BtMacosHandle* handle_
-        +rfcommChannelData(ch, data, len)
-        +rfcommChannelClosed(ch)
-        +rfcommChannelOpenComplete(ch, status)
-    }
-
-    RadioTransport <|.. BleTransport : implements
-    RadioTransport <|.. BtTransport : implements
-    BtTransport "1" --> "0..1" BtMacosHandle : macOS only
-    BtMacosHandle "1" --> "1" BtRfcommDelegate : delegate
-    BtRfcommDelegate ..> BtMacosHandle : writes to pipe
-```
-
-### Data Flow Diagram
-
-```mermaid
-flowchart LR
-    subgraph Radio
-        TNC["TNC / Radio<br/>(BLE or BT SPP)"]
-    end
-
-    subgraph bt_kiss_bridge
-        subgraph Transport
-            BLE["BleTransport<br/>Native BLE (pipe fd)"]
-            BT_L["BtTransport (Linux)<br/>RFCOMM socket fd"]
-            BT_M["BtTransport (macOS)<br/>IOBluetooth → pipe fd"]
-        end
-        SEL["select() loop"]
-        MON["KISS/AX.25<br/>Monitor"]
-    end
-
-    subgraph Clients
-        PTY["PTY<br/>/tmp/kiss"]
-        TCP["TCP Server<br/>:8001"]
-        A1["ax25tnc"]
-        A2["bbs"]
-    end
-
-    TNC <-->|GATT notify/write| BLE
-    TNC <-->|RFCOMM| BT_L
-    TNC <-->|RFCOMM| BT_M
-
-    BLE --> SEL
-    BT_L --> SEL
-    BT_M --> SEL
-
-    SEL <--> PTY
-    SEL <--> TCP
-    SEL -.-> MON
-
-    PTY --- A1
-    TCP --- A2
-```
+> Architecture diagrams and implementation notes: [DESIGN.md — bt_kiss_bridge Architecture](DESIGN.md#10-bt_kiss_bridge--architecture).
 
 ### Build
 
@@ -3215,7 +2735,7 @@ the bridge automatically attempts to reconnect:
 
 ### Debugging BLE traffic
 
-Two complementary tools help diagnose BLE issues (radio not transmitting,
+These tools help diagnose BLE issues (radio not transmitting,
 GATT errors, notify subscription problems, etc.):
 
 #### bt_sniffer — KISS proxy tap (all platforms)
@@ -3250,57 +2770,6 @@ Output example:
     00000000  c0 01 28 c0                                     |..(.|
     └─ [KISS->#2 port=0]  ctrl: TXDELAY  val=40 (0x28)
 ```
-
-#### PacketLogger — HCI-level BLE sniffer (macOS only)
-
-PacketLogger captures raw HCI packets including ACL data (GATT
-writes/notifies), connection parameters, and CCCD subscription events.
-This is the deepest level of visibility into what CoreBluetooth is actually
-sending to the radio.
-
-**Install:**
-
-1. Download **Additional Tools for Xcode** from
-   `https://developer.apple.com/download/all/`
-   (search "Additional Tools for Xcode", match your Xcode version).
-2. Mount the `.dmg` and copy `Hardware/PacketLogger.app` to `/Applications`.
-
-**Capture (macOS Ventura / Sonoma and later — no extra setup needed):**
-
-1. Open **PacketLogger.app**
-2. Click **Start** (red record button) — capture begins immediately
-3. **Then** run `bt_kiss_bridge` in another terminal
-4. ATT packets appear in real-time
-
-> Starting PacketLogger **after** the connection is already established will
-> miss the initial handshake (CCCD write / notify subscription).  Always
-> start PacketLogger first.
-
-**Capture (macOS Monterey and earlier):**
-
-```bash
-sudo defaults write /Library/Preferences/com.apple.Bluetooth \
-    PacketLoggerLevel -int 4
-# Toggle Bluetooth off/on in System Preferences to apply (safer than pkill).
-```
-
-Open PacketLogger, connect the radio, then remove the setting when done:
-
-```bash
-sudo defaults delete /Library/Preferences/com.apple.Bluetooth PacketLoggerLevel
-# Toggle Bluetooth off/on again to restore defaults.
-```
-
-> **Avoid `sudo pkill bluetoothd`** — it can leave the daemon in a bad state.
-> Use the Bluetooth toggle in System Settings / System Preferences instead.
-
-**Useful PacketLogger filters:**
-
-| Filter | Shows |
-|--------|-------|
-| `ATT` | All GATT attribute protocol packets (writes, notifies) |
-| `HCI_EVT` | Connection events, disconnects, errors |
-| `L2CAP` | Raw L2CAP frames (lower level than ATT) |
 
 #### btmon — HCI-level BLE sniffer (Linux only)
 
