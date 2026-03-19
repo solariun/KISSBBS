@@ -150,6 +150,9 @@ journalctl -u kissbbs-bbs -f
 17. [ax25tnc — TNC Terminal Client](#17-ax25tnc--tnc-terminal-client)
 18. [ble_kiss_monitor.py — BLE KISS Scanner & AX.25 Monitor](#18-ble_kiss_monitorpy--ble-kiss-scanner--ax25-monitor)
 19. [bt_kiss_bridge — Bluetooth KISS Bridge (BLE + Classic BT)](#19-bt_kiss_bridge--bluetooth-kiss-bridge-ble--classic-bt)
+    - [bt_sniffer — KISS proxy tap](#bt_sniffer--kiss-proxy-tap-all-platforms)
+    - [PacketLogger — HCI sniffer (macOS)](#packetlogger--hci-level-ble-sniffer-macos-only)
+    - [btmon — HCI sniffer (Linux)](#btmon--hci-level-ble-sniffer-linux-only)
 20. [basic_tool — Offline BASIC Interpreter / REPL Debugger](#20-basic_tool--offline-basic-interpreter--repl-debugger)
 21. [ax25sim — AX.25 TNC Simulator](#21-ax25sim--ax25-tnc-simulator)
 
@@ -3209,6 +3212,103 @@ the bridge automatically attempts to reconnect:
 - All transports now provide a real `read_fd()` (pipe fd) for unified `select()` I/O.
 - `make install` / `make uninstall` handle both `bt_kiss_bridge` and the `ble_kiss_bridge` backward-compat symlink.
 - The TCP server uses a dual-stack IPv6 socket (`IPV6_V6ONLY=0`) with automatic IPv4-only fallback.
+
+### Debugging BLE traffic
+
+Two complementary tools help diagnose BLE issues (radio not transmitting,
+GATT errors, notify subscription problems, etc.):
+
+#### bt_sniffer — KISS proxy tap (all platforms)
+
+`bt_sniffer` sits transparently between `bt_kiss_bridge` and `ax25tnc`,
+forwarding all traffic in both directions while decoding every KISS frame
+and AX.25 header in real-time.  The bridge and client operate normally —
+the sniffer only observes.
+
+```
+Terminal 1 (bridge):   ./bin/bt_kiss_bridge --ble --device "VR-N76" --link /tmp/kiss
+Terminal 2 (sniffer):  ./bin/bt_sniffer /tmp/kiss --link /tmp/kiss-tap
+Terminal 3 (client):   ./bin/ax25tnc -c N0CALL /tmp/kiss-tap
+```
+
+Or with a TCP upstream:
+
+```
+Terminal 1:  ./bin/bt_kiss_bridge --ble --device "VR-N76" --server-port 8001
+Terminal 2:  ./bin/bt_sniffer localhost:8001 --link /tmp/kiss-tap
+Terminal 3:  ./bin/ax25tnc -c N0CALL /tmp/kiss-tap
+```
+
+Output example:
+
+```
+[14:30:01.234]  <- BRIDGE  23 bytes
+    00000000  c0 00 82 a4 64 98 9a 62  40 40 40 40 40 40 e0  |....d..b@@@@@@@|
+    └─ [KISS<-#1 port=0]  AX.25: W1AW -> CQ  [UI]
+
+[14:30:02.111]  -> BRIDGE   4 bytes
+    00000000  c0 01 28 c0                                     |..(.|
+    └─ [KISS->#2 port=0]  ctrl: TXDELAY  val=40 (0x28)
+```
+
+#### PacketLogger — HCI-level BLE sniffer (macOS only)
+
+PacketLogger captures raw HCI packets including ACL data (GATT
+writes/notifies), connection parameters, and CCCD subscription events.
+This is the deepest level of visibility into what CoreBluetooth is actually
+sending to the radio.
+
+**Install:**
+
+1. Download **Additional Tools for Xcode** from
+   `https://developer.apple.com/download/all/`
+   (search "Additional Tools for Xcode", match your Xcode version).
+2. Mount the `.dmg` and copy `Hardware/PacketLogger.app` to `/Applications`.
+
+**Enable HCI logging:**
+
+```bash
+sudo defaults write /Library/Preferences/com.apple.Bluetooth \
+    PacketLoggerLevel -int 4
+
+# Restart Bluetooth daemon to activate:
+sudo pkill bluetoothd
+```
+
+Open PacketLogger, then connect your radio via `bt_kiss_bridge`.  You will
+see `ATT Write Command` packets (GATT write-without-response) carrying your
+KISS frames, and `Handle Value Notification` packets for incoming data.
+This is the best way to verify that the CCCD subscription (notify enable)
+is being acknowledged by the peripheral before writes begin.
+
+To disable logging when done:
+
+```bash
+sudo defaults delete /Library/Preferences/com.apple.Bluetooth PacketLoggerLevel
+sudo pkill bluetoothd
+```
+
+**Useful PacketLogger filters:**
+
+| Filter | Shows |
+|--------|-------|
+| `ATT` | All GATT attribute protocol packets (writes, notifies) |
+| `HCI_EVT` | Connection events, disconnects, errors |
+| `L2CAP` | Raw L2CAP frames (lower level than ATT) |
+
+#### btmon — HCI-level BLE sniffer (Linux only)
+
+```bash
+# Capture to file while running the bridge:
+sudo btmon -w /tmp/bt.log &
+./bin/bt_kiss_bridge --ble --device 38:D2:00:01:61:35
+
+# Review capture:
+sudo btmon -r /tmp/bt.log | less
+
+# Or pipe live to Wireshark:
+sudo btmon -w - | wireshark -k -i -
+```
 
 ---
 
