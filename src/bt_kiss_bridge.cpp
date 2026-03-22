@@ -484,11 +484,6 @@ struct BridgeConfig {
 
     // Classic BT specific
     int bt_channel = 0;  // RFCOMM channel (0 = auto-detect via SDP)
-
-    // Test mode — uses the same connect path as device mode but no PTY/socket
-    bool   test_mode       = false;
-    std::string test_call  = "N0CALL";
-    double test_interval   = 5.0;  // seconds between test frames
 };
 
 // =========================================================================
@@ -1301,146 +1296,73 @@ static void do_sniff(const BridgeConfig& cfg,
 // =========================================================================
 // BRIDGE (device) mode -- transport-agnostic
 // =========================================================================
-static void do_bridge(const BridgeConfig& cfg, RadioTransport& transport) {
-    // -- PTY is created only when NOT in TCP-server mode and NOT in test mode --
-    int master_fd = -1, slave_fd = -1;
-    std::string slave_path;
+// ── Session callbacks ───────────────────────────────────────────────────
+// Modes (device, test) provide callbacks; run_session handles the shared
+// reconnect loop, connect, tnc-init, keep-alive, transport RX, monitor.
 
-    const bool tcp_mode  = (cfg.server_port > 0);
-    const bool test_mode = cfg.test_mode;
+struct SessionContext {
+    const BridgeConfig& cfg;
+    RadioTransport& transport;
+    std::mutex& mx;
+    std::atomic<int>& rx_frames;
+    std::atomic<int>& tx_frames;
+    KissDecoder& tx_decoder;
+};
 
-    if (!tcp_mode && !test_mode) {
-        if (!open_pty(master_fd, slave_fd, slave_path)) return;
+struct SessionCallbacks {
+    // Print mode-specific banner lines (after common device/transport info)
+    std::function<void()> on_banner;
+    // Called once after transport.connect() + tnc_init succeeds
+    std::function<void()> on_connected;
+    // Called each select loop iteration (send test frames, etc.)
+    // Return extra fds to add to the select set.
+    std::function<void(SessionContext&, fd_set& rfds, int& max_fd)> setup_fds;
+    // Called after select returns; handle mode-specific fd reads (PTY, TCP, etc.)
+    std::function<void(SessionContext&, fd_set& rfds)> on_select;
+    // Called when transport has RX data (write to PTY, TCP clients, or display)
+    std::function<void(const uint8_t* data, size_t len)> on_transport_rx;
+    // Final cleanup
+    std::function<void()> on_cleanup;
+};
 
-        // Symlink PTY slave to a stable path
-        if (!cfg.link_path.empty()) {
-            ::unlink(cfg.link_path.c_str());  // remove stale link
-            if (::symlink(slave_path.c_str(), cfg.link_path.c_str()) < 0)
-                std::cerr << "Warning: symlink " << cfg.link_path
-                          << ": " << strerror(errno) << "\n";
-        }
-    }
+// ── run_session — shared reconnect + select loop ────────────────────────
 
-    std::string display_path = (!cfg.link_path.empty()) ? cfg.link_path : slave_path;
-
-    std::cout << hr('=') << "\n";
-    if (test_mode)
-        std::cout << "  " << transport.label() << " KISS Test Mode"
-                  << (cfg.monitor ? " + AX.25 Monitor" : "") << "\n";
-    else if (tcp_mode)
-        std::cout << "  " << transport.label() << " KISS TCP Server Bridge"
-                  << (cfg.monitor ? " + AX.25 Monitor" : "") << "\n";
-    else
-        std::cout << "  " << transport.label() << " KISS Serial Bridge"
-                  << (cfg.monitor ? " + AX.25 Monitor" : "") << "\n";
-    std::cout << hr('=') << "\n";
-    std::cout << "  Device     : " << cfg.address << "\n";
-    std::cout << "  Transport  : " << transport.label() << "\n";
+static void run_session(const BridgeConfig& cfg, RadioTransport& transport,
+                         const std::string& mode_title,
+                         const SessionCallbacks& cb)
+{
+    // -- Banner --
+    std::cout << hr('=') << "\n"
+              << "  " << transport.label() << " " << mode_title
+              << (cfg.monitor ? " + AX.25 Monitor" : "") << "\n"
+              << hr('=') << "\n"
+              << "  Device     : " << cfg.address << "\n"
+              << "  Transport  : " << transport.label() << "\n";
     if (cfg.transport == BridgeConfig::BLE) {
-        std::cout << "  Service    : " << cfg.service_uuid << "\n";
-        if (test_mode) {
-            std::cout << "  Read char  : " << cfg.read_uuid << "  (notify -> test)\n";
-            std::cout << "  Write char : " << cfg.write_uuid << "  (test -> BLE)\n";
-        } else if (tcp_mode) {
-            std::cout << "  Read char  : " << cfg.read_uuid << "  (notify -> TCP clients)\n";
-            std::cout << "  Write char : " << cfg.write_uuid << "  (TCP clients -> BLE)\n";
-        } else {
-            std::cout << "  Read char  : " << cfg.read_uuid << "  (notify -> PTY)\n";
-            std::cout << "  Write char : " << cfg.write_uuid << "  (PTY -> BLE)\n";
-        }
+        std::cout << "  Service    : " << cfg.service_uuid << "\n"
+                  << "  Read char  : " << cfg.read_uuid << "\n"
+                  << "  Write char : " << cfg.write_uuid << "\n";
     } else if (cfg.transport == BridgeConfig::BT) {
         std::cout << "  RFCOMM ch  : " << (cfg.bt_channel > 0
                      ? std::to_string(cfg.bt_channel) : "auto (SDP)") << "\n";
     }
     std::cout << hr() << "\n";
-    if (test_mode) {
-        std::cout << "  Call       : " << cfg.test_call << "\n";
-        std::cout << "  Interval   : " << (int)cfg.test_interval << "s\n";
-        std::cout << "  Sending UI test frames.  Ctrl-C to stop.\n";
-    } else if (!tcp_mode) {
-        std::cout << "  PTY device : " << slave_path << "\n";
-        if (!cfg.link_path.empty())
-            std::cout << "  Symlink    : " << cfg.link_path << "  -> " << slave_path << "\n";
-        std::cout << "\n";
-        std::cout << "  Example:\n      ax25tnc -c W1AW -r W1BBS-1 " << display_path << "\n";
-    }
+    if (cb.on_banner) cb.on_banner();
     std::cout << hr() << "\n  Connecting to " << transport.label() << "...\n";
     std::cout.flush();
 
-    // -- Signal handlers -- treat all termination signals as graceful shutdown
+    // -- Signal handlers --
     signal(SIGINT,  sigint_handler);
     signal(SIGTERM, sigint_handler);
     signal(SIGHUP,  sigint_handler);
     signal(SIGQUIT, sigint_handler);
 
-    // -- TCP server setup (once -- survives reconnects) --
-    int server_sock = -1;
-    std::vector<int> tcp_clients;
     std::mutex mx;
     std::atomic<int> rx_frames{0}, tx_frames{0};
 
-    if (cfg.server_port > 0) {
-        server_sock = ::socket(AF_INET6, SOCK_STREAM, 0);
-        bool bound = false;
-
-        if (server_sock >= 0) {
-            int one = 1;
-            ::setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-            int off = 0;
-            ::setsockopt(server_sock, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
-
-            struct sockaddr_in6 a{};
-            a.sin6_family = AF_INET6;
-            a.sin6_port   = htons(static_cast<uint16_t>(cfg.server_port));
-            if (cfg.server_host.empty()) {
-                a.sin6_addr = in6addr_any;
-            } else {
-                if (::inet_pton(AF_INET6, cfg.server_host.c_str(), &a.sin6_addr) <= 0)
-                    a.sin6_addr = in6addr_any;
-            }
-            bound = (::bind(server_sock, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0);
-        }
-
-        if (!bound) {
-            if (server_sock >= 0) { ::close(server_sock); server_sock = -1; }
-            server_sock = ::socket(AF_INET, SOCK_STREAM, 0);
-            if (server_sock >= 0) {
-                int one = 1;
-                ::setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-                struct sockaddr_in a{};
-                a.sin_family = AF_INET;
-                a.sin_port   = htons(static_cast<uint16_t>(cfg.server_port));
-                if (cfg.server_host.empty()) {
-                    a.sin_addr.s_addr = INADDR_ANY;
-                } else {
-                    ::inet_pton(AF_INET, cfg.server_host.c_str(), &a.sin_addr);
-                }
-                bound = (::bind(server_sock, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0);
-                if (!bound) { ::close(server_sock); server_sock = -1; }
-            }
-        }
-
-        if (server_sock >= 0 && bound) {
-            ::listen(server_sock, 8);
-            int fl = ::fcntl(server_sock, F_GETFL, 0);
-            ::fcntl(server_sock, F_SETFL, fl | O_NONBLOCK);
-            std::cout << "  TCP server : "
-                      << (cfg.server_host.empty() ? "*" : cfg.server_host)
-                      << ":" << cfg.server_port << "\n";
-        } else {
-            std::cerr << "Warning: cannot start TCP server on port "
-                      << cfg.server_port << ": " << strerror(errno) << "\n";
-            server_sock = -1;
-        }
-    }
-
-    // -- Test mode state --
-    int test_tx_count = 0;
-    auto test_next_tx = std::chrono::steady_clock::now();
-
     // -- Reconnect loop --
     static constexpr int MAX_RECONNECTS  = 10;
-    static constexpr int RECONNECT_PAUSE = 5000; // ms between attempts
+    static constexpr int RECONNECT_PAUSE = 5000;
 
     for (int attempt = 0; attempt <= MAX_RECONNECTS && g_running; ++attempt) {
 
@@ -1449,7 +1371,6 @@ static void do_bridge(const BridgeConfig& cfg, RadioTransport& transport) {
                       << attempt << "/" << MAX_RECONNECTS
                       << " -- waiting " << RECONNECT_PAUSE / 1000 << " s...\n";
             std::cout.flush();
-            // Interruptible sleep
             for (int i = 0; i < RECONNECT_PAUSE / 100 && g_running; ++i)
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             if (!g_running) break;
@@ -1460,9 +1381,8 @@ static void do_bridge(const BridgeConfig& cfg, RadioTransport& transport) {
             std::cout.flush();
         }
 
-        g_transport_disc = false;   // reset for this session
+        g_transport_disc = false;
 
-        // Disconnect callback
         transport.set_on_disconnect([&]() {
             std::lock_guard<std::mutex> lk(mx);
             std::cout << "\n  [" << transport.label() << " disconnected]\n";
@@ -1470,236 +1390,108 @@ static void do_bridge(const BridgeConfig& cfg, RadioTransport& transport) {
             g_transport_disc = true;
         });
 
-        if (!transport.connect()) continue; // retry
+        if (!transport.connect()) continue;
 
         if (cfg.tnc_init)
             send_tnc_init(transport);
 
-        if (tcp_mode)
-            std::cout << "  Mode       : TCP server only (no PTY)\n";
+        if (cb.on_connected) cb.on_connected();
+
         std::cout << (cfg.monitor ? "  Monitor on.  Ctrl-C to stop.\n"
                                   : "  Running.     Ctrl-C to stop.\n");
         std::cout.flush();
 
-        // Per-session KISS decoders (reset each reconnect)
-        KissDecoder rx_decoder;  // for fd-based transport reads
+        KissDecoder rx_decoder;
         KissDecoder tx_decoder;
+        SessionContext ctx{cfg, transport, mx, rx_frames, tx_frames, tx_decoder};
 
         // -- Main select loop --
         while (g_running && !g_transport_disc && transport.is_connected()) {
             fd_set rfds;
             FD_ZERO(&rfds);
             int max_fd = 0;
-            if (master_fd >= 0) {
-                FD_SET(master_fd, &rfds);
-                max_fd = master_fd;
-            }
-            if (server_sock >= 0) {
-                FD_SET(server_sock, &rfds);
-                max_fd = std::max(max_fd, server_sock);
-            }
 
-            std::vector<int> clients_snap;
-            {
-                std::lock_guard<std::mutex> lk(mx);
-                clients_snap = tcp_clients;
-            }
-            for (int fd : clients_snap) {
-                FD_SET(fd, &rfds);
-                max_fd = std::max(max_fd, fd);
-            }
-
-            // If transport has a readable fd (BT), add it
             int tfd = transport.read_fd();
             if (tfd >= 0) {
                 FD_SET(tfd, &rfds);
                 max_fd = std::max(max_fd, tfd);
             }
 
-            struct timeval tv{0, 50000};  // 50 ms (shorter for pump responsiveness)
+            // Mode-specific fds (PTY, TCP server, TCP clients)
+            if (cb.setup_fds) cb.setup_fds(ctx, rfds, max_fd);
+
+            struct timeval tv{0, 50000};
             bool got_any = select(max_fd + 1, &rfds, nullptr, nullptr, &tv) > 0;
 
-            // Pump platform run loop (macOS BT delivers delegate
-            // callbacks via the main thread's NSRunLoop)
             transport.pump();
 
-            // BLE keep-alive (only for BLE transport)
+            // BLE keep-alive
             auto* ble_tp = dynamic_cast<BleTransport*>(&transport);
             if (ble_tp) {
                 bool sent = ble_tp->maybe_keepalive();
                 if (sent && cfg.monitor && cfg.show_keepalive) {
                     std::lock_guard<std::mutex> lk(mx);
-                    std::cout << "\n" << hr() << "\n";
-                    std::cout << "[" << ts() << "]  BLE keep-alive  (KISS null)\n";
+                    std::cout << "\n" << hr() << "\n"
+                              << "[" << ts() << "]  BLE keep-alive  (KISS null)\n";
                     std::cout.flush();
                 }
             }
 
-            // Test mode: send periodic UI test frames
-            if (test_mode) {
-                auto now = std::chrono::steady_clock::now();
-                if (now >= test_next_tx) {
-                    ++test_tx_count;
-                    char info[32];
-                    std::snprintf(info, sizeof(info), "Test %03d", test_tx_count);
-                    auto frame = build_kiss_ui(cfg.test_call, "CQ", info);
+            // Mode-specific iteration (test frames, etc.) — runs even if !got_any
+            if (cb.on_select) cb.on_select(ctx, rfds);
 
-                    {
-                        std::lock_guard<std::mutex> lk(mx);
-                        std::cout << "[" << ts() << "]  TX >> #" << test_tx_count
-                                  << "  " << cfg.test_call << ">CQ [UI] \""
-                                  << info << "\"  (" << frame.size() << "B)\n";
-                        std::cout << "              ";
-                        test_hex_dump(frame.data(), frame.size());
-                        std::cout.flush();
-                    }
-
-                    transport.write(frame.data(), frame.size());
-                    ++tx_frames;
-                    test_next_tx = now + std::chrono::milliseconds(
-                        (long long)(cfg.test_interval * 1000));
-                }
-            }
-
-            if (!got_any) continue;
-
-            // Accept new TCP client
-            if (server_sock >= 0 && FD_ISSET(server_sock, &rfds)) {
-                int cli = ::accept(server_sock, nullptr, nullptr);
-                if (cli >= 0) {
-                    int one = 1;
-                    ::setsockopt(cli, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-                    int fl = ::fcntl(cli, F_GETFL, 0);
-                    ::fcntl(cli, F_SETFL, fl | O_NONBLOCK);
-                    {
-                        std::lock_guard<std::mutex> lk(mx);
-                        tcp_clients.push_back(cli);
-                        if (cfg.monitor) {
-                            std::cout << "\n" << hr() << "\n";
-                            std::cout << "[" << ts() << "]  TCP client connected  fd="
-                                      << cli << "\n";
-                            std::cout.flush();
-                        }
-                    }
-                }
-            }
-
-            // Read from TCP clients -> transport
-            for (int fd : clients_snap) {
-                if (!FD_ISSET(fd, &rfds)) continue;
-                uint8_t tbuf[4096];
-                ssize_t tn = ::read(fd, tbuf, sizeof(tbuf));
-                if (tn <= 0) {
-                    ::close(fd);
-                    {
-                        std::lock_guard<std::mutex> lk(mx);
-                        tcp_clients.erase(
-                            std::remove(tcp_clients.begin(), tcp_clients.end(), fd),
-                            tcp_clients.end());
-                        if (cfg.monitor) {
-                            std::cout << "\n" << hr() << "\n";
-                            std::cout << "[" << ts() << "]  TCP client disconnected  fd="
-                                      << fd << "\n";
-                            std::cout.flush();
-                        }
-                    }
-                    continue;
-                }
-
-                ++tx_frames;
-                if (cfg.monitor) {
-                    std::lock_guard<std::mutex> lk(mx);
-                    std::string t = ts();
-                    auto frames = tx_decoder.feed(tbuf, (size_t)tn);
-                    if (frames.empty()) {
-                        std::cout << DIM() << "[" << t << "]  -> " << transport.label()
-                                  << "  " << tn << " bytes (buffering)\n"
-                                  << hex_dump(tbuf, (size_t)tn, "           ") << RESET();
-                    }
-                    for (auto& kf : frames) {
-                        if (kf.type == 0 && !kf.payload.empty()) {
-                            auto ax = decode_ax25(kf.payload.data(), kf.payload.size());
-                            std::cout << "[" << t << "]  -> " << transport.label()
-                                      << "  " << ax.summary << "\n";
-                            print_frame_detail(ax, kf.payload.data(), kf.payload.size());
-                        } else {
-                            static constexpr const char* cmd_names[] =
-                                {"DATA","TXDELAY","P","SLOTTIME","TXTAIL",
-                                 "FULLDUPLEX","SETHW","?","?","?","?","?","?","?","?","RETURN"};
-                            std::cout << DIM() << "[" << t << "]  -> " << transport.label()
-                                      << "  KISS cmd=" << cmd_names[kf.type & 0xF]
-                                      << " port=" << kf.port
-                                      << "  " << kf.payload.size() << " bytes\n";
-                            if (!kf.payload.empty())
-                                std::cout << hex_dump(kf.payload.data(), kf.payload.size(), "           ");
-                            std::cout << RESET();
-                        }
-                    }
-                    std::cout.flush();
-                }
-                transport.write(tbuf, (size_t)tn);
-            }
-
-            // Read from transport fd -> PTY + TCP clients (fd-based transports: BT)
-            if (tfd >= 0 && FD_ISSET(tfd, &rfds)) {
+            // Transport RX → mode callback + monitor
+            if (tfd >= 0 && got_any && FD_ISSET(tfd, &rfds)) {
                 uint8_t rbuf[4096];
                 ssize_t rn = ::read(tfd, rbuf, sizeof(rbuf));
                 if (rn <= 0) {
-                    // Transport read error -- treat as disconnect
                     if (rn == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
                         std::lock_guard<std::mutex> lk(mx);
-                        std::cout << "\n  [" << transport.label() << " read error / disconnected]\n";
+                        std::cout << "\n  [" << transport.label()
+                                  << " read error / disconnected]\n";
                         std::cout.flush();
                         g_transport_disc = true;
                         continue;
                     }
                 } else {
-                    std::lock_guard<std::mutex> lk(mx);
-
-                    if (master_fd >= 0 && ::write(master_fd, rbuf, (size_t)rn) < 0)
-                        std::cerr << "  PTY write error: " << strerror(errno) << "\n";
-
-                    std::vector<int> dead;
-                    for (int cfd : tcp_clients) {
-                        if (::write(cfd, rbuf, (size_t)rn) < 0) dead.push_back(cfd);
-                    }
-                    for (int cfd : dead) {
-                        tcp_clients.erase(
-                            std::remove(tcp_clients.begin(), tcp_clients.end(), cfd),
-                            tcp_clients.end());
-                        ::close(cfd);
-                        if (cfg.monitor)
-                            std::cout << "[" << ts() << "]  TCP client fd=" << cfd
-                                      << " removed (write error)\n";
-                    }
-
                     ++rx_frames;
 
+                    if (cb.on_transport_rx) cb.on_transport_rx(rbuf, (size_t)rn);
+
                     if (cfg.monitor) {
+                        std::lock_guard<std::mutex> lk(mx);
                         std::string t = ts();
                         auto frames = rx_decoder.feed(rbuf, (size_t)rn);
-
                         if (frames.empty()) {
-                            std::cout << DIM() << "[" << t << "]  <- " << transport.label()
-                                      << "  " << rn << " bytes (buffering)\n"
-                                      << hex_dump(rbuf, (size_t)rn, "           ") << RESET();
+                            std::cout << DIM() << "[" << t << "]  <- "
+                                      << transport.label() << "  " << rn
+                                      << " bytes (buffering)\n"
+                                      << hex_dump(rbuf, (size_t)rn, "           ")
+                                      << RESET();
                         }
                         for (auto& kf : frames) {
                             if (kf.type == 0 && !kf.payload.empty()) {
-                                auto ax = decode_ax25(kf.payload.data(), kf.payload.size());
-                                std::cout << "[" << t << "]  <- " << transport.label()
-                                          << "  " << ax.summary << "\n";
-                                print_frame_detail(ax, kf.payload.data(), kf.payload.size());
+                                auto ax = decode_ax25(kf.payload.data(),
+                                                       kf.payload.size());
+                                std::cout << "[" << t << "]  <- "
+                                          << transport.label() << "  "
+                                          << ax.summary << "\n";
+                                print_frame_detail(ax, kf.payload.data(),
+                                                   kf.payload.size());
                             } else {
                                 static constexpr const char* cmd_names[] =
                                     {"DATA","TXDELAY","P","SLOTTIME","TXTAIL",
-                                     "FULLDUPLEX","SETHW","?","?","?","?","?","?","?","?","RETURN"};
-                                std::cout << DIM() << "[" << t << "]  <- " << transport.label()
-                                          << "  KISS cmd="
-                                          << cmd_names[kf.type & 0xF] << " port=" << kf.port
-                                          << "  " << kf.payload.size() << " bytes\n";
+                                     "FULLDUPLEX","SETHW","?","?","?","?","?",
+                                     "?","?","?","RETURN"};
+                                std::cout << DIM() << "[" << t << "]  <- "
+                                          << transport.label() << "  KISS cmd="
+                                          << cmd_names[kf.type & 0xF]
+                                          << " port=" << kf.port << "  "
+                                          << kf.payload.size() << " bytes\n";
                                 if (!kf.payload.empty())
-                                    std::cout << hex_dump(kf.payload.data(), kf.payload.size(), "           ");
+                                    std::cout << hex_dump(kf.payload.data(),
+                                                          kf.payload.size(),
+                                                          "           ");
                                 std::cout << RESET();
                             }
                         }
@@ -1708,75 +1500,334 @@ static void do_bridge(const BridgeConfig& cfg, RadioTransport& transport) {
                 }
             }
 
-            // Read from PTY -> transport (serial mode only)
-            if (master_fd < 0 || !FD_ISSET(master_fd, &rfds)) continue;
+        }  // end session main loop
 
-            uint8_t buf[4096];
-            ssize_t nr = ::read(master_fd, buf, sizeof(buf));
-            if (nr <= 0) continue;
+        transport.disconnect();
+        if (!g_running) break;
 
-            ++tx_frames;
-            if (cfg.monitor) {
-                std::lock_guard<std::mutex> lk(mx);
+        if (attempt == MAX_RECONNECTS) {
+            std::cout << "[" << ts()
+                      << "]  Max reconnect attempts reached.  Giving up.\n";
+        }
+    }  // end reconnect loop
+
+    if (cb.on_cleanup) cb.on_cleanup();
+
+    std::cout << "\n" << hr() << "\n"
+              << "  Session ended.  RX frames: " << rx_frames.load()
+              << "  TX frames: " << tx_frames.load() << "\n"
+              << hr() << "\n";
+}
+
+// ── do_device — PTY/TCP bridge mode ─────────────────────────────────────
+
+static void do_device(const BridgeConfig& cfg, RadioTransport& transport) {
+    int master_fd = -1, slave_fd = -1;
+    std::string slave_path;
+    const bool tcp_mode = (cfg.server_port > 0);
+
+    if (!tcp_mode) {
+        if (!open_pty(master_fd, slave_fd, slave_path)) return;
+        if (!cfg.link_path.empty()) {
+            ::unlink(cfg.link_path.c_str());
+            if (::symlink(slave_path.c_str(), cfg.link_path.c_str()) < 0)
+                std::cerr << "Warning: symlink " << cfg.link_path
+                          << ": " << strerror(errno) << "\n";
+        }
+    }
+
+    std::string display_path = (!cfg.link_path.empty()) ? cfg.link_path : slave_path;
+
+    // TCP server socket (survives reconnects)
+    int server_sock = -1;
+    std::vector<int> tcp_clients;
+
+    if (cfg.server_port > 0) {
+        server_sock = ::socket(AF_INET6, SOCK_STREAM, 0);
+        bool bound = false;
+        if (server_sock >= 0) {
+            int one = 1;
+            ::setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+            int off = 0;
+            ::setsockopt(server_sock, IPPROTO_IPV6, IPV6_V6ONLY, &off, sizeof(off));
+            struct sockaddr_in6 a{};
+            a.sin6_family = AF_INET6;
+            a.sin6_port   = htons(static_cast<uint16_t>(cfg.server_port));
+            if (cfg.server_host.empty()) a.sin6_addr = in6addr_any;
+            else if (::inet_pton(AF_INET6, cfg.server_host.c_str(), &a.sin6_addr) <= 0)
+                a.sin6_addr = in6addr_any;
+            bound = (::bind(server_sock, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0);
+        }
+        if (!bound) {
+            if (server_sock >= 0) { ::close(server_sock); server_sock = -1; }
+            server_sock = ::socket(AF_INET, SOCK_STREAM, 0);
+            if (server_sock >= 0) {
+                int one = 1;
+                ::setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+                struct sockaddr_in a{};
+                a.sin_family = AF_INET;
+                a.sin_port   = htons(static_cast<uint16_t>(cfg.server_port));
+                if (cfg.server_host.empty()) a.sin_addr.s_addr = INADDR_ANY;
+                else ::inet_pton(AF_INET, cfg.server_host.c_str(), &a.sin_addr);
+                bound = (::bind(server_sock, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0);
+                if (!bound) { ::close(server_sock); server_sock = -1; }
+            }
+        }
+        if (server_sock >= 0 && bound) {
+            ::listen(server_sock, 8);
+            int fl = ::fcntl(server_sock, F_GETFL, 0);
+            ::fcntl(server_sock, F_SETFL, fl | O_NONBLOCK);
+        } else {
+            std::cerr << "Warning: cannot start TCP server on port "
+                      << cfg.server_port << ": " << strerror(errno) << "\n";
+            server_sock = -1;
+        }
+    }
+
+    SessionCallbacks cb;
+
+    cb.on_banner = [&]() {
+        if (tcp_mode) {
+            std::cout << "  TCP server : "
+                      << (cfg.server_host.empty() ? "*" : cfg.server_host)
+                      << ":" << cfg.server_port << "\n";
+        } else {
+            std::cout << "  PTY device : " << slave_path << "\n";
+            if (!cfg.link_path.empty())
+                std::cout << "  Symlink    : " << cfg.link_path
+                          << "  -> " << slave_path << "\n";
+            std::cout << "\n  Example:\n      ax25tnc -c W1AW -r W1BBS-1 "
+                      << display_path << "\n";
+        }
+    };
+
+    cb.on_connected = [&]() {
+        if (tcp_mode)
+            std::cout << "  Mode       : TCP server only (no PTY)\n";
+    };
+
+    cb.setup_fds = [&](SessionContext&, fd_set& rfds, int& max_fd) {
+        if (master_fd >= 0) {
+            FD_SET(master_fd, &rfds);
+            max_fd = std::max(max_fd, master_fd);
+        }
+        if (server_sock >= 0) {
+            FD_SET(server_sock, &rfds);
+            max_fd = std::max(max_fd, server_sock);
+        }
+        for (int fd : tcp_clients) {
+            FD_SET(fd, &rfds);
+            max_fd = std::max(max_fd, fd);
+        }
+    };
+
+    cb.on_select = [&](SessionContext& ctx, fd_set& rfds) {
+        auto& transport = ctx.transport;
+
+        // Accept new TCP client
+        if (server_sock >= 0 && FD_ISSET(server_sock, &rfds)) {
+            int cli = ::accept(server_sock, nullptr, nullptr);
+            if (cli >= 0) {
+                int one = 1;
+                ::setsockopt(cli, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+                int fl = ::fcntl(cli, F_GETFL, 0);
+                ::fcntl(cli, F_SETFL, fl | O_NONBLOCK);
+                tcp_clients.push_back(cli);
+                if (ctx.cfg.monitor) {
+                    std::lock_guard<std::mutex> lk(ctx.mx);
+                    std::cout << "\n" << hr() << "\n"
+                              << "[" << ts() << "]  TCP client connected  fd="
+                              << cli << "\n";
+                    std::cout.flush();
+                }
+            }
+        }
+
+        // Read from TCP clients → transport
+        std::vector<int> dead_clients;
+        for (int fd : tcp_clients) {
+            if (!FD_ISSET(fd, &rfds)) continue;
+            uint8_t tbuf[4096];
+            ssize_t tn = ::read(fd, tbuf, sizeof(tbuf));
+            if (tn <= 0) {
+                dead_clients.push_back(fd);
+                continue;
+            }
+            ++ctx.tx_frames;
+            if (ctx.cfg.monitor) {
+                std::lock_guard<std::mutex> lk(ctx.mx);
                 std::string t = ts();
-                auto frames = tx_decoder.feed(buf, (size_t)nr);
+                auto frames = ctx.tx_decoder.feed(tbuf, (size_t)tn);
                 if (frames.empty()) {
-                    std::cout << DIM() << "[" << t << "]  -> " << transport.label()
-                              << "  " << nr << " bytes (buffering)\n"
-                              << hex_dump(buf, (size_t)nr, "           ") << RESET();
+                    std::cout << DIM() << "[" << t << "]  -> "
+                              << transport.label() << "  " << tn
+                              << " bytes (buffering)\n"
+                              << hex_dump(tbuf, (size_t)tn, "           ")
+                              << RESET();
                 }
                 for (auto& kf : frames) {
                     if (kf.type == 0 && !kf.payload.empty()) {
-                        auto ax = decode_ax25(kf.payload.data(), kf.payload.size());
-                        std::cout << "[" << t << "]  -> " << transport.label()
-                                  << "  " << ax.summary << "\n";
-                        print_frame_detail(ax, kf.payload.data(), kf.payload.size());
+                        auto ax = decode_ax25(kf.payload.data(),
+                                               kf.payload.size());
+                        std::cout << "[" << t << "]  -> "
+                                  << transport.label() << "  "
+                                  << ax.summary << "\n";
+                        print_frame_detail(ax, kf.payload.data(),
+                                           kf.payload.size());
                     } else {
                         static constexpr const char* cmd_names[] =
                             {"DATA","TXDELAY","P","SLOTTIME","TXTAIL",
-                             "FULLDUPLEX","SETHW","?","?","?","?","?","?","?","?","RETURN"};
-                        std::cout << DIM() << "[" << t << "]  -> " << transport.label()
-                                  << "  KISS cmd=" << cmd_names[kf.type & 0xF]
-                                  << " port=" << kf.port
-                                  << "  " << kf.payload.size() << " bytes\n";
+                             "FULLDUPLEX","SETHW","?","?","?","?","?",
+                             "?","?","?","RETURN"};
+                        std::cout << DIM() << "[" << t << "]  -> "
+                                  << transport.label() << "  KISS cmd="
+                                  << cmd_names[kf.type & 0xF]
+                                  << " port=" << kf.port << "  "
+                                  << kf.payload.size() << " bytes\n";
                         if (!kf.payload.empty())
-                            std::cout << hex_dump(kf.payload.data(), kf.payload.size(), "           ");
+                            std::cout << hex_dump(kf.payload.data(),
+                                                  kf.payload.size(),
+                                                  "           ");
                         std::cout << RESET();
                     }
                 }
                 std::cout.flush();
             }
-            transport.write(buf, (size_t)nr);
-        }  // end session main loop
-
-        transport.disconnect();
-
-        if (!g_running) break;   // SIGINT -- stop immediately
-
-        // g_transport_disc is true here: outer for-loop will retry if attempts remain
-        if (attempt == MAX_RECONNECTS) {
-            std::cout << "[" << ts()
-                      << "]  Max reconnect attempts reached.  Giving up.\n";
+            transport.write(tbuf, (size_t)tn);
+        }
+        for (int fd : dead_clients) {
+            ::close(fd);
+            tcp_clients.erase(
+                std::remove(tcp_clients.begin(), tcp_clients.end(), fd),
+                tcp_clients.end());
+            if (ctx.cfg.monitor) {
+                std::lock_guard<std::mutex> lk(ctx.mx);
+                std::cout << "\n" << hr() << "\n"
+                          << "[" << ts() << "]  TCP client disconnected  fd="
+                          << fd << "\n";
+                std::cout.flush();
+            }
         }
 
-    }  // end reconnect loop
+        // Read from PTY → transport
+        if (master_fd >= 0 && FD_ISSET(master_fd, &rfds)) {
+            uint8_t buf[4096];
+            ssize_t nr = ::read(master_fd, buf, sizeof(buf));
+            if (nr > 0) {
+                ++ctx.tx_frames;
+                if (ctx.cfg.monitor) {
+                    std::lock_guard<std::mutex> lk(ctx.mx);
+                    std::string t = ts();
+                    auto frames = ctx.tx_decoder.feed(buf, (size_t)nr);
+                    if (frames.empty()) {
+                        std::cout << DIM() << "[" << t << "]  -> "
+                                  << transport.label() << "  " << nr
+                                  << " bytes (buffering)\n"
+                                  << hex_dump(buf, (size_t)nr, "           ")
+                                  << RESET();
+                    }
+                    for (auto& kf : frames) {
+                        if (kf.type == 0 && !kf.payload.empty()) {
+                            auto ax = decode_ax25(kf.payload.data(),
+                                                   kf.payload.size());
+                            std::cout << "[" << t << "]  -> "
+                                      << transport.label() << "  "
+                                      << ax.summary << "\n";
+                            print_frame_detail(ax, kf.payload.data(),
+                                               kf.payload.size());
+                        } else {
+                            static constexpr const char* cmd_names[] =
+                                {"DATA","TXDELAY","P","SLOTTIME","TXTAIL",
+                                 "FULLDUPLEX","SETHW","?","?","?","?","?",
+                                 "?","?","?","RETURN"};
+                            std::cout << DIM() << "[" << t << "]  -> "
+                                      << transport.label() << "  KISS cmd="
+                                      << cmd_names[kf.type & 0xF]
+                                      << " port=" << kf.port << "  "
+                                      << kf.payload.size() << " bytes\n";
+                            if (!kf.payload.empty())
+                                std::cout << hex_dump(kf.payload.data(),
+                                                      kf.payload.size(),
+                                                      "           ");
+                            std::cout << RESET();
+                        }
+                    }
+                    std::cout.flush();
+                }
+                transport.write(buf, (size_t)nr);
+            }
+        }
+    };
 
-    // -- Final cleanup (TCP server, PTY) --
-    if (server_sock >= 0) { ::close(server_sock); }
-    {
-        std::lock_guard<std::mutex> lk(mx);
+    cb.on_transport_rx = [&](const uint8_t* data, size_t len) {
+        if (master_fd >= 0 && ::write(master_fd, data, len) < 0)
+            std::cerr << "  PTY write error: " << strerror(errno) << "\n";
+        std::vector<int> dead;
+        for (int cfd : tcp_clients) {
+            if (::write(cfd, data, len) < 0) dead.push_back(cfd);
+        }
+        for (int cfd : dead) {
+            tcp_clients.erase(
+                std::remove(tcp_clients.begin(), tcp_clients.end(), cfd),
+                tcp_clients.end());
+            ::close(cfd);
+        }
+    };
+
+    cb.on_cleanup = [&]() {
+        if (server_sock >= 0) ::close(server_sock);
         for (int fd : tcp_clients) ::close(fd);
-        tcp_clients.clear();
-    }
+        if (master_fd >= 0) ::close(master_fd);
+        if (slave_fd  >= 0) ::close(slave_fd);
+        if (!tcp_mode && !cfg.link_path.empty()) ::unlink(cfg.link_path.c_str());
+    };
 
-    if (master_fd >= 0) ::close(master_fd);
-    if (slave_fd  >= 0) ::close(slave_fd);
-    if (!tcp_mode && !cfg.link_path.empty()) ::unlink(cfg.link_path.c_str());
+    std::string title = tcp_mode ? "KISS TCP Server Bridge" : "KISS Serial Bridge";
+    run_session(cfg, transport, title, cb);
+}
 
-    std::cout << "\n" << hr() << "\n";
-    std::cout << "  Session ended.  RX frames: " << rx_frames.load()
-              << "  TX frames: " << tx_frames.load() << "\n";
-    std::cout << hr() << "\n";
+// ── do_test — test mode (no PTY, no socket) ─────────────────────────────
+
+static void do_test(const BridgeConfig& cfg, RadioTransport& transport,
+                     const std::string& call, double interval_s)
+{
+    int tx_count = 0;
+    auto next_tx = std::chrono::steady_clock::now();
+
+    SessionCallbacks cb;
+
+    cb.on_banner = [&]() {
+        std::cout << "  Call       : " << call << "\n"
+                  << "  Interval   : " << (int)interval_s << "s\n"
+                  << "  Sending UI test frames.  Ctrl-C to stop.\n";
+    };
+
+    cb.on_select = [&](SessionContext& ctx, fd_set&) {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= next_tx) {
+            ++tx_count;
+            char info[32];
+            std::snprintf(info, sizeof(info), "Test %03d", tx_count);
+            auto frame = build_kiss_ui(call, "CQ", info);
+
+            {
+                std::lock_guard<std::mutex> lk(ctx.mx);
+                std::cout << "[" << ts() << "]  TX >> #" << tx_count
+                          << "  " << call << ">CQ [UI] \""
+                          << info << "\"  (" << frame.size() << "B)\n"
+                          << "              ";
+                test_hex_dump(frame.data(), frame.size());
+                std::cout.flush();
+            }
+
+            ctx.transport.write(frame.data(), frame.size());
+            ++ctx.tx_frames;
+            next_tx = now + std::chrono::milliseconds(
+                (long long)(interval_s * 1000));
+        }
+    };
+
+    run_session(cfg, transport, "KISS Test Mode", cb);
 }
 
 // =========================================================================
@@ -1939,20 +1990,15 @@ int main(int argc, char* argv[]) {
     }
     if (mode == "test") {
         cfg.timeout = timeout;
-        cfg.test_mode = true;
-        cfg.test_call = test_call;
-        cfg.test_interval = test_interval;
         cfg.monitor = true;  // always monitor in test mode
-        // Auto BLE for test mode (BLE preferred)
         if (cfg.transport == BridgeConfig::AUTO)
             cfg.transport = BridgeConfig::BLE;
-        // Use the same bridge path as --device (no PTY, no socket)
         if (cfg.transport == BridgeConfig::BLE) {
             BleTransport ble(cfg);
-            do_bridge(cfg, ble);
+            do_test(cfg, ble, test_call, test_interval);
         } else {
             BtTransport bt(cfg.address, cfg.bt_channel);
-            do_bridge(cfg, bt);
+            do_test(cfg, bt, test_call, test_interval);
         }
         return 0;
     }
@@ -1982,12 +2028,11 @@ int main(int argc, char* argv[]) {
 
     // Validate required options per transport
     if (cfg.transport == BridgeConfig::BLE) {
-        // UUIDs are optional — auto-detected at connect time if not specified
         BleTransport ble(cfg);
-        do_bridge(cfg, ble);
+        do_device(cfg, ble);
     } else {
         BtTransport bt(cfg.address, cfg.bt_channel);
-        do_bridge(cfg, bt);
+        do_device(cfg, bt);
     }
 
     return 0;

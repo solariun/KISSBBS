@@ -915,8 +915,14 @@ static DBusMessage* build_write_msg(const std::string& char_path,
 }
 
 // Write via a dedicated conn_write connection (no dispatch thread on it).
-// Uses blocking send_with_reply_and_block — safe because conn_write is
-// never used by the dispatch thread.
+//
+// write-without-response ("command"): fire-and-forget via dbus_connection_send()
+//   + flush — matches SimpleBLE's write_command() and macOS dispatch_async.
+//   BlueZ accepts the D-Bus call immediately; BLE sends without ACK.
+//
+// write-with-response ("request"): blocking send_with_reply_and_block() —
+//   waits for BlueZ to confirm the BLE-level ACK from the peripheral.
+//
 // Return: 1 = ok, 0 = permanent error, -1 = "In Progress" (transient, retry)
 static int gatt_write_once(DBusConnection* conn_write, const std::string& char_path,
                             const uint8_t* data, size_t len,
@@ -925,6 +931,19 @@ static int gatt_write_once(DBusConnection* conn_write, const std::string& char_p
     DBusMessage* msg = build_write_msg(char_path, data, len, with_response);
     if (!msg) return 0;
 
+    if (!with_response) {
+        // Fire-and-forget for write-without-response (command)
+        dbus_uint32_t serial = 0;
+        if (!dbus_connection_send(conn_write, msg, &serial)) {
+            dbus_message_unref(msg);
+            return 0;
+        }
+        dbus_message_unref(msg);
+        dbus_connection_flush(conn_write);
+        return 1;
+    }
+
+    // Blocking for write-with-response (request)
     DBusError err;
     dbus_error_init(&err);
     DBusMessage* reply = dbus_connection_send_with_reply_and_block(
