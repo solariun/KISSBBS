@@ -484,6 +484,11 @@ struct BridgeConfig {
 
     // Classic BT specific
     int bt_channel = 0;  // RFCOMM channel (0 = auto-detect via SDP)
+
+    // Test mode — uses the same connect path as device mode but no PTY/socket
+    bool   test_mode       = false;
+    std::string test_call  = "N0CALL";
+    double test_interval   = 5.0;  // seconds between test frames
 };
 
 // =========================================================================
@@ -1112,100 +1117,6 @@ static void send_tnc_init(RadioTransport& transport, int txdelay_ms = 400,
     std::cout.flush();
 }
 
-static void do_test(const BridgeConfig& cfg, const std::string& call, double interval_s) {
-    std::cout << hr('=') << "\n"
-              << "  BLE KISS Test Mode\n"
-              << hr('=') << "\n"
-              << "  Device : " << cfg.address << "\n"
-              << hr() << "\n"
-              << "  Connecting...\n";
-    std::cout.flush();
-
-    BleTransport transport(cfg);
-    if (!transport.connect()) {
-        std::cerr << "[TEST] Connection failed.\n";
-        return;
-    }
-
-    if (cfg.tnc_init)
-        send_tnc_init(transport);
-
-    if (cfg.ble_ka_ms > 0)
-        std::cout << "  BLE keep-alive: " << cfg.ble_ka_ms / 1000 << "s  (KISS null writes)\n";
-    std::cout << hr() << "\n"
-              << "  Sending UI test frames every " << (int)interval_s << "s.  Ctrl-C to stop.\n"
-              << "  RX data shown as hex dump.\n"
-              << hr() << "\n\n";
-    std::cout.flush();
-
-    signal(SIGINT,  sigint_handler);
-    signal(SIGTERM, sigint_handler);
-
-    int tx_count = 0, rx_count = 0;
-    auto next_tx = std::chrono::steady_clock::now();
-    auto next_ka = std::chrono::steady_clock::now()
-                 + std::chrono::milliseconds(cfg.ble_ka_ms > 0 ? cfg.ble_ka_ms : 5000);
-
-    uint8_t rx_buf[512];
-    int rx_fd = transport.read_fd();
-
-    while (g_running && transport.is_connected()) {
-        auto now = std::chrono::steady_clock::now();
-
-        // Send test frame
-        if (now >= next_tx) {
-            ++tx_count;
-            char info[32];
-            std::snprintf(info, sizeof(info), "Test %03d", tx_count);
-            auto frame = build_kiss_ui(call, "CQ", info);
-
-            std::printf("[%s]  TX >> #%d  %s>CQ [UI] \"%s\"  (%zuB)\n",
-                        ts().c_str(), tx_count, call.c_str(), info, frame.size());
-            std::printf("              ");
-            test_hex_dump(frame.data(), frame.size());
-            std::fflush(stdout);
-
-            transport.write(frame.data(), frame.size());
-            next_tx = now + std::chrono::milliseconds((long long)(interval_s * 1000));
-        }
-
-        // Keep-alive
-        if (cfg.ble_ka_ms > 0 && now >= next_ka) {
-            static const uint8_t ka[] = {0xC0, 0xC0};
-            transport.write(ka, 2);
-            next_ka = now + std::chrono::milliseconds(cfg.ble_ka_ms);
-        }
-
-        // Pump platform run loop (macOS BT)
-        transport.pump();
-
-        // Check for RX data
-        if (rx_fd >= 0) {
-            fd_set rfds;
-            FD_ZERO(&rfds);
-            FD_SET(rx_fd, &rfds);
-            struct timeval tv{0, 50000};  // 50ms
-            int r = ::select(rx_fd + 1, &rfds, nullptr, nullptr, &tv);
-            if (r > 0 && FD_ISSET(rx_fd, &rfds)) {
-                ssize_t n = ::read(rx_fd, rx_buf, sizeof(rx_buf));
-                if (n > 0) {
-                    ++rx_count;
-                    std::printf("[%s]  RX << (%zdB):", ts().c_str(), n);
-                    test_hex_dump(rx_buf, (size_t)n);
-                    std::fflush(stdout);
-                }
-            }
-        } else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-    }
-
-    transport.disconnect();
-
-    std::cout << hr() << "\n"
-              << "  Test ended.  TX: " << tx_count << "  RX: " << rx_count << "\n"
-              << hr() << "\n";
-}
 
 // =========================================================================
 // SNIFF mode -- connect and show raw BLE/BT traffic with KISS/AX.25 decode
@@ -1391,13 +1302,14 @@ static void do_sniff(const BridgeConfig& cfg,
 // BRIDGE (device) mode -- transport-agnostic
 // =========================================================================
 static void do_bridge(const BridgeConfig& cfg, RadioTransport& transport) {
-    // -- PTY is created only when NOT in TCP-server mode --
+    // -- PTY is created only when NOT in TCP-server mode and NOT in test mode --
     int master_fd = -1, slave_fd = -1;
     std::string slave_path;
 
-    const bool tcp_mode = (cfg.server_port > 0);
+    const bool tcp_mode  = (cfg.server_port > 0);
+    const bool test_mode = cfg.test_mode;
 
-    if (!tcp_mode) {
+    if (!tcp_mode && !test_mode) {
         if (!open_pty(master_fd, slave_fd, slave_path)) return;
 
         // Symlink PTY slave to a stable path
@@ -1412,7 +1324,10 @@ static void do_bridge(const BridgeConfig& cfg, RadioTransport& transport) {
     std::string display_path = (!cfg.link_path.empty()) ? cfg.link_path : slave_path;
 
     std::cout << hr('=') << "\n";
-    if (tcp_mode)
+    if (test_mode)
+        std::cout << "  " << transport.label() << " KISS Test Mode"
+                  << (cfg.monitor ? " + AX.25 Monitor" : "") << "\n";
+    else if (tcp_mode)
         std::cout << "  " << transport.label() << " KISS TCP Server Bridge"
                   << (cfg.monitor ? " + AX.25 Monitor" : "") << "\n";
     else
@@ -1423,7 +1338,10 @@ static void do_bridge(const BridgeConfig& cfg, RadioTransport& transport) {
     std::cout << "  Transport  : " << transport.label() << "\n";
     if (cfg.transport == BridgeConfig::BLE) {
         std::cout << "  Service    : " << cfg.service_uuid << "\n";
-        if (tcp_mode) {
+        if (test_mode) {
+            std::cout << "  Read char  : " << cfg.read_uuid << "  (notify -> test)\n";
+            std::cout << "  Write char : " << cfg.write_uuid << "  (test -> BLE)\n";
+        } else if (tcp_mode) {
             std::cout << "  Read char  : " << cfg.read_uuid << "  (notify -> TCP clients)\n";
             std::cout << "  Write char : " << cfg.write_uuid << "  (TCP clients -> BLE)\n";
         } else {
@@ -1435,7 +1353,11 @@ static void do_bridge(const BridgeConfig& cfg, RadioTransport& transport) {
                      ? std::to_string(cfg.bt_channel) : "auto (SDP)") << "\n";
     }
     std::cout << hr() << "\n";
-    if (!tcp_mode) {
+    if (test_mode) {
+        std::cout << "  Call       : " << cfg.test_call << "\n";
+        std::cout << "  Interval   : " << (int)cfg.test_interval << "s\n";
+        std::cout << "  Sending UI test frames.  Ctrl-C to stop.\n";
+    } else if (!tcp_mode) {
         std::cout << "  PTY device : " << slave_path << "\n";
         if (!cfg.link_path.empty())
             std::cout << "  Symlink    : " << cfg.link_path << "  -> " << slave_path << "\n";
@@ -1511,6 +1433,10 @@ static void do_bridge(const BridgeConfig& cfg, RadioTransport& transport) {
             server_sock = -1;
         }
     }
+
+    // -- Test mode state --
+    int test_tx_count = 0;
+    auto test_next_tx = std::chrono::steady_clock::now();
 
     // -- Reconnect loop --
     static constexpr int MAX_RECONNECTS  = 10;
@@ -1606,6 +1532,32 @@ static void do_bridge(const BridgeConfig& cfg, RadioTransport& transport) {
                     std::cout << "\n" << hr() << "\n";
                     std::cout << "[" << ts() << "]  BLE keep-alive  (KISS null)\n";
                     std::cout.flush();
+                }
+            }
+
+            // Test mode: send periodic UI test frames
+            if (test_mode) {
+                auto now = std::chrono::steady_clock::now();
+                if (now >= test_next_tx) {
+                    ++test_tx_count;
+                    char info[32];
+                    std::snprintf(info, sizeof(info), "Test %03d", test_tx_count);
+                    auto frame = build_kiss_ui(cfg.test_call, "CQ", info);
+
+                    {
+                        std::lock_guard<std::mutex> lk(mx);
+                        std::cout << "[" << ts() << "]  TX >> #" << test_tx_count
+                                  << "  " << cfg.test_call << ">CQ [UI] \""
+                                  << info << "\"  (" << frame.size() << "B)\n";
+                        std::cout << "              ";
+                        test_hex_dump(frame.data(), frame.size());
+                        std::cout.flush();
+                    }
+
+                    transport.write(frame.data(), frame.size());
+                    ++tx_frames;
+                    test_next_tx = now + std::chrono::milliseconds(
+                        (long long)(cfg.test_interval * 1000));
                 }
             }
 
@@ -1987,10 +1939,21 @@ int main(int argc, char* argv[]) {
     }
     if (mode == "test") {
         cfg.timeout = timeout;
+        cfg.test_mode = true;
+        cfg.test_call = test_call;
+        cfg.test_interval = test_interval;
+        cfg.monitor = true;  // always monitor in test mode
         // Auto BLE for test mode (BLE preferred)
         if (cfg.transport == BridgeConfig::AUTO)
             cfg.transport = BridgeConfig::BLE;
-        do_test(cfg, test_call, test_interval);
+        // Use the same bridge path as --device (no PTY, no socket)
+        if (cfg.transport == BridgeConfig::BLE) {
+            BleTransport ble(cfg);
+            do_bridge(cfg, ble);
+        } else {
+            BtTransport bt(cfg.address, cfg.bt_channel);
+            do_bridge(cfg, bt);
+        }
         return 0;
     }
     if (mode == "sniff") {
