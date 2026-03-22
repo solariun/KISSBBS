@@ -1029,7 +1029,7 @@ extern "C" {
 
 // ── ble_scan ────────────────────────────────────────────────────────────────
 
-void ble_scan(double timeout_s) {
+void ble_scan(double timeout_s, bool show_all) {
     init_dbus_threads();
 
     DBusError err;
@@ -1105,15 +1105,17 @@ void ble_scan(double timeout_s) {
     std::sort(found.begin(), found.end(),
               [](const DevInfo& a, const DevInfo& b){ return a.rssi > b.rssi; });
 
-    int named = 0;
+    int shown = 0, named = 0;
     for (auto& d : found) {
+        if (!d.name.empty()) ++named;
+        if (!show_all && d.name.empty()) continue;
         std::cout << d.address << "\t"
                   << std::setw(4) << d.rssi << " dBm\t"
                   << (d.name.empty() ? "(no name)" : d.name) << "\n";
-        if (!d.name.empty()) ++named;
+        ++shown;
     }
-    std::cout << "\nFound " << found.size() << " BLE device(s)"
-              << " (" << named << " named).\n";
+    std::cout << "\nFound " << shown << " BLE device(s)"
+              << " (" << named << " named, " << found.size() << " total).\n";
 
     dbus_connection_unref(conn);
 }

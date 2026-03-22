@@ -815,8 +815,8 @@ public:
 // =========================================================================
 
 // -- BLE scan (all platforms, native) --
-static void do_ble_scan(double timeout_s) {
-    ble_scan(timeout_s);
+static void do_ble_scan(double timeout_s, bool show_all = false) {
+    ble_scan(timeout_s, show_all);
 }
 
 // -- Classic BT scan (Linux only) --
@@ -878,14 +878,15 @@ static void do_bt_scan([[maybe_unused]] double timeout_s) {
 #endif
 
 // Dispatch scan based on transport preference
-static void do_scan(double timeout_s, BridgeConfig::Transport transport) {
+static void do_scan(double timeout_s, BridgeConfig::Transport transport,
+                     bool show_all = false) {
     if (transport == BridgeConfig::BT) {
         do_bt_scan(timeout_s);
     } else if (transport == BridgeConfig::BLE) {
-        do_ble_scan(timeout_s);
+        do_ble_scan(timeout_s, show_all);
     } else {
         // AUTO: scan both
-        do_ble_scan(timeout_s);
+        do_ble_scan(timeout_s, show_all);
 #if defined(__linux__) || defined(__APPLE__)
         std::cout << "\n";
         do_bt_scan(timeout_s);
@@ -1834,6 +1835,7 @@ static void usage(const char* prog) {
         "Bluetooth KISS TNC bridge + AX.25 monitor (BLE + Classic BT)\n\n"
         "Usage:\n"
         "  " << prog << " --scan [--timeout <s>] [--ble|--bt]\n"
+        "  " << prog << " --scan-all [--timeout <s>] [--ble|--bt]\n"
         "  " << prog << " --inspect <ADDRESS> [--ble|--bt]\n"
         "  " << prog << " --test <ADDRESS> [--ble|--bt] [--call <CALL>]\n"
         "  " << prog << " --sniff <ADDRESS> [--ble|--bt] [--service U] [--write U] [--read U]\n"
@@ -1890,10 +1892,12 @@ static void usage(const char* prog) {
         "  --tx-interval <secs>   Repeat --tx payload every N seconds (default: no repeat)\n"
         "                         Use --service/--write/--read to narrow to specific UUIDs\n\n"
         "Examples:\n"
-        "  # Scan for all Bluetooth devices\n"
+        "  # Scan for named Bluetooth devices\n"
         "  " << prog << " --scan --timeout 15\n"
         "  " << prog << " --scan --ble\n"
         "  " << prog << " --scan --bt\n\n"
+        "  # Scan showing all devices (including unnamed)\n"
+        "  " << prog << " --scan-all --ble --timeout 15\n\n"
         "  # Inspect device services\n"
         "  " << prog << " --ble --inspect AA:BB:CC:DD:EE:FF\n"
         "  " << prog << " --bt  --inspect AA:BB:CC:DD:EE:FF\n\n"
@@ -1930,6 +1934,7 @@ int main(int argc, char* argv[]) {
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
         if      (a == "--scan")    { mode = "scan"; }
+        else if (a == "--scan-all")              { mode = "scan-all"; }
         else if (a == "--inspect"           && i+1 < argc) { mode = "inspect"; cfg.address      = argv[++i]; }
         else if (a == "--test"              && i+1 < argc) { mode = "test";    cfg.address      = argv[++i]; }
         else if (a == "--sniff"             && i+1 < argc) { mode = "sniff";   cfg.address      = argv[++i]; }
@@ -1972,8 +1977,8 @@ int main(int argc, char* argv[]) {
     if (mode.empty()) { usage(argv[0]); return 1; }
 
     // -- Scan / Inspect / Test modes --
-    if (mode == "scan") {
-        do_scan(timeout, cfg.transport);
+    if (mode == "scan" || mode == "scan-all") {
+        do_scan(timeout, cfg.transport, mode == "scan-all");
         return 0;
     }
     if (mode == "inspect") {

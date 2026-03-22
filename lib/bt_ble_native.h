@@ -78,7 +78,8 @@ void ble_wake(ble_handle_t h);
 
 // Scan for nearby BLE peripherals (blocks for timeout_s seconds).
 // Prints results to stdout.
-void ble_scan(double timeout_s);
+// show_all: if true, include unnamed devices; if false, only named devices.
+void ble_scan(double timeout_s, bool show_all);
 
 // Inspect a device's GATT services.  Connects, enumerates services and
 // characteristics, prints to stdout, then disconnects.

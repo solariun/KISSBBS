@@ -482,7 +482,7 @@ extern "C" {
 
 // ── ble_scan ────────────────────────────────────────────────────────────────
 
-void ble_scan(double timeout_s) {
+void ble_scan(double timeout_s, bool show_all) {
     @autoreleasepool {
         dispatch_queue_t q = dispatch_queue_create("ble.scan", DISPATCH_QUEUE_SERIAL);
         BleDelegate* del = [[BleDelegate alloc] init];
@@ -505,16 +505,18 @@ void ble_scan(double timeout_s) {
             found = [del.found copy];
         }
 
-        int named = 0;
+        int shown = 0, named = 0;
         for (CBPeripheral* p in found) {
-            std::string name = (p.name && [p.name length] > 0)
-                             ? to_std(p.name) : "(no name)";
+            bool has_name = (p.name && [p.name length] > 0);
+            if (has_name) ++named;
+            if (!show_all && !has_name) continue;
+            std::string name = has_name ? to_std(p.name) : "(no name)";
             std::cout << to_std([p.identifier UUIDString])
                       << "\t" << name << "\n";
-            if (p.name && [p.name length] > 0) ++named;
+            ++shown;
         }
-        std::cout << "\nFound " << (int)found.count << " BLE device(s)"
-                  << " (" << named << " named).\n";
+        std::cout << "\nFound " << shown << " BLE device(s)"
+                  << " (" << named << " named, " << (int)found.count << " total).\n";
     }
 }
 
