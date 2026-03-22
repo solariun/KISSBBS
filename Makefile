@@ -177,18 +177,15 @@ clean:
 install:
 	@echo "Installing binaries to $(INSTALLDIR) ..."
 	install -d $(INSTALLDIR)
-	install -m 755 $(BINDIR)/bbs        $(INSTALLDIR)/bbs
-	install -m 755 $(BINDIR)/ax25kiss   $(INSTALLDIR)/ax25kiss
-	install -m 755 $(BINDIR)/ax25tnc    $(INSTALLDIR)/ax25tnc
-	install -m 755 $(BINDIR)/ax25sim    $(INSTALLDIR)/ax25sim
-	install -m 755 $(BINDIR)/basic_tool $(INSTALLDIR)/basic_tool
-	@if [ -f $(BINDIR)/bt_kiss_bridge ]; then \
-	    install -m 755 $(BINDIR)/bt_kiss_bridge $(INSTALLDIR)/bt_kiss_bridge; \
-	    ln -sf bt_kiss_bridge $(INSTALLDIR)/ble_kiss_bridge; \
-	    echo "  installed: $(INSTALLDIR)/bt_kiss_bridge (+ ble_kiss_bridge symlink)"; \
-	else \
-	    echo "  skipped  : bt_kiss_bridge (not built — run: make bt_kiss_bridge)"; \
-	fi
+	install -m 755 $(BINDIR)/bbs            $(INSTALLDIR)/bbs
+	install -m 755 $(BINDIR)/ax25kiss       $(INSTALLDIR)/ax25kiss
+	install -m 755 $(BINDIR)/ax25tnc        $(INSTALLDIR)/ax25tnc
+	install -m 755 $(BINDIR)/ax25sim        $(INSTALLDIR)/ax25sim
+	install -m 755 $(BINDIR)/ax25send       $(INSTALLDIR)/ax25send
+	install -m 755 $(BINDIR)/basic_tool     $(INSTALLDIR)/basic_tool
+	install -m 755 $(BINDIR)/bt_kiss_bridge $(INSTALLDIR)/bt_kiss_bridge
+	install -m 755 $(BINDIR)/bt_sniffer     $(INSTALLDIR)/bt_sniffer
+	ln -sf bt_kiss_bridge $(INSTALLDIR)/ble_kiss_bridge
 	@echo "Installing config and scripts to ~/.kissbbs ..."
 	@mkdir -p $(HOME)/.kissbbs/scripts
 	@cp -n etc/bbs.ini $(HOME)/.kissbbs/bbs.ini 2>/dev/null || true
@@ -203,8 +200,10 @@ uninstall:
 	      $(INSTALLDIR)/ax25kiss \
 	      $(INSTALLDIR)/ax25tnc \
 	      $(INSTALLDIR)/ax25sim \
+	      $(INSTALLDIR)/ax25send \
 	      $(INSTALLDIR)/basic_tool \
 	      $(INSTALLDIR)/bt_kiss_bridge \
+	      $(INSTALLDIR)/bt_sniffer \
 	      $(INSTALLDIR)/ble_kiss_bridge
 	@echo "Done."
 
