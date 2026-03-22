@@ -382,8 +382,12 @@ static void set_discovery_filter_le(DBusConnection* conn,
     DBusMessage* reply = dbus_connection_send_with_reply_and_block(
                              conn, msg, 5000, &err);
     dbus_message_unref(msg);
-    if (reply) dbus_message_unref(reply);
-    dbus_error_free(&err);
+    if (dbus_error_is_set(&err)) {
+        std::cerr << "  SetDiscoveryFilter warning: " << err.message << "\n";
+        dbus_error_free(&err);
+    } else if (reply) {
+        dbus_message_unref(reply);
+    }
 }
 
 // ── Find first adapter path ─────────────────────────────────────────────────
@@ -1050,18 +1054,23 @@ void ble_scan(double timeout_s) {
     std::cout << "Scanning for BLE devices (" << (int)timeout_s << "s)...\n\n";
     std::cout.flush();
 
-    dbus_call_void(conn, "org.bluez", adapter.c_str(),
-                   "org.bluez.Adapter1", "StartDiscovery");
+    if (!dbus_call_void(conn, "org.bluez", adapter.c_str(),
+                        "org.bluez.Adapter1", "StartDiscovery")) {
+        std::cerr << "  StartDiscovery failed — listing cached devices only.\n";
+    }
 
-    // Wait for discovery
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds((int)(timeout_s * 1000)));
+    // Pump D-Bus dispatch while scanning so BlueZ device objects appear
+    auto scan_end = std::chrono::steady_clock::now()
+                  + std::chrono::milliseconds((int)(timeout_s * 1000));
+    while (std::chrono::steady_clock::now() < scan_end) {
+        dbus_connection_read_write_dispatch(conn, 200);
+    }
 
     dbus_call_void(conn, "org.bluez", adapter.c_str(),
                    "org.bluez.Adapter1", "StopDiscovery");
 
     // Small delay for last results to settle
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    dbus_connection_read_write_dispatch(conn, 200);
 
     // Enumerate discovered devices
     struct DevInfo {
@@ -1086,8 +1095,6 @@ void ble_scan(double timeout_s) {
 
         di.rssi = dbus_get_int16_prop(conn, o.path.c_str(),
                                        "org.bluez.Device1", "RSSI", -127);
-        // Skip devices with no RSSI (not recently seen)
-        if (di.rssi <= -127) continue;
 
         di.uuids = dbus_get_string_array_prop(conn, o.path.c_str(),
                                                "org.bluez.Device1", "UUIDs");
@@ -1101,7 +1108,9 @@ void ble_scan(double timeout_s) {
     int shown = 0;
     for (auto& d : found) {
         if (d.name.empty()) continue;
-        std::cout << d.address << "\t" << d.name << "\n";
+        std::cout << d.address << "\t"
+                  << std::setw(4) << d.rssi << " dBm\t"
+                  << d.name << "\n";
         ++shown;
     }
     std::cout << "\nFound " << shown << " named BLE device(s)"
