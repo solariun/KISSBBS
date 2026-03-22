@@ -1083,7 +1083,7 @@ static void send_tnc_init(RadioTransport& transport, int txdelay_ms = 400,
         std::cout.flush();
         transport.write(reinterpret_cast<const uint8_t*>(cmd), ::strlen(cmd));
         transport.flush();                                      // wait until sent
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
     }
     std::cout << "  [TNC-INIT] Waiting 2s for KISS mode...\n";
     std::cout.flush();
@@ -1125,6 +1125,9 @@ static void do_test(const BridgeConfig& cfg, const std::string& call, double int
         std::cerr << "[TEST] Connection failed.\n";
         return;
     }
+
+    if (cfg.tnc_init)
+        send_tnc_init(transport);
 
     if (cfg.ble_ka_ms > 0)
         std::cout << "  BLE keep-alive: " << cfg.ble_ka_ms / 1000 << "s  (KISS null writes)\n";
