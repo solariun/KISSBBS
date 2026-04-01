@@ -238,16 +238,99 @@ uninstall:
 	@echo "Done."
 
 install-deps:
-	@echo "Install dependencies:"
-	@echo "  macOS  : brew install googletest sqlite"
-	@echo "  Ubuntu : sudo apt-get install libgtest-dev libsqlite3-dev libdbus-1-dev libbluetooth-dev"
-	@echo "  Fedora : sudo dnf install gtest-devel sqlite-devel dbus-devel bluez-libs-devel"
+	@echo "Use 'make deps' to auto-install, or see below for manual commands:"
 	@echo ""
-	@echo "BT/BLE bridge (bt_kiss_bridge):"
-	@echo "  Linux  : libdbus-1-dev (BLE via BlueZ D-Bus)"
-	@echo "  Linux  : libbluetooth-dev (Classic Bluetooth RFCOMM)"
-	@echo "  macOS  : no extra deps (CoreBluetooth + IOBluetooth are system frameworks)"
-	@echo "  Build  : make bt_kiss_bridge"
+	@echo "  macOS  : brew install googletest sqlite"
+	@echo "  Ubuntu : sudo apt-get install build-essential libasound2-dev libsqlite3-dev libdbus-1-dev libbluetooth-dev libgtest-dev"
+	@echo "  Fedora : sudo dnf install gcc-c++ alsa-lib-devel sqlite-devel dbus-devel bluez-libs-devel gtest-devel"
+	@echo "  Arch   : sudo pacman -S base-devel alsa-lib sqlite dbus bluez-libs gtest"
+
+# ── Auto-install dependencies ─────────────────────────────────────────────
+.PHONY: deps deps-linux deps-mac
+
+deps:
+ifeq ($(UNAME), Darwin)
+	@$(MAKE) --no-print-directory deps-mac
+else
+	@$(MAKE) --no-print-directory deps-linux
+endif
+
+deps-mac:
+	@echo "=== macOS: installing build dependencies ==="
+	@echo "Checking Xcode Command Line Tools..."
+	@xcode-select -p >/dev/null 2>&1 || { echo "Installing Xcode CLT..."; xcode-select --install; }
+	@echo "Xcode CLT: OK"
+	@echo ""
+	@echo "Checking Homebrew packages..."
+	@which brew >/dev/null 2>&1 || { echo "Homebrew not found — install from https://brew.sh"; exit 1; }
+	brew install sqlite googletest 2>/dev/null || true
+	@echo ""
+	@echo "=== macOS deps installed ==="
+	@echo "  Core tools  : Xcode CLT (clang++, make, ld)"
+	@echo "  Audio       : CoreAudio + AudioToolbox (system frameworks, no install needed)"
+	@echo "  Bluetooth   : CoreBluetooth + IOBluetooth (system frameworks, no install needed)"
+	@echo "  Optional    : sqlite (BBS database), googletest (unit tests)"
+	@echo ""
+	@echo "Ready to build:  make"
+
+deps-linux:
+	@echo "=== Linux: installing build dependencies ==="
+	@if command -v apt-get >/dev/null 2>&1; then \
+		echo "Detected: Debian/Ubuntu (apt)"; \
+		sudo apt-get update; \
+		sudo apt-get install -y \
+			build-essential \
+			libasound2-dev \
+			libsqlite3-dev \
+			libdbus-1-dev \
+			libbluetooth-dev \
+			libgtest-dev; \
+	elif command -v dnf >/dev/null 2>&1; then \
+		echo "Detected: Fedora/RHEL (dnf)"; \
+		sudo dnf install -y \
+			gcc-c++ make \
+			alsa-lib-devel \
+			sqlite-devel \
+			dbus-devel \
+			bluez-libs-devel \
+			gtest-devel; \
+	elif command -v pacman >/dev/null 2>&1; then \
+		echo "Detected: Arch (pacman)"; \
+		sudo pacman -S --needed --noconfirm \
+			base-devel \
+			alsa-lib \
+			sqlite \
+			dbus \
+			bluez-libs \
+			gtest; \
+	elif command -v zypper >/dev/null 2>&1; then \
+		echo "Detected: openSUSE (zypper)"; \
+		sudo zypper install -y \
+			gcc-c++ make \
+			alsa-devel \
+			sqlite3-devel \
+			dbus-1-devel \
+			bluez-devel \
+			gtest; \
+	else \
+		echo "Unknown package manager. Install manually:"; \
+		echo "  C++17 compiler (g++ or clang++)"; \
+		echo "  ALSA dev headers (libasound)"; \
+		echo "  SQLite3 dev headers"; \
+		echo "  D-Bus dev headers (for BLE bridge)"; \
+		echo "  BlueZ dev headers (for Classic BT bridge)"; \
+		echo "  GoogleTest (optional, for tests)"; \
+		exit 1; \
+	fi
+	@echo ""
+	@echo "=== Linux deps installed ==="
+	@echo "  Compiler    : g++ / clang++ (C++17)"
+	@echo "  Audio       : ALSA (libasound2) — for modemtnc"
+	@echo "  Bluetooth   : D-Bus (BLE) + BlueZ (Classic BT) — for bt_kiss_bridge"
+	@echo "  Database    : SQLite3 — for bbs"
+	@echo "  Testing     : GoogleTest — for make test"
+	@echo ""
+	@echo "Ready to build:  make"
 
 help:
 	@echo "Targets:"
@@ -256,11 +339,14 @@ help:
 	@echo "  ax25kiss       KISS TNC serial bridge"
 	@echo "  ax25tnc        Virtual TNC with BASIC scripting"
 	@echo "  ax25sim        PTY-based AX.25 simulator"
+	@echo "  ax25send       Fire-and-forget APRS/UI sender"
 	@echo "  basic_tool     Standalone BASIC script runner"
 	@echo "  bt_kiss_bridge BLE/Classic BT KISS bridge"
 	@echo "  bt_sniffer     KISS proxy tap for bridge debugging"
+	@echo "  modemtnc       Software TNC with soundcard DSP"
 	@echo "  test           Build and run test suite"
 	@echo "  clean          Remove build/ and bin/"
 	@echo "  install        Install to $(PREFIX)/bin + ~/.ax25toolkit"
 	@echo "  uninstall      Remove installed binaries"
+	@echo "  deps           Auto-install all build dependencies (detects OS)"
 	@echo "  install-deps   Show dependency install commands"
