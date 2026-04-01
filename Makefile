@@ -88,7 +88,7 @@ INSTALLDIR = $(PREFIX)/bin
 
 .PHONY: all clean test install uninstall install-deps help
 
-all: bbs ax25kiss ax25tnc ax25sim ax25send basic_tool bt_kiss_bridge bt_sniffer
+all: bbs ax25kiss ax25tnc ax25sim ax25send basic_tool bt_kiss_bridge bt_sniffer modemtnc
 
 # ── Build directories ───────────────────────────────────────────────────────
 $(BUILDDIR) $(BINDIR):
@@ -134,7 +134,8 @@ basic_tool: $(BINDIR)/basic_tool
 bt_kiss_bridge: $(BINDIR)/bt_kiss_bridge
 ble_kiss_bridge: $(BINDIR)/ble_kiss_bridge
 bt_sniffer: $(BINDIR)/bt_sniffer
-.PHONY: bbs ax25kiss ax25tnc ax25sim ax25send basic_tool bt_kiss_bridge ble_kiss_bridge bt_sniffer
+modemtnc: $(BINDIR)/modemtnc
+.PHONY: bbs ax25kiss ax25tnc ax25sim ax25send basic_tool bt_kiss_bridge ble_kiss_bridge bt_sniffer modemtnc
 
 # ── Tests ───────────────────────────────────────────────────────────────────
 $(BINDIR)/test_ax25lib: $(TESTDIR)/test_ax25lib.cpp $(LIB_OBJ) $(BASIC_OBJ) | $(BINDIR)
@@ -165,6 +166,35 @@ $(BINDIR)/bt_kiss_bridge: $(SRCDIR)/bt_kiss_bridge.cpp $(BLE_OBJ) $(BT_MACOS_OBJ
 $(BINDIR)/ble_kiss_bridge: $(BINDIR)/bt_kiss_bridge
 	ln -sf bt_kiss_bridge $(BINDIR)/ble_kiss_bridge
 	@echo "Created symlink: bin/ble_kiss_bridge -> bt_kiss_bridge"
+
+# ── modemtnc — Software TNC with Soundcard DSP ────────────────────────────
+MODEM_DIR  = modemtnc
+MODEM_OBJS = $(BUILDDIR)/modemtnc.o $(BUILDDIR)/modem_dsp.o \
+             $(BUILDDIR)/modem_hdlc.o $(BUILDDIR)/modem_audio.o
+
+ifeq ($(UNAME), Darwin)
+    MODEM_AUDIO_SRC = $(MODEM_DIR)/audio_coreaudio.cpp
+    MODEM_AUDIO_LIBS = -framework CoreAudio -framework AudioToolbox -framework CoreFoundation -lpthread
+else
+    MODEM_AUDIO_SRC = $(MODEM_DIR)/audio_alsa.cpp
+    MODEM_AUDIO_LIBS = -lasound -lpthread
+endif
+
+$(BUILDDIR)/modemtnc.o: $(MODEM_DIR)/modemtnc.cpp $(MODEM_DIR)/modem.h $(MODEM_DIR)/hdlc.h $(MODEM_DIR)/audio.h | $(BUILDDIR)
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -Ilib -I$(MODEM_DIR) -c -o $@ $<
+
+$(BUILDDIR)/modem_dsp.o: $(MODEM_DIR)/modem.cpp $(MODEM_DIR)/modem.h | $(BUILDDIR)
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -ffast-math -I$(MODEM_DIR) -c -o $@ $<
+
+$(BUILDDIR)/modem_hdlc.o: $(MODEM_DIR)/hdlc.cpp $(MODEM_DIR)/hdlc.h | $(BUILDDIR)
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -I$(MODEM_DIR) -c -o $@ $<
+
+$(BUILDDIR)/modem_audio.o: $(MODEM_AUDIO_SRC) $(MODEM_DIR)/audio.h | $(BUILDDIR)
+	$(CXX) -std=c++17 -O2 -Wall -Wextra -I$(MODEM_DIR) -c -o $@ $<
+
+$(BINDIR)/modemtnc: $(MODEM_OBJS) $(LIB_OBJ) | $(BINDIR)
+	$(CXX) -std=c++17 -O2 -o $@ $(MODEM_OBJS) $(LIB_OBJ) $(LDUTIL) $(MODEM_AUDIO_LIBS)
+	@echo "Built: bin/modemtnc"
 
 # ── Clean ───────────────────────────────────────────────────────────────────
 clean:
