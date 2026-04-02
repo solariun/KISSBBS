@@ -392,12 +392,18 @@ PTT methods to work with any radio setup:
 
 | Method | Flag | How it works | Common use |
 |--------|------|-------------|------------|
-| **VOX** | (default) | Audio level triggers the radio's VOX circuit | SignaLink USB (turn DLY fully CCW) |
-| **Serial RTS** | `--ptt rts` | Asserts RTS line on a serial port | IC-7300, FT-991A (USB serial), homebrew cables |
-| **Serial DTR** | `--ptt dtr` | Asserts DTR line on a serial port | Some homebrew interfaces |
+| **VOX** | `--ptt vox` (default) | Audio level triggers the radio's VOX circuit | SignaLink USB (turn DLY fully CCW) |
+| **Serial RTS** | `--ptt rts` or `--ptt +rts` | Asserts RTS line on a serial port | IC-7300, FT-991A (USB serial), homebrew cables |
+| **Serial RTS (inv)** | `--ptt -rts` | Asserts RTS inverted (active low) | Interfaces with inverted logic |
+| **Serial DTR** | `--ptt dtr` or `--ptt +dtr` | Asserts DTR line on a serial port | Some homebrew interfaces |
+| **Serial DTR (inv)** | `--ptt -dtr` | Asserts DTR inverted (active low) | Interfaces with inverted logic |
 | **CM108 GPIO** | `--ptt cm108` | Sets GPIO pin on CM108/CM119 USB audio chip | Digirig, cheap USB sound cards |
 | **GPIO (sysfs)** | `--ptt gpio` | Writes to /sys/class/gpio (Raspberry Pi, etc.) | DRAWS HAT, custom GPIO wiring |
 | **CAT (hamlib)** | `--ptt hamlib` | Computer Aided Transceiver via hamlib | Any radio with CAT (future) |
+
+The `+`/`-` prefix follows the Direwolf convention:
+`+rts` = active high (default), `-rts` = active low (inverted).
+You can also use `--ptt-invert` separately with any method.
 
 ### PTT Timing
 
@@ -447,9 +453,86 @@ ls /dev/cu.usbserial* /dev/cu.usbmodem*
 # Use RTS for PTT
 ./bin/modemtnc -d plughw:1,0 -s 1200 --ptt rts --ptt-device /dev/ttyUSB0 --monitor
 
-# If PTT is inverted (active low)
+# If PTT is inverted (active low) — two equivalent ways:
+./bin/modemtnc -d plughw:1,0 -s 1200 --ptt -rts --ptt-device /dev/ttyUSB0 --monitor
 ./bin/modemtnc -d plughw:1,0 -s 1200 --ptt rts --ptt-device /dev/ttyUSB0 --ptt-invert --monitor
 ```
+
+### Testing PTT — Step by Step
+
+Before going on-air, verify that PTT activates correctly and audio is flowing.
+Follow these steps in order:
+
+**Step 1 — Loopback (no hardware)**
+```bash
+./bin/modemtnc --loopback --monitor -c TEST
+# Expected: "Result: PASS" — confirms DSP chain works
+```
+
+**Step 2 — List devices**
+```bash
+./bin/modemtnc --list-devices
+# Note your audio device (e.g., plughw:1,0) and serial port (e.g., /dev/ttyUSB0)
+```
+
+**Step 3 — Start modemtnc with PTT and monitor**
+```bash
+# Terminal 1: start the TNC
+# Digirig:
+./bin/modemtnc -d plughw:1,0 -s 1200 --ptt cm108 --link /tmp/kiss --monitor
+
+# IC-7300 / FT-991A:
+./bin/modemtnc -d plughw:1,0 -s 1200 --ptt rts --ptt-device /dev/ttyUSB0 --link /tmp/kiss --monitor
+```
+
+You should see:
+```
+  PTT: CM108 GPIO 3 on /dev/hidraw0
+```
+or:
+```
+  PTT: Serial RTS on /dev/ttyUSB0
+```
+
+**Step 4 — Send a test UI frame**
+```bash
+# Terminal 2: send a test packet
+./bin/ax25send -c YOURCALL /tmp/kiss --ui CQ "PTT test 1 2 3"
+```
+
+Watch Terminal 1 — you should see:
+```
+[HH:MM:SS.mmm]  -> AIR  YOURCALL>CQ [UI] PID=0xF0 | PTT test 1 2 3
+```
+
+And on the radio:
+- **TX LED** lights up (PTT keyed)
+- **Power meter** deflects (audio being transmitted)
+- TX LED goes off after the frame
+
+**Step 5 — Send an APRS position**
+```bash
+./bin/ax25send -c YOURCALL /tmp/kiss --pos 42.3601,-71.0589 "Testing modemtnc"
+```
+
+**Step 6 — Monitor for incoming packets**
+```bash
+# Leave modemtnc running — any packet received on-air will appear:
+[HH:MM:SS.mmm]  <- AIR  W1AW>CQ [UI] PID=0xF0 | Hello from W1AW
+```
+
+### PTT Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---------|-------------|-----|
+| No TX LED on radio | PTT not keying | Check `--ptt` method and `--ptt-device` path |
+| TX LED but no signal on SDR | Audio not reaching radio | Check audio device with `--list-devices`, verify cable |
+| TX LED stays on forever | PTT stuck | Ctrl-C modemtnc (releases PTT on exit), check `--ptt-invert` |
+| Permission denied on `/dev/hidraw*` | CM108 HID permissions | Add udev rule (see CM108 section above) |
+| Permission denied on `/dev/ttyUSB*` | Serial port permissions | `sudo usermod -aG dialout $USER` then re-login |
+| PTT keys but wrong polarity | Inverted PTT logic | Use `--ptt -rts` or `--ptt-invert` |
+| "cannot open" serial device | Wrong device path | Run `ls /dev/ttyUSB* /dev/ttyACM*` to find the right one |
+| PTT keys but no audio | Separate audio + PTT devices | Verify `-d` audio device matches your sound card, not PTT port |
 
 ## HDLC & FCS
 
