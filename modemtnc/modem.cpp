@@ -172,11 +172,22 @@ void Demodulator::init_afsk(int baud, int mark, int space) {
     pll_locked_inertia_ = 0.74f;
     pll_searching_inertia_ = 0.50f;
 
-    // Local oscillators
+    // Use Profile B (FM discriminator) — more robust for FM signals with de-emphasis
+    afsk_.use_profile_b = true;
+
+    // Profile A: Mark/Space local oscillators (kept for reference)
     afsk_.m_osc_phase = 0;
     afsk_.m_osc_delta = (unsigned int)round(pow(2.0, 32.0) * (double)mark / (double)sample_rate_);
     afsk_.s_osc_phase = 0;
     afsk_.s_osc_delta = (unsigned int)round(pow(2.0, 32.0) * (double)space / (double)sample_rate_);
+
+    // Profile B: Center frequency oscillator
+    afsk_.c_osc_phase = 0;
+    afsk_.c_osc_delta = (unsigned int)round(pow(2.0, 32.0) * 0.5 * (mark + space) / (double)sample_rate_);
+    afsk_.prev_phase = 0;
+    afsk_.normalize_rpsam = (float)(1.0 / (0.5 * abs(mark - space) * 2 * M_PI / sample_rate_));
+    memset(afsk_.c_I_raw, 0, sizeof(afsk_.c_I_raw));
+    memset(afsk_.c_Q_raw, 0, sizeof(afsk_.c_Q_raw));
 
     // Pre-filter (bandpass around mark/space)
     afsk_.use_prefilter = true;
@@ -191,9 +202,9 @@ void Demodulator::init_afsk(int baud, int mark, int space) {
     if (f1 < 0.001f) f1 = 0.001f;
     gen_bandpass(f1, f2, afsk_.pre_filter, afsk_.pre_filter_taps);
 
-    // RRC low-pass filter
-    float rrc_width = 2.80f;
-    float rrc_rolloff = 0.20f;
+    // RRC low-pass filter (Profile B uses wider filter)
+    float rrc_width = afsk_.use_profile_b ? 2.00f : 2.80f;
+    float rrc_rolloff = afsk_.use_profile_b ? 0.40f : 0.20f;
     afsk_.lp_filter_taps = ((int)(rrc_width * (float)sample_rate_ / baud)) | 1;
     if (afsk_.lp_filter_taps > MAX_FILTER) afsk_.lp_filter_taps = (MAX_FILTER - 1) | 1;
     gen_rrc_lowpass(afsk_.lp_filter, afsk_.lp_filter_taps, rrc_rolloff, (float)sample_rate_ / baud);
@@ -255,32 +266,53 @@ void Demodulator::process_afsk(float fsam) {
         fsam = convolve(afsk_.raw_cb, afsk_.pre_filter, afsk_.pre_filter_taps);
     }
 
-    // Mix with mark and space local oscillators
-    push_sample(fsam * fcos256(afsk_.m_osc_phase), afsk_.m_I_raw, afsk_.lp_filter_taps);
-    push_sample(fsam * fsin256(afsk_.m_osc_phase), afsk_.m_Q_raw, afsk_.lp_filter_taps);
-    afsk_.m_osc_phase += afsk_.m_osc_delta;
+    float demod_out;
 
-    push_sample(fsam * fcos256(afsk_.s_osc_phase), afsk_.s_I_raw, afsk_.lp_filter_taps);
-    push_sample(fsam * fsin256(afsk_.s_osc_phase), afsk_.s_Q_raw, afsk_.lp_filter_taps);
-    afsk_.s_osc_phase += afsk_.s_osc_delta;
+    if (afsk_.use_profile_b) {
+        // ── Profile B: FM discriminator ──
+        // Mix with center frequency, measure phase rate.
+        // More robust than mark/space amplitude comparison for FM signals.
+        push_sample(fsam * fcos256(afsk_.c_osc_phase), afsk_.c_I_raw, afsk_.lp_filter_taps);
+        push_sample(fsam * fsin256(afsk_.c_osc_phase), afsk_.c_Q_raw, afsk_.lp_filter_taps);
+        afsk_.c_osc_phase += afsk_.c_osc_delta;
 
-    // Low-pass filter I/Q and compute magnitudes
-    float m_I = convolve(afsk_.m_I_raw, afsk_.lp_filter, afsk_.lp_filter_taps);
-    float m_Q = convolve(afsk_.m_Q_raw, afsk_.lp_filter, afsk_.lp_filter_taps);
-    float m_amp = hypotf(m_I, m_Q);
+        float c_I = convolve(afsk_.c_I_raw, afsk_.lp_filter, afsk_.lp_filter_taps);
+        float c_Q = convolve(afsk_.c_Q_raw, afsk_.lp_filter, afsk_.lp_filter_taps);
 
-    float s_I = convolve(afsk_.s_I_raw, afsk_.lp_filter, afsk_.lp_filter_taps);
-    float s_Q = convolve(afsk_.s_Q_raw, afsk_.lp_filter, afsk_.lp_filter_taps);
-    float s_amp = hypotf(s_I, s_Q);
+        float phase = atan2f(c_Q, c_I);
+        float rate = phase - afsk_.prev_phase;
+        if (rate > (float)M_PI) rate -= 2.0f * (float)M_PI;
+        else if (rate < -(float)M_PI) rate += 2.0f * (float)M_PI;
+        afsk_.prev_phase = phase;
 
-    // AGC normalize
-    float m_norm = agc(m_amp, afsk_.agc_fast_attack, afsk_.agc_slow_decay,
-                       &afsk_.m_peak, &afsk_.m_valley);
-    float s_norm = agc(s_amp, afsk_.agc_fast_attack, afsk_.agc_slow_decay,
-                       &afsk_.s_peak, &afsk_.s_valley);
+        // Normalize: mark → +1, space → -1
+        demod_out = rate * afsk_.normalize_rpsam;
 
-    // Demod output: mark stronger → positive → 1, space stronger → negative → 0
-    float demod_out = m_norm - s_norm;
+    } else {
+        // ── Profile A: Mark/Space amplitude comparison ──
+        push_sample(fsam * fcos256(afsk_.m_osc_phase), afsk_.m_I_raw, afsk_.lp_filter_taps);
+        push_sample(fsam * fsin256(afsk_.m_osc_phase), afsk_.m_Q_raw, afsk_.lp_filter_taps);
+        afsk_.m_osc_phase += afsk_.m_osc_delta;
+
+        push_sample(fsam * fcos256(afsk_.s_osc_phase), afsk_.s_I_raw, afsk_.lp_filter_taps);
+        push_sample(fsam * fsin256(afsk_.s_osc_phase), afsk_.s_Q_raw, afsk_.lp_filter_taps);
+        afsk_.s_osc_phase += afsk_.s_osc_delta;
+
+        float m_I = convolve(afsk_.m_I_raw, afsk_.lp_filter, afsk_.lp_filter_taps);
+        float m_Q = convolve(afsk_.m_Q_raw, afsk_.lp_filter, afsk_.lp_filter_taps);
+        float m_amp = hypotf(m_I, m_Q);
+
+        float s_I = convolve(afsk_.s_I_raw, afsk_.lp_filter, afsk_.lp_filter_taps);
+        float s_Q = convolve(afsk_.s_Q_raw, afsk_.lp_filter, afsk_.lp_filter_taps);
+        float s_amp = hypotf(s_I, s_Q);
+
+        float m_norm = agc(m_amp, afsk_.agc_fast_attack, afsk_.agc_slow_decay,
+                           &afsk_.m_peak, &afsk_.m_valley);
+        float s_norm = agc(s_amp, afsk_.agc_fast_attack, afsk_.agc_slow_decay,
+                           &afsk_.s_peak, &afsk_.s_valley);
+
+        demod_out = m_norm - s_norm;
+    }
 
     nudge_pll(demod_out);
 }

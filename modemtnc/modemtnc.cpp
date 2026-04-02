@@ -556,16 +556,22 @@ static void run_bridge(const Config& cfg) {
         exit(1);
     }
 
+    // Use the actual sample rate from the audio device (may differ from requested)
+    int actual_rate = audio->sample_rate();
+    if (actual_rate != cfg.sample_rate)
+        fprintf(stderr, "  Note: using device sample rate %d Hz (requested %d)\n",
+                actual_rate, cfg.sample_rate);
+
     if (cfg.monitor) printf("  Monitor on.  Ctrl-C to stop.\n\n");
 
-    // Init modem
+    // Init modem with ACTUAL audio sample rate
     modem::Demodulator demod;
     modem::Modulator modulator;
     hdlc::Decoder hdlc_dec;
     hdlc::Encoder hdlc_enc;
 
-    demod.init(cfg.modem_type, cfg.sample_rate);
-    modulator.init(cfg.modem_type, cfg.sample_rate, amp);
+    demod.init(cfg.modem_type, actual_rate);
+    modulator.init(cfg.modem_type, actual_rate, amp);
     hdlc_dec.init();
 
     // KISS decoder for host → radio TX path
@@ -649,7 +655,7 @@ static void run_bridge(const Config& cfg) {
             if (cfg.debug)
                 fprintf(stderr, "  [TX] burst: %zu frame(s), %zu samples (%.0f ms)\n",
                         batch.size(), tx_audio.size(),
-                        1000.0 * tx_audio.size() / cfg.sample_rate);
+                        1000.0 * tx_audio.size() / actual_rate);
 
             // ── Step 6: PTT ON → write audio → drain → PTT OFF ──
             ptt_ctl.set(true);

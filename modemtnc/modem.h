@@ -70,6 +70,14 @@ private:
         float agc_fast_attack, agc_slow_decay;
         float m_peak, m_valley;
         float s_peak, s_valley;
+
+        // Profile B (FM discriminator) state
+        unsigned int c_osc_phase, c_osc_delta; // center frequency LO
+        float c_I_raw[MAX_FILTER];
+        float c_Q_raw[MAX_FILTER];
+        float prev_phase;
+        float normalize_rpsam;
+        bool  use_profile_b;  // true = FM discriminator, false = mark/space
     } afsk_;
 
     // ----- 9600 baud state -----

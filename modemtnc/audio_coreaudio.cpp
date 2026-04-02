@@ -146,46 +146,80 @@ public:
         OSStatus err = AudioComponentInstanceNew(comp, &au_);
         if (err != noErr) { fprintf(stderr, "[Audio] AudioUnit create failed: %d\n", (int)err); return false; }
 
-        // Enable input (capture) on the AudioUnit
-        UInt32 enableIO = capture ? 1 : 0;
-        AudioUnitSetProperty(au_, kAudioOutputUnitProperty_EnableIO,
-                             kAudioUnitScope_Input, 1, &enableIO, sizeof(enableIO));
+        // Enable input (capture) — must be done BEFORE setting device
+        UInt32 flag = 1;
+        if (capture) {
+            err = AudioUnitSetProperty(au_, kAudioOutputUnitProperty_EnableIO,
+                                       kAudioUnitScope_Input, 1, &flag, sizeof(flag));
+            if (err != noErr) fprintf(stderr, "[AU] EnableIO input: %d\n", (int)err);
+        }
 
         // Enable output (playback)
-        enableIO = playback ? 1 : 0;
-        AudioUnitSetProperty(au_, kAudioOutputUnitProperty_EnableIO,
-                             kAudioUnitScope_Output, 0, &enableIO, sizeof(enableIO));
+        if (playback) {
+            flag = 1;
+            err = AudioUnitSetProperty(au_, kAudioOutputUnitProperty_EnableIO,
+                                       kAudioUnitScope_Output, 0, &flag, sizeof(flag));
+            if (err != noErr) fprintf(stderr, "[AU] EnableIO output: %d\n", (int)err);
+        } else {
+            // If no playback, disable output (AUHAL has output enabled by default)
+            flag = 0;
+            AudioUnitSetProperty(au_, kAudioOutputUnitProperty_EnableIO,
+                                 kAudioUnitScope_Output, 0, &flag, sizeof(flag));
+        }
 
         // Set device
         if (devId != 0) {
-            AudioUnitSetProperty(au_, kAudioOutputUnitProperty_CurrentDevice,
-                                 kAudioUnitScope_Global, 0, &devId, sizeof(devId));
+            err = AudioUnitSetProperty(au_, kAudioOutputUnitProperty_CurrentDevice,
+                                       kAudioUnitScope_Global, 0, &devId, sizeof(devId));
+            if (err != noErr) fprintf(stderr, "[AU] SetDevice: %d\n", (int)err);
         }
 
         // Set format on input scope (what we receive from hardware)
         if (capture) {
-            AudioUnitSetProperty(au_, kAudioUnitProperty_StreamFormat,
-                                 kAudioUnitScope_Output, 1, &fmt, sizeof(fmt));
+            // First check what format the hardware provides
+            AudioStreamBasicDescription hwFmt{};
+            UInt32 fmtSz = sizeof(hwFmt);
+            AudioUnitGetProperty(au_, kAudioUnitProperty_StreamFormat,
+                                 kAudioUnitScope_Input, 1, &hwFmt, &fmtSz);
+            fprintf(stderr, "  [AU] HW input: rate=%.0f ch=%u bits=%u\n",
+                    hwFmt.mSampleRate, (unsigned)hwFmt.mChannelsPerFrame,
+                    (unsigned)hwFmt.mBitsPerChannel);
+
+            // Use hardware native sample rate — AudioUnit doesn't reliably
+            // convert sample rates on USB devices
+            if (hwFmt.mSampleRate > 0) {
+                sample_rate_ = (int)hwFmt.mSampleRate;
+                fmt.mSampleRate = hwFmt.mSampleRate;
+            }
+            fprintf(stderr, "  [AU] Using %d Hz 16-bit mono\n", sample_rate_);
+
+            err = AudioUnitSetProperty(au_, kAudioUnitProperty_StreamFormat,
+                                       kAudioUnitScope_Output, 1, &fmt, sizeof(fmt));
+            if (err != noErr) fprintf(stderr, "[AU] SetFormat input: %d\n", (int)err);
 
             // Set input callback
             AURenderCallbackStruct inputCb{};
             inputCb.inputProc = input_render_cb;
             inputCb.inputProcRefCon = this;
-            AudioUnitSetProperty(au_, kAudioOutputUnitProperty_SetInputCallback,
-                                 kAudioUnitScope_Global, 0, &inputCb, sizeof(inputCb));
+            err = AudioUnitSetProperty(au_, kAudioOutputUnitProperty_SetInputCallback,
+                                       kAudioUnitScope_Global, 0, &inputCb, sizeof(inputCb));
+            if (err != noErr) fprintf(stderr, "[AU] SetInputCallback: %d\n", (int)err);
         }
 
         // Set format on output scope (what we send to hardware)
         if (playback) {
-            AudioUnitSetProperty(au_, kAudioUnitProperty_StreamFormat,
-                                 kAudioUnitScope_Input, 0, &fmt, sizeof(fmt));
+            fmt.mSampleRate = sample_rate_;  // same as what modem generates
+            err = AudioUnitSetProperty(au_, kAudioUnitProperty_StreamFormat,
+                                       kAudioUnitScope_Input, 0, &fmt, sizeof(fmt));
+            if (err != noErr) fprintf(stderr, "[AU] SetFormat output: %d\n", (int)err);
 
             // Set output render callback
             AURenderCallbackStruct outputCb{};
             outputCb.inputProc = output_render_cb;
             outputCb.inputProcRefCon = this;
-            AudioUnitSetProperty(au_, kAudioUnitProperty_SetRenderCallback,
-                                 kAudioUnitScope_Input, 0, &outputCb, sizeof(outputCb));
+            err = AudioUnitSetProperty(au_, kAudioUnitProperty_SetRenderCallback,
+                                       kAudioUnitScope_Input, 0, &outputCb, sizeof(outputCb));
+            if (err != noErr) fprintf(stderr, "[AU] SetRenderCallback: %d\n", (int)err);
         }
 
         // Initialize and start
@@ -211,15 +245,21 @@ public:
 
     int read(int16_t* buf, int frames) override {
         if (!has_capture_) return 0;
-        std::unique_lock<std::mutex> lk(rx_mtx_);
-        rx_cv_.wait(lk, [this] { return rx_avail_ > 0 || !has_capture_; });
-        if (!has_capture_) return 0;
-        int n = std::min(frames, rx_avail_);
-        for (int i = 0; i < n; i++) {
-            buf[i] = rx_ring_[rx_rd_];
-            rx_rd_ = (rx_rd_ + 1) % RX_RING_SIZE;
+        // Spin until data available (lock-free)
+        int rd, wr, avail;
+        for (;;) {
+            rd = rx_rd_.load(std::memory_order_relaxed);
+            wr = rx_wr_.load(std::memory_order_acquire);
+            avail = (wr - rd + RX_RING_SIZE) % RX_RING_SIZE;
+            if (avail > 0 || !has_capture_) break;
+            usleep(500);  // 0.5ms — minimal sleep, don't starve CPU
         }
-        rx_avail_ -= n;
+        if (!has_capture_) return 0;
+        int n = std::min(frames, avail);
+        for (int i = 0; i < n; i++) {
+            buf[i] = rx_ring_[(rd + i) % RX_RING_SIZE];
+        }
+        rx_rd_.store((rd + n) % RX_RING_SIZE, std::memory_order_release);
         return n;
     }
 
@@ -266,7 +306,6 @@ public:
         }
         has_capture_ = false;
         has_playback_ = false;
-        rx_cv_.notify_all();
     }
 
 private:
@@ -274,11 +313,10 @@ private:
     bool has_capture_ = false;
     bool has_playback_ = false;
 
-    // ── RX ring buffer ───────────────────────────────────────────────────
+    // ── RX ring buffer (lock-free: audio callback writes, read() reads) ──
     int16_t rx_ring_[RX_RING_SIZE]{};
-    int     rx_wr_ = 0, rx_rd_ = 0, rx_avail_ = 0;
-    std::mutex              rx_mtx_;
-    std::condition_variable rx_cv_;
+    std::atomic<int> rx_wr_{0};
+    std::atomic<int> rx_rd_{0};
 
     // ── TX ring buffer ───────────────────────────────────────────────────
     int16_t tx_ring_[TX_RING_SIZE]{};
@@ -307,16 +345,25 @@ private:
                                        inBusNumber, inNumberFrames, &bufList);
         if (err != noErr) return err;
 
-        // Copy to RX ring buffer
-        {
-            std::lock_guard<std::mutex> lk(self->rx_mtx_);
-            for (UInt32 i = 0; i < inNumberFrames && self->rx_avail_ < RX_RING_SIZE; i++) {
-                self->rx_ring_[self->rx_wr_] = tmp[i];
-                self->rx_wr_ = (self->rx_wr_ + 1) % RX_RING_SIZE;
-                self->rx_avail_++;
-            }
+        // Log first callback and count
+        static int cb_count = 0;
+        cb_count++;
+        if (cb_count <= 3 || (cb_count % 1000 == 0)) {
+            fprintf(stderr, "  [AU] input cb #%d: %u frames, %u bytes, err=%d\n",
+                    cb_count, (unsigned)inNumberFrames,
+                    (unsigned)bufList.mBuffers[0].mDataByteSize, (int)err);
         }
-        self->rx_cv_.notify_one();
+
+        // Copy to RX ring buffer (lock-free)
+        int wr = self->rx_wr_.load(std::memory_order_relaxed);
+        int rd = self->rx_rd_.load(std::memory_order_acquire);
+        for (UInt32 i = 0; i < inNumberFrames; i++) {
+            int next = (wr + 1) % RX_RING_SIZE;
+            if (next == rd) break;
+            self->rx_ring_[wr] = tmp[i];
+            wr = next;
+        }
+        self->rx_wr_.store(wr, std::memory_order_release);
         return noErr;
     }
 
