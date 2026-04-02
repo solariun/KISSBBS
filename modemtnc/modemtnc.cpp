@@ -596,35 +596,62 @@ static void run_bridge(const Config& cfg) {
     std::condition_variable tx_queue_cv;
     std::vector<std::vector<uint8_t>> tx_queue;
 
-    // TX thread: encode, modulate, PTT, write audio
+    // TX thread: batch all pending frames into one TX burst
+    // Flow: wait for frame → collect more frames (slottime window) →
+    //       PTT ON → txdelay preamble → frame1 → frame2 → ... → txtail → PTT OFF
     std::thread tx_thread([&]() {
         std::vector<int16_t> tx_audio;
         modulator.set_on_sample([&tx_audio](int16_t s) { tx_audio.push_back(s); });
         hdlc_enc.set_on_bit([&modulator](int bit) { modulator.put_bit(bit); });
 
         while (g_running) {
-            std::vector<uint8_t> frame;
+            // Wait for at least one frame
+            std::vector<std::vector<uint8_t>> batch;
             {
                 std::unique_lock<std::mutex> lk(tx_queue_mtx);
                 tx_queue_cv.wait_for(lk, std::chrono::milliseconds(100),
                     [&] { return !tx_queue.empty() || !g_running; });
                 if (!g_running) break;
                 if (tx_queue.empty()) continue;
-                frame = std::move(tx_queue.front());
+
+                // Collect first frame
+                batch.push_back(std::move(tx_queue.front()));
                 tx_queue.erase(tx_queue.begin());
             }
 
+            // Wait a short window (slottime) for more frames to batch
+            {
+                std::unique_lock<std::mutex> lk(tx_queue_mtx);
+                tx_queue_cv.wait_for(lk, std::chrono::milliseconds(kp.slottime * 10),
+                    [&] { return !tx_queue.empty() || !g_running; });
+                // Grab all pending frames
+                while (!tx_queue.empty()) {
+                    batch.push_back(std::move(tx_queue.front()));
+                    tx_queue.erase(tx_queue.begin());
+                }
+            }
+
+            // Modulate all frames into one audio burst
             int flags = kp.txdelay * cfg.baud / (8 * 100);
             if (flags < 5) flags = 5;
 
             tx_audio.clear();
-            hdlc_enc.send_frame(frame.data(), frame.size(), flags, 2);
+            for (size_t i = 0; i < batch.size(); i++) {
+                if (i == 0) {
+                    // First frame: full preamble
+                    hdlc_enc.send_frame(batch[i].data(), batch[i].size(), flags, 2);
+                } else {
+                    // Subsequent frames: short inter-frame gap (3 flags)
+                    hdlc_enc.send_frame(batch[i].data(), batch[i].size(), 3, 2);
+                }
+            }
             modulator.put_quiet_ms(kp.txtail * 10);
 
             if (!tx_audio.empty()) {
                 if (cfg.debug)
-                    fprintf(stderr, "  [TX] %zu samples (%.0f ms), PTT ON\n",
-                            tx_audio.size(), 1000.0 * tx_audio.size() / cfg.sample_rate);
+                    fprintf(stderr, "  [TX] %zu frame(s), %zu samples (%.0f ms), PTT ON\n",
+                            batch.size(), tx_audio.size(),
+                            1000.0 * tx_audio.size() / cfg.sample_rate);
 
                 ptt_ctl.set(true);
                 size_t off = 0;
@@ -632,14 +659,12 @@ static void run_bridge(const Config& cfg) {
                     int chunk = std::min((int)(tx_audio.size() - off), 1024);
                     int written = audio->write(tx_audio.data() + off, chunk);
                     if (written > 0) off += written;
-                    else { if (cfg.debug) fprintf(stderr, "  [TX] write err at off=%zu\n", off); break; }
+                    else break;
                 }
                 audio->flush();
                 audio->wait_drain();
                 ptt_ctl.set(false);
                 if (cfg.debug) fprintf(stderr, "  [TX] done, PTT OFF\n");
-            } else {
-                if (cfg.debug) fprintf(stderr, "  [TX] WARNING: 0 samples!\n");
             }
         }
     });
