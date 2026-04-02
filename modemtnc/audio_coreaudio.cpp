@@ -174,29 +174,7 @@ public:
         }
 
         if (playback) {
-            OSStatus err = AudioQueueNewOutput(&fmt, output_callback, this, nullptr,
-                                               kCFRunLoopCommonModes, 0, &output_queue_);
-            if (err != noErr) {
-                fprintf(stderr, "[Audio] Failed to create output queue: %d\n", (int)err);
-                return false;
-            }
-            set_queue_device(output_queue_, devId);
-            for (int i = 0; i < NUM_BUFFERS; i++) {
-                AudioQueueAllocateBuffer(output_queue_, BUFFER_FRAMES * 2, &output_bufs_[i]);
-            }
-            // Pre-fill with silence and enqueue — keeps the audio pipeline alive
-            // The output_callback re-enqueues silence when no TX data is pending
-            for (int i = 0; i < NUM_BUFFERS; i++) {
-                memset(output_bufs_[i]->mAudioData, 0, BUFFER_FRAMES * 2);
-                output_bufs_[i]->mAudioDataByteSize = BUFFER_FRAMES * 2;
-                AudioQueueEnqueueBuffer(output_queue_, output_bufs_[i], 0, nullptr);
-            }
-            {
-                std::lock_guard<std::mutex> lk(tx_mtx_);
-                tx_free_count_ = 0;  // all buffers are in the queue (playing silence)
-                tx_pending_ = 0;
-            }
-            AudioQueueStart(output_queue_, nullptr);
+            tx_dev_id_ = devId;  // saved for per-burst queue creation
             has_playback_ = true;
         }
 
@@ -215,45 +193,72 @@ public:
         return n;
     }
 
+    // Accumulate samples — played all at once in wait_drain()
     int write(const int16_t* buf, int frames) override {
-        if (!has_playback_ || !output_queue_) return 0;
-        std::unique_lock<std::mutex> lk(tx_mtx_);
-        // Signal callback to return buffers to pool instead of re-enqueuing silence
-        tx_want_bufs_ = true;
-        tx_cv_.wait(lk, [this] { return tx_free_count_ > 0 || !has_playback_; });
         if (!has_playback_) return 0;
-
-        AudioQueueBufferRef abuf = tx_free_bufs_[--tx_free_count_];
-        int n = std::min(frames, BUFFER_FRAMES);
-        memcpy(abuf->mAudioData, buf, n * sizeof(int16_t));
-        abuf->mAudioDataByteSize = n * 2;
-        tx_pending_++;
-        tx_want_bufs_ = (tx_free_count_ == 0); // keep requesting if we need more
-        AudioQueueEnqueueBuffer(output_queue_, abuf, 0, nullptr);
+        int n = frames;
+        for (int i = 0; i < n; i++)
+            tx_pcm_.push_back(buf[i]);
         return n;
     }
 
-    void flush() override {
-        // no-op — queue is always running
-    }
+    void flush() override {}
 
+    // Play all accumulated samples via a one-shot AudioQueue, then return
     void wait_drain() override {
-        if (!output_queue_ || !has_playback_) return;
-        // Wait until all TX buffers have been played (with 5s safety timeout)
-        std::unique_lock<std::mutex> lk(tx_mtx_);
-        bool ok = tx_cv_.wait_for(lk, std::chrono::seconds(5),
-            [this] { return tx_pending_ <= 0 || !has_playback_; });
-        if (!ok)
-            fprintf(stderr, "  [Audio] WARNING: wait_drain timeout (pending=%d)\n", tx_pending_);
-        tx_pending_ = 0;  // reset in case of timeout
-        // Re-enqueue free buffers as silence to keep pipeline warm
-        tx_want_bufs_ = false;
-        while (tx_free_count_ > 0) {
-            AudioQueueBufferRef buf = tx_free_bufs_[--tx_free_count_];
-            memset(buf->mAudioData, 0, BUFFER_FRAMES * 2);
-            buf->mAudioDataByteSize = BUFFER_FRAMES * 2;
-            AudioQueueEnqueueBuffer(output_queue_, buf, 0, nullptr);
+        if (tx_pcm_.empty() || !has_playback_) return;
+
+        AudioStreamBasicDescription fmt{};
+        fmt.mSampleRate = sample_rate_;
+        fmt.mFormatID = kAudioFormatLinearPCM;
+        fmt.mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked;
+        fmt.mBitsPerChannel = 16;
+        fmt.mChannelsPerFrame = 1;
+        fmt.mBytesPerFrame = 2;
+        fmt.mFramesPerPacket = 1;
+        fmt.mBytesPerPacket = 2;
+
+        AudioQueueRef q = nullptr;
+        OSStatus err = AudioQueueNewOutput(&fmt, tx_burst_cb, nullptr, nullptr,
+                                           kCFRunLoopCommonModes, 0, &q);
+        if (err != noErr || !q) {
+            fprintf(stderr, "[Audio] TX queue create failed: %d\n", (int)err);
+            tx_pcm_.clear();
+            return;
         }
+
+        // Set output device if user selected one
+        if (tx_dev_id_ != 0) {
+            CFStringRef uidRef = nullptr;
+            AudioObjectPropertyAddress uidProp = {
+                kAudioDevicePropertyDeviceUID,
+                kAudioObjectPropertyScopeGlobal,
+                kAudioObjectPropertyElementMain
+            };
+            UInt32 uidSz = sizeof(uidRef);
+            if (AudioObjectGetPropertyData(tx_dev_id_, &uidProp, 0, nullptr, &uidSz, &uidRef) == noErr && uidRef) {
+                AudioQueueSetProperty(q, kAudioQueueProperty_CurrentDevice, &uidRef, sizeof(uidRef));
+                CFRelease(uidRef);
+            }
+        }
+
+        // Enqueue all samples in chunks
+        size_t off = 0;
+        while (off < tx_pcm_.size()) {
+            int chunk = std::min((int)(tx_pcm_.size() - off), BUFFER_FRAMES);
+            AudioQueueBufferRef buf = nullptr;
+            AudioQueueAllocateBuffer(q, chunk * 2, &buf);
+            memcpy(buf->mAudioData, tx_pcm_.data() + off, chunk * 2);
+            buf->mAudioDataByteSize = chunk * 2;
+            AudioQueueEnqueueBuffer(q, buf, 0, nullptr);
+            off += chunk;
+        }
+
+        // Start playback and synchronously drain (blocks until all audio played)
+        AudioQueueStart(q, nullptr);
+        AudioQueueStop(q, false);  // false = drain (play all then stop)
+        AudioQueueDispose(q, true);
+        tx_pcm_.clear();
     }
 
     void close() override {
@@ -265,13 +270,7 @@ public:
         has_capture_ = false;
         rx_cv_.notify_all();
 
-        if (output_queue_) {
-            AudioQueueStop(output_queue_, true);
-            AudioQueueDispose(output_queue_, true);
-            output_queue_ = nullptr;
-        }
         has_playback_ = false;
-        tx_cv_.notify_all();
     }
 
 private:
@@ -286,17 +285,10 @@ private:
     std::mutex              rx_mtx_;
     std::condition_variable rx_cv_;
 
-    // Playback
-    AudioQueueRef          output_queue_ = nullptr;
-    AudioQueueBufferRef    output_bufs_[NUM_BUFFERS]{};
+    // Playback — per-burst AudioQueue (created fresh in wait_drain)
     bool                   has_playback_ = false;
-
-    AudioQueueBufferRef    tx_free_bufs_[NUM_BUFFERS]{};
-    int                    tx_free_count_ = 0;
-    int                    tx_pending_    = 0;   // TX data buffers not yet played
-    bool                   tx_want_bufs_  = false; // write() needs buffers from silence loop
-    std::mutex              tx_mtx_;
-    std::condition_variable tx_cv_;
+    AudioDeviceID          tx_dev_id_    = 0;     // saved from open() for device selection
+    std::vector<int16_t>   tx_pcm_;               // accumulated TX samples
 
     static void input_callback(void* ctx, AudioQueueRef /*q*/, AudioQueueBufferRef buf,
                                const AudioTimeStamp*, UInt32, const AudioStreamPacketDescription*) {
@@ -318,28 +310,8 @@ private:
         AudioQueueEnqueueBuffer(self->input_queue_, buf, 0, nullptr);
     }
 
-    static void output_callback(void* ctx, AudioQueueRef q, AudioQueueBufferRef buf) {
-        auto* self = static_cast<CoreAudioDevice*>(ctx);
-        std::lock_guard<std::mutex> lk(self->tx_mtx_);
-
-        if (self->tx_pending_ > 0) {
-            // TX data buffer finished playing — return to free pool
-            self->tx_pending_--;
-            if (self->tx_free_count_ < NUM_BUFFERS)
-                self->tx_free_bufs_[self->tx_free_count_++] = buf;
-            self->tx_cv_.notify_all();
-        } else if (self->tx_want_bufs_) {
-            // write() needs buffers — return this one from the silence loop
-            if (self->tx_free_count_ < NUM_BUFFERS)
-                self->tx_free_bufs_[self->tx_free_count_++] = buf;
-            self->tx_cv_.notify_all();
-        } else {
-            // Idle — re-enqueue silence to keep audio pipeline warm
-            memset(buf->mAudioData, 0, BUFFER_FRAMES * 2);
-            buf->mAudioDataByteSize = BUFFER_FRAMES * 2;
-            AudioQueueEnqueueBuffer(q, buf, 0, nullptr);
-        }
-    }
+    // Burst callback — buffers freed by AudioQueueDispose, nothing to do
+    static void tx_burst_cb(void*, AudioQueueRef, AudioQueueBufferRef) {}
 };
 
 AudioDevice* AudioDevice::create() {
