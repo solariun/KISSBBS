@@ -679,7 +679,12 @@ static void run_bridge(const Config& cfg) {
                 audio->flush();
                 audio->wait_drain();
                 ptt_ctl.set(false);
-                if (cfg.debug) fprintf(stderr, "  [TX] done, PTT OFF\n");
+                if (cfg.debug) fprintf(stderr, "  [TX] done, PTT OFF, cooldown %dms\n",
+                                       kp.txdelay * 10);
+
+                // TX cooldown: wait TXDELAY before next burst
+                // Gives the remote side time to process and respond
+                usleep(kp.txdelay * 10000);
             }
         }
     });
