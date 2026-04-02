@@ -265,7 +265,7 @@ struct Config {
     int t3_ms   = 60000;              // keep-alive / inactivity timer ms
     int n2      = 10;                 // max retransmissions before link-fail
     int baud    = 9600;               // link speed (for dynamic T1 computation)
-    int txdelay = 0;                  // KISS TX delay (×10 ms units, 0=TNC controls timing)
+    int txdelay = 40;                 // KISS TX delay (×10 ms units, default 400ms)
     int persist = 63;                 // KISS persistence (0-255)
 
     // KISSet-style dynamic T1: max(t1_ms, window × mtu × 40000 / baud).
