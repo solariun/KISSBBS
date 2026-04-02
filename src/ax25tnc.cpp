@@ -1630,7 +1630,7 @@ int main(int argc, char* argv[]) {
             if (cfg.kiss_tnc) tnc_kiss_init(kiss.fd());
         }
     }
-    kiss.set_txdelay(cfg.txdelay);
+    kiss.set_txdelay(cfg.txdelay);  // cfg.txdelay is already in ms, set_txdelay expects ms
     kiss.set_persistence(cfg.ax25.persist);
 
     // ── Create Router ────────────────────────────────────────────────────────

@@ -622,8 +622,8 @@ static void run_bridge(const Config& cfg) {
                 if (cfg.debug) fprintf(stderr, "  [DCD] clear\n");
             }
 
-            // ── Step 3: post-receive gap (TXTAIL) ──
-            usleep(kp.txtail * 10000);
+            // ── Step 3: short gap after DCD clears (let channel settle) ──
+            usleep(20000);  // 20ms — just enough for squelch tail
 
             // ── Step 4: collect ALL pending frames ──
             std::vector<std::vector<uint8_t>> batch;
