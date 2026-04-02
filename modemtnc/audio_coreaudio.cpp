@@ -280,7 +280,7 @@ private:
     AudioQueueBufferRef    input_bufs_[NUM_BUFFERS]{};
     bool                   has_capture_ = false;
 
-    static constexpr int RX_RING_SIZE = 16384;
+    static constexpr int RX_RING_SIZE = 65536;  // ~1.5s at 44100 Hz — survives long TX bursts
     int16_t rx_ring_[RX_RING_SIZE]{};
     int     rx_wr_ = 0, rx_rd_ = 0, rx_avail_ = 0;
     std::mutex              rx_mtx_;
