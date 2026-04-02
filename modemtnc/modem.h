@@ -93,9 +93,16 @@ private:
     int   prev_demod_data_;     // per-sample: for PLL transition detection
     int   prev_demod_bit_;      // per-bit: for NRZI decode at sample points
 
-    // ----- DCD tracking -----
-    unsigned int dcd_shreg_;     // 32-bit shift register for quality tracking
-    int          dcd_count_;
+    // ----- DCD tracking (from Direwolf: transition quality over 32 symbols) -----
+    // A good transition occurs when the PLL phase is near zero at a data transition.
+    // We track the last 32 transitions: 1=good, 0=bad.
+    // DCD ON when >= DCD_THRESH_ON good transitions out of 32.
+    // DCD OFF when < DCD_THRESH_OFF.
+    static const int DCD_THRESH_ON  = 25;  // need 25/32 good transitions to lock
+    static const int DCD_THRESH_OFF = 10;  // drop below 10/32 to unlock
+    unsigned int dcd_shreg_;     // 32-bit shift register (1=good, 0=bad transition)
+    int          dcd_count_;     // popcount of dcd_shreg_ (cached)
+    int          dcd_missing_;   // samples since last transition (detect silence)
 
     // Cosine table
     float cos256_[256];

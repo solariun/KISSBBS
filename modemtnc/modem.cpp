@@ -140,6 +140,7 @@ void Demodulator::init(Type type, int sample_rate) {
     dcd_ = false;
     dcd_shreg_ = 0;
     dcd_count_ = 0;
+    dcd_missing_ = 0;
     data_clock_pll_ = 0;
     prev_d_c_pll_ = 0;
     prev_demod_data_ = 0;
@@ -300,35 +301,72 @@ void Demodulator::nudge_pll(float demod_out) {
     // Advance PLL (unsigned add to avoid signed overflow)
     data_clock_pll_ = (int)((unsigned int)data_clock_pll_ + (unsigned int)pll_step_per_sample_);
 
+    // Count samples since last transition (for DCD silence detection)
+    dcd_missing_++;
+
     // Overflow (positive → negative): sample a data bit
     if (data_clock_pll_ < 0 && prev_d_c_pll_ > 0) {
         int raw_bit = demod_out > 0 ? 1 : 0;
 
         int dbit;
         if (type_ == GMSK_9600 || type_ == AIS) {
-            // G3RUH: descramble then NRZI decode
             int descrambled = descramble(raw_bit, &bb_.scramble_state);
             dbit = (descrambled == prev_demod_bit_) ? 1 : 0;
             prev_demod_bit_ = descrambled;
         } else {
-            // AFSK NRZI: same as previous sampled bit = 1, different = 0
             dbit = (raw_bit == prev_demod_bit_) ? 1 : 0;
             prev_demod_bit_ = raw_bit;
         }
 
-        dcd_ = true;
         if (on_bit_) on_bit_(dbit);
     }
 
-    // Nudge PLL at every data transition (every sample, not just at overflow)
+    // --- DCD tracking at every data transition ---
     int demod_data = demod_out > 0 ? 1 : 0;
     if (demod_data != prev_demod_data_) {
+        // Transition detected — evaluate quality
+        // A "good" transition has PLL phase near zero (mid-point between samples)
+        // PLL is signed 32-bit: 0 = perfect mid-bit, ±2^31 = worst
+        // Good = PLL magnitude < 25% of full cycle
+        unsigned int pll_mag = (unsigned int)(data_clock_pll_ < 0 ? -data_clock_pll_ : data_clock_pll_);
+        bool good = (pll_mag < 0x40000000u);  // < 25% of 2^32
+
+        // Shift into 32-bit quality register
+        dcd_shreg_ <<= 1;
+        if (good) dcd_shreg_ |= 1;
+
+        // Popcount (count good transitions in last 32)
+        unsigned int v = dcd_shreg_;
+        int cnt = 0;
+        while (v) { cnt += (v & 1); v >>= 1; }
+        dcd_count_ = cnt;
+
+        // Hysteresis: DCD ON at >= 25/32, OFF at < 10/32
+        if (!dcd_ && dcd_count_ >= DCD_THRESH_ON)
+            dcd_ = true;
+        else if (dcd_ && dcd_count_ < DCD_THRESH_OFF)
+            dcd_ = false;
+
+        dcd_missing_ = 0;
+
+        // PLL nudge
         if (dcd_)
             data_clock_pll_ = (int)(data_clock_pll_ * pll_locked_inertia_);
         else
             data_clock_pll_ = (int)(data_clock_pll_ * pll_searching_inertia_);
     }
-    prev_demod_data_ = demod_data;  // Updated every sample for transition detection
+
+    // No transitions for too long → DCD off (silence / no signal)
+    // Threshold: 4 bit periods worth of samples with no transition
+    int silence_thresh = (sample_rate_ * 4) / (type_ == GMSK_9600 ? 9600 :
+                          type_ == AFSK_300 ? 300 : 1200);
+    if (dcd_missing_ > silence_thresh) {
+        dcd_ = false;
+        dcd_shreg_ = 0;
+        dcd_count_ = 0;
+    }
+
+    prev_demod_data_ = demod_data;
 }
 
 // ===========================================================================
