@@ -60,8 +60,9 @@ struct Config {
     int         slottime      = 10;   // in 10ms units (10 = 100ms)
     int         volume        = 50;
     bool        list_devices  = false;
-    bool        test_ptt      = false;  // toggle PTT 3 times and exit
-    std::string test_tx;                // send a UI frame and exit (callsign>dest text)
+    bool        test_ptt      = false;
+    std::string test_tx;
+    bool        debug         = false;
 
     // PTT control
     ptt::Config ptt;
@@ -216,6 +217,7 @@ static void usage() {
         "  --test-ptt        Toggle PTT 3 times (1s on, 1s off) and exit\n"
         "  --test-tx TEXT    Send one UI frame (CALL>CQ TEXT) via audio and exit\n"
         "                      e.g. --test-tx \"Hello from modemtnc\"\n"
+        "  --debug           Verbose debug output (PTY hex, queue, TX timing)\n"
         "  -h, --help        Show this help\n"
         "\n"
         "Examples:\n"
@@ -261,6 +263,7 @@ static Config parse_args(int argc, char* argv[]) {
         {"cat-tx-off",   required_argument, nullptr, 15},
         {"test-ptt",     no_argument,       nullptr, 16},
         {"test-tx",      required_argument, nullptr, 17},
+        {"debug",        no_argument,       nullptr, 18},
         {"help",        no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
@@ -310,6 +313,7 @@ static Config parse_args(int argc, char* argv[]) {
             case 15:  cfg.ptt.cat_tx_off = optarg; break;
             case 16:  cfg.test_ptt = true; break;
             case 17:  cfg.test_tx = optarg; break;
+            case 18:  cfg.debug = true; break;
             case 'h': usage(); exit(0);
             default:  usage(); exit(1);
         }
@@ -512,7 +516,9 @@ static void run_bridge(const Config& cfg) {
     std::string slave_name;
     int pty_master = open_pty(&slave_fd, slave_name);
     if (pty_master < 0) { fprintf(stderr, "Failed to open PTY\n"); exit(1); }
-    ::close(slave_fd);  // we only use master side
+    // Keep slave_fd open — on macOS, closing the last slave fd
+    // causes the PTY master to return EIO on subsequent reads.
+    // Clients (ax25send, ax25tnc) open/close the slave independently.
 
     create_symlink(slave_name, cfg.link_path);
 
@@ -578,17 +584,65 @@ static void run_bridge(const Config& cfg) {
             ::write(fd, kissed.data(), kissed.size());
     });
 
-    // Wire TX: modulator samples → audio output
-    std::vector<int16_t> tx_audio;
-    modulator.set_on_sample([&tx_audio](int16_t s) { tx_audio.push_back(s); });
-    hdlc_enc.set_on_bit([&modulator](int bit) { modulator.put_bit(bit); });
-
     // KISS params
     KissParams kp;
     kp.txdelay  = cfg.txdelay;   // already in 10ms units
     kp.persist  = cfg.persist;
     kp.slottime = cfg.slottime;
     kp.txtail   = cfg.txtail;
+
+    // TX queue: frames from PTY/TCP → TX thread
+    std::mutex tx_queue_mtx;
+    std::condition_variable tx_queue_cv;
+    std::vector<std::vector<uint8_t>> tx_queue;
+
+    // TX thread: encode, modulate, PTT, write audio
+    std::thread tx_thread([&]() {
+        std::vector<int16_t> tx_audio;
+        modulator.set_on_sample([&tx_audio](int16_t s) { tx_audio.push_back(s); });
+        hdlc_enc.set_on_bit([&modulator](int bit) { modulator.put_bit(bit); });
+
+        while (g_running) {
+            std::vector<uint8_t> frame;
+            {
+                std::unique_lock<std::mutex> lk(tx_queue_mtx);
+                tx_queue_cv.wait_for(lk, std::chrono::milliseconds(100),
+                    [&] { return !tx_queue.empty() || !g_running; });
+                if (!g_running) break;
+                if (tx_queue.empty()) continue;
+                frame = std::move(tx_queue.front());
+                tx_queue.erase(tx_queue.begin());
+            }
+
+            int flags = kp.txdelay * cfg.baud / (8 * 100);
+            if (flags < 5) flags = 5;
+
+            tx_audio.clear();
+            hdlc_enc.send_frame(frame.data(), frame.size(), flags, 2);
+            modulator.put_quiet_ms(kp.txtail * 10);
+
+            if (!tx_audio.empty()) {
+                if (cfg.debug)
+                    fprintf(stderr, "  [TX] %zu samples (%.0f ms), PTT ON\n",
+                            tx_audio.size(), 1000.0 * tx_audio.size() / cfg.sample_rate);
+
+                ptt_ctl.set(true);
+                size_t off = 0;
+                while (off < tx_audio.size()) {
+                    int chunk = std::min((int)(tx_audio.size() - off), 1024);
+                    int written = audio->write(tx_audio.data() + off, chunk);
+                    if (written > 0) off += written;
+                    else { if (cfg.debug) fprintf(stderr, "  [TX] write err at off=%zu\n", off); break; }
+                }
+                audio->flush();
+                audio->wait_drain();
+                ptt_ctl.set(false);
+                if (cfg.debug) fprintf(stderr, "  [TX] done, PTT OFF\n");
+            } else {
+                if (cfg.debug) fprintf(stderr, "  [TX] WARNING: 0 samples!\n");
+            }
+        }
+    });
 
     // RX audio thread
     std::thread rx_thread([&]() {
@@ -629,33 +683,25 @@ static void run_bridge(const Config& cfg) {
             uint8_t buf[2048];
             ssize_t n = ::read(pty_master, buf, sizeof(buf));
             if (n > 0) {
+                if (cfg.debug) {
+                    fprintf(stderr, "  [PTY] read %zd bytes:", n);
+                    for (ssize_t i = 0; i < n && i < 32; i++) fprintf(stderr, " %02x", buf[i]);
+                    if (n > 32) fprintf(stderr, " ...");
+                    fprintf(stderr, "\n");
+                }
                 auto frames = kiss_dec.feed(buf, n);
                 for (auto& kf : frames) {
                     if (kf.command == ax25::kiss::Cmd::Data && kf.data.size() > 0) {
-                        // Data frame → TX
+                        // Data frame → enqueue for TX thread
                         if (cfg.monitor) show_frame(kf.data.data(), kf.data.size(), "-> AIR");
-
-                        int flags = kp.txdelay * cfg.baud / (8 * 100);
-                        if (flags < 5) flags = 5;
-
-                        tx_audio.clear();
-                        hdlc_enc.send_frame(kf.data.data(), kf.data.size(), flags, 2);
-                        modulator.put_quiet_ms(kp.txtail * 10);
-
-                        // Write TX audio with PTT control
-                        if (!tx_audio.empty()) {
-                            ptt_ctl.set(true);   // Key transmitter
-                            size_t off = 0;
-                            while (off < tx_audio.size()) {
-                                int chunk = std::min((int)(tx_audio.size() - off), 1024);
-                                int written = audio->write(tx_audio.data() + off, chunk);
-                                if (written > 0) off += written;
-                                else break;
-                            }
-                            audio->flush();
-                            audio->wait_drain();  // block until audio played
-                            ptt_ctl.set(false);   // Release transmitter
+                        {
+                            std::lock_guard<std::mutex> lk(tx_queue_mtx);
+                            tx_queue.push_back(kf.data);
+                            if (cfg.debug)
+                                fprintf(stderr, "  [QUEUE] enqueued %zu bytes, depth=%zu\n",
+                                        kf.data.size(), tx_queue.size());
                         }
+                        tx_queue_cv.notify_one();
                     }
                     // Handle KISS parameter commands
                     else if (kf.command == ax25::kiss::Cmd::TxDelay && kf.data.size() >= 1)
@@ -685,24 +731,11 @@ static void run_bridge(const Config& cfg) {
                 for (auto& kf : frames) {
                     if (kf.command == ax25::kiss::Cmd::Data && kf.data.size() > 0) {
                         if (cfg.monitor) show_frame(kf.data.data(), kf.data.size(), "-> AIR");
-                        int flags = kp.txdelay * cfg.baud / (8 * 100);
-                        if (flags < 5) flags = 5;
-                        tx_audio.clear();
-                        hdlc_enc.send_frame(kf.data.data(), kf.data.size(), flags, 2);
-                        modulator.put_quiet_ms(kp.txtail * 10);
-                        if (!tx_audio.empty()) {
-                            ptt_ctl.set(true);
-                            size_t off = 0;
-                            while (off < tx_audio.size()) {
-                                int chunk = std::min((int)(tx_audio.size() - off), 1024);
-                                int written = audio->write(tx_audio.data() + off, chunk);
-                                if (written > 0) off += written;
-                                else break;
-                            }
-                            audio->flush();
-                            audio->wait_drain();
-                            ptt_ctl.set(false);
+                        {
+                            std::lock_guard<std::mutex> lk(tx_queue_mtx);
+                            tx_queue.push_back(kf.data);
                         }
+                        tx_queue_cv.notify_one();
                     }
                 }
             }
@@ -711,10 +744,13 @@ static void run_bridge(const Config& cfg) {
     }
 
     g_running = false;
+    tx_queue_cv.notify_all();
+    tx_thread.join();
     audio->close();
     rx_thread.join();
 
     unlink(cfg.link_path.c_str());
+    ::close(slave_fd);
     ::close(pty_master);
     if (tcp_srv >= 0) ::close(tcp_srv);
     for (int fd : tcp_clients) ::close(fd);
