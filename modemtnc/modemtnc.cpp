@@ -172,7 +172,14 @@ static void usage() {
         "  --server-port N   TCP KISS server port (disabled by default)\n"
         "\n"
         "PTT control:\n"
-        "  --ptt METHOD      PTT method: vox, rts, dtr, cm108, gpio (default: vox)\n"
+        "  --ptt METHOD      PTT method (default: vox):\n"
+        "                      vox       audio-triggered (no hardware control)\n"
+        "                      rts, +rts assert RTS on serial port\n"
+        "                      -rts      assert RTS inverted (active low)\n"
+        "                      dtr, +dtr assert DTR on serial port\n"
+        "                      -dtr      assert DTR inverted (active low)\n"
+        "                      cm108     CM108/CM119 USB GPIO (Digirig)\n"
+        "                      gpio      Linux sysfs GPIO\n"
         "  --ptt-device DEV  Serial port or HID device for PTT\n"
         "                      rts/dtr: /dev/ttyUSB0, /dev/cu.usbserial-*\n"
         "                      cm108:   /dev/hidraw0 (auto-detected if omitted)\n"
@@ -250,9 +257,11 @@ static Config parse_args(int argc, char* argv[]) {
             case 5:   cfg.volume = atoi(optarg); break;
             case 6: { // --ptt METHOD
                 std::string m = optarg;
-                if (m == "vox")       cfg.ptt.method = ptt::VOX;
-                else if (m == "rts")  cfg.ptt.method = ptt::SERIAL_RTS;
-                else if (m == "dtr")  cfg.ptt.method = ptt::SERIAL_DTR;
+                if (m == "vox")        cfg.ptt.method = ptt::VOX;
+                else if (m == "rts"  || m == "+rts")  { cfg.ptt.method = ptt::SERIAL_RTS; cfg.ptt.invert = false; }
+                else if (m == "-rts")                  { cfg.ptt.method = ptt::SERIAL_RTS; cfg.ptt.invert = true; }
+                else if (m == "dtr"  || m == "+dtr")  { cfg.ptt.method = ptt::SERIAL_DTR; cfg.ptt.invert = false; }
+                else if (m == "-dtr")                  { cfg.ptt.method = ptt::SERIAL_DTR; cfg.ptt.invert = true; }
                 else if (m == "cm108") cfg.ptt.method = ptt::CM108;
                 else if (m == "gpio") cfg.ptt.method = ptt::GPIO;
                 else if (m == "hamlib" || m == "cat") cfg.ptt.method = ptt::HAMLIB;
