@@ -15,8 +15,130 @@ class CoreAudioDevice : public AudioDevice {
 public:
     ~CoreAudioDevice() override { close(); }
 
-    bool open(const char* /*device*/, int sample_rate, bool capture, bool playback) override {
+    // Find AudioDeviceID by name or index (e.g. "1", "USB Audio Device")
+    // Returns 0 (kAudioDeviceUnknown) if not found or empty string (use default)
+    AudioDeviceID find_device(const char* device) {
+        if (!device || !device[0]) return 0;
+
+        // Get all devices
+        AudioObjectPropertyAddress prop = {
+            kAudioHardwarePropertyDevices,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain
+        };
+        UInt32 size = 0;
+        AudioObjectGetPropertyDataSize(kAudioObjectSystemObject, &prop, 0, nullptr, &size);
+        if (size == 0) return 0;
+
+        int count = (int)(size / sizeof(AudioDeviceID));
+        AudioDeviceID* devices = new AudioDeviceID[count];
+        AudioObjectGetPropertyData(kAudioObjectSystemObject, &prop, 0, nullptr, &size, devices);
+
+        // Check if device is a number (index from --list-devices)
+        char* endp = nullptr;
+        long idx = strtol(device, &endp, 10);
+        bool is_index = (endp && *endp == '\0' && idx >= 0);
+
+        AudioDeviceID found = 0;
+        int visible = 0;
+        for (int i = 0; i < count; i++) {
+            // Check if device has any channels
+            AudioObjectPropertyAddress inProp = {
+                kAudioDevicePropertyStreamConfiguration,
+                kAudioDevicePropertyScopeInput,
+                kAudioObjectPropertyElementMain
+            };
+            AudioObjectPropertyAddress outProp = {
+                kAudioDevicePropertyStreamConfiguration,
+                kAudioDevicePropertyScopeOutput,
+                kAudioObjectPropertyElementMain
+            };
+            UInt32 inSz = 0, outSz = 0;
+            bool has_in = false, has_out = false;
+            if (AudioObjectGetPropertyDataSize(devices[i], &inProp, 0, nullptr, &inSz) == noErr && inSz > 0) {
+                AudioBufferList* b = (AudioBufferList*)malloc(inSz);
+                if (AudioObjectGetPropertyData(devices[i], &inProp, 0, nullptr, &inSz, b) == noErr)
+                    for (UInt32 j = 0; j < b->mNumberBuffers; j++) if (b->mBuffers[j].mNumberChannels > 0) has_in = true;
+                free(b);
+            }
+            if (AudioObjectGetPropertyDataSize(devices[i], &outProp, 0, nullptr, &outSz) == noErr && outSz > 0) {
+                AudioBufferList* b = (AudioBufferList*)malloc(outSz);
+                if (AudioObjectGetPropertyData(devices[i], &outProp, 0, nullptr, &outSz, b) == noErr)
+                    for (UInt32 j = 0; j < b->mNumberBuffers; j++) if (b->mBuffers[j].mNumberChannels > 0) has_out = true;
+                free(b);
+            }
+            if (!has_in && !has_out) continue;
+
+            if (is_index && visible == (int)idx) {
+                found = devices[i];
+                break;
+            }
+
+            // Match by name (substring)
+            if (!is_index) {
+                CFStringRef nameRef = nullptr;
+                AudioObjectPropertyAddress nameProp = { kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+                UInt32 ns = sizeof(nameRef);
+                AudioObjectGetPropertyData(devices[i], &nameProp, 0, nullptr, &ns, &nameRef);
+                if (nameRef) {
+                    char name[256];
+                    CFStringGetCString(nameRef, name, sizeof(name), kCFStringEncodingUTF8);
+                    CFRelease(nameRef);
+                    if (strstr(name, device) != nullptr) { found = devices[i]; break; }
+                }
+            }
+            visible++;
+        }
+        delete[] devices;
+        return found;
+    }
+
+    // Set the device on an AudioQueue by AudioDeviceID
+    bool set_queue_device(AudioQueueRef queue, AudioDeviceID devId) {
+        if (devId == 0) return true;  // use default
+
+        // Get UID from device ID
+        CFStringRef uidRef = nullptr;
+        AudioObjectPropertyAddress uidProp = {
+            kAudioDevicePropertyDeviceUID,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain
+        };
+        UInt32 uidSz = sizeof(uidRef);
+        if (AudioObjectGetPropertyData(devId, &uidProp, 0, nullptr, &uidSz, &uidRef) != noErr || !uidRef)
+            return false;
+
+        OSStatus err = AudioQueueSetProperty(queue, kAudioQueueProperty_CurrentDevice, &uidRef, sizeof(uidRef));
+        CFRelease(uidRef);
+        if (err != noErr) {
+            fprintf(stderr, "[Audio] Failed to set device on queue: %d\n", (int)err);
+            return false;
+        }
+        return true;
+    }
+
+    bool open(const char* device, int sample_rate, bool capture, bool playback) override {
         sample_rate_ = sample_rate;
+
+        AudioDeviceID devId = find_device(device);
+        if (device && device[0] && devId == 0) {
+            fprintf(stderr, "[Audio] Device not found: '%s'\n", device);
+            fprintf(stderr, "        Run --list-devices to see available devices\n");
+            return false;
+        }
+        if (devId != 0) {
+            // Print selected device name
+            CFStringRef nameRef = nullptr;
+            AudioObjectPropertyAddress np = { kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain };
+            UInt32 ns = sizeof(nameRef);
+            AudioObjectGetPropertyData(devId, &np, 0, nullptr, &ns, &nameRef);
+            if (nameRef) {
+                char name[256];
+                CFStringGetCString(nameRef, name, sizeof(name), kCFStringEncodingUTF8);
+                CFRelease(nameRef);
+                fprintf(stderr, "  Audio device: %s\n", name);
+            }
+        }
 
         AudioStreamBasicDescription fmt{};
         fmt.mSampleRate = sample_rate;
@@ -35,6 +157,7 @@ public:
                 fprintf(stderr, "[Audio] Failed to create input queue: %d\n", (int)err);
                 return false;
             }
+            set_queue_device(input_queue_, devId);
             for (int i = 0; i < NUM_BUFFERS; i++) {
                 AudioQueueAllocateBuffer(input_queue_, BUFFER_FRAMES * 2, &input_bufs_[i]);
                 AudioQueueEnqueueBuffer(input_queue_, input_bufs_[i], 0, nullptr);
@@ -56,6 +179,7 @@ public:
                 fprintf(stderr, "[Audio] Failed to create output queue: %d\n", (int)err);
                 return false;
             }
+            set_queue_device(output_queue_, devId);
             for (int i = 0; i < NUM_BUFFERS; i++) {
                 AudioQueueAllocateBuffer(output_queue_, BUFFER_FRAMES * 2, &output_bufs_[i]);
                 output_bufs_[i]->mAudioDataByteSize = 0;
