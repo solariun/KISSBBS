@@ -596,9 +596,9 @@ static void run_bridge(const Config& cfg) {
     std::condition_variable tx_queue_cv;
     std::vector<std::vector<uint8_t>> tx_queue;
 
-    // TX thread: batch all pending frames into one TX burst
-    // Flow: wait for frame → collect more frames (slottime window) →
-    //       PTT ON → txdelay preamble → frame1 → frame2 → ... → txtail → PTT OFF
+    // TX thread: CSMA/CA + batch all pending frames into one TX burst
+    // Flow: wait for frame → CSMA (check DCD, persistence) →
+    //       collect more frames → PTT ON → preamble → frames → tail → PTT OFF
     std::thread tx_thread([&]() {
         std::vector<int16_t> tx_audio;
         modulator.set_on_sample([&tx_audio](int16_t s) { tx_audio.push_back(s); });
@@ -613,23 +613,38 @@ static void run_bridge(const Config& cfg) {
                     [&] { return !tx_queue.empty() || !g_running; });
                 if (!g_running) break;
                 if (tx_queue.empty()) continue;
-
-                // Collect first frame
-                batch.push_back(std::move(tx_queue.front()));
-                tx_queue.erase(tx_queue.begin());
             }
 
-            // Wait a short window (slottime) for more frames to batch
+            // CSMA/CA: wait for channel clear, then apply persistence
+            if (!kp.fullduplex) {
+                // Wait for DCD to clear (channel not busy)
+                while (g_running && demod.dcd()) {
+                    usleep(10000);  // 10ms poll
+                }
+
+                // Persistence algorithm: random chance to transmit per slot
+                while (g_running) {
+                    int r = rand() & 0xFF;
+                    if (r <= kp.persist) break;  // transmit!
+                    usleep(kp.slottime * 10000); // wait one slottime
+                    // Re-check DCD
+                    if (demod.dcd()) {
+                        // Channel busy again — wait for it to clear
+                        while (g_running && demod.dcd())
+                            usleep(10000);
+                    }
+                }
+            }
+
+            // Grab all pending frames (batch)
             {
                 std::unique_lock<std::mutex> lk(tx_queue_mtx);
-                tx_queue_cv.wait_for(lk, std::chrono::milliseconds(kp.slottime * 10),
-                    [&] { return !tx_queue.empty() || !g_running; });
-                // Grab all pending frames
                 while (!tx_queue.empty()) {
                     batch.push_back(std::move(tx_queue.front()));
                     tx_queue.erase(tx_queue.begin());
                 }
             }
+            if (batch.empty()) continue;
 
             // Modulate all frames into one audio burst
             int flags = kp.txdelay * cfg.baud / (8 * 100);
