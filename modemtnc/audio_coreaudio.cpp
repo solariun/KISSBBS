@@ -195,7 +195,7 @@ public:
 
     // Accumulate samples — played all at once in wait_drain()
     int write(const int16_t* buf, int frames) override {
-        if (!has_playback_) return 0;
+        if (!has_playback_) { fprintf(stderr, "  [AQ] write: no playback!\n"); return 0; }
         int n = frames;
         for (int i = 0; i < n; i++)
             tx_pcm_.push_back(buf[i]);
@@ -206,6 +206,7 @@ public:
 
     // Play all accumulated samples via a one-shot AudioQueue, then return
     void wait_drain() override {
+        fprintf(stderr, "  [AQ] wait_drain: pcm=%zu playback=%d\n", tx_pcm_.size(), (int)has_playback_);
         if (tx_pcm_.empty() || !has_playback_) return;
 
         AudioStreamBasicDescription fmt{};
@@ -255,8 +256,12 @@ public:
         }
 
         // Start playback and synchronously drain (blocks until all audio played)
-        AudioQueueStart(q, nullptr);
-        AudioQueueStop(q, false);  // false = drain (play all then stop)
+        fprintf(stderr, "  [AQ] start burst: %zu samples\n", tx_pcm_.size());
+        err = AudioQueueStart(q, nullptr);
+        if (err != noErr) fprintf(stderr, "  [AQ] Start error: %d\n", (int)err);
+        err = AudioQueueStop(q, false);  // false = drain (play all then stop)
+        if (err != noErr) fprintf(stderr, "  [AQ] Stop error: %d\n", (int)err);
+        fprintf(stderr, "  [AQ] burst done\n");
         AudioQueueDispose(q, true);
         tx_pcm_.clear();
     }
