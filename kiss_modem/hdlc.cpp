@@ -3,6 +3,7 @@
 // Original: https://github.com/wb2osz/direwolf
 // Simplified for kiss_modem: single-channel, C++ classes, no global state
 #include "hdlc.h"
+#include <cstdio>
 #include <cstring>
 
 namespace hdlc {
