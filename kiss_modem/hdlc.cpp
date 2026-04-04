@@ -82,7 +82,7 @@ void Decoder::receive_bit(int raw) {
             uint16_t computed_fcs = fcs_calc(frame_buf_, frame_len_ - 2);
             if (received_fcs == computed_fcs) {
                 if (on_frame_) on_frame_(frame_buf_, frame_len_ - 2);
-            } else if (debug_) {
+            } else if (debug_ >= 3) {
                 fprintf(stderr, "  [HDLC] FCS fail: %d bytes (got=%04x want=%04x)\n",
                         frame_len_ - 2, received_fcs, computed_fcs);
             }
@@ -100,7 +100,7 @@ void Decoder::receive_bit(int raw) {
     if (dbit) {
         consecutive_ones_++;
         if (consecutive_ones_ >= 7) {
-            if (debug_ && collecting_ && frame_len_ > 0)
+            if (debug_ >= 3 && collecting_ && frame_len_ > 0)
                 fprintf(stderr, "  [HDLC] abort at %d bytes\n", frame_len_);
             collecting_ = false;
             frame_len_ = 0;

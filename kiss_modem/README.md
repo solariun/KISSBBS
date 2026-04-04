@@ -200,6 +200,10 @@ Display:
   --monitor         Print all decoded frames to stdout with timestamps
                       Shows direction (<- AIR for RX, -> AIR for TX),
                       AX.25 decode, and hex dump
+  --debug N         Debug level (1-3), all output timestamped:
+                      1 = TX timing, PTT ON/OFF, burst info
+                      2 = + queue depth, DCD state, PTY/TCP hex
+                      3 = + HDLC internals (FCS failures, aborts)
 
 Testing:
   --loopback        Self-test: TX -> modulate -> demodulate -> RX in memory

@@ -34,14 +34,14 @@ public:
     void receive_bit(int raw);
 
     void set_on_frame(FrameCb cb) { on_frame_ = cb; }
-    void set_debug(bool d) { debug_ = d; }
+    void set_debug(int level) { debug_ = level; }
 
 private:
     static constexpr int MAX_FRAME = 330;  // 256 info + 14 addr + ctrl + pid + 2 FCS + margin
     static constexpr uint8_t FLAG = 0x7E;
 
     FrameCb on_frame_;
-    bool    debug_ = false;
+    int     debug_ = 0;   // 0=off, 3=verbose (FCS fail, abort)
 
     uint8_t pat_det_;          // 8-bit shift register for flag detection
     int     olen_;             // output bit counter within current byte

@@ -22,7 +22,10 @@
 #include <getopt.h>
 #include <string>
 #include <vector>
+#include <deque>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <atomic>
 #include <chrono>
 
@@ -62,13 +65,29 @@ struct Config {
     bool        list_devices  = false;
     bool        test_ptt      = false;
     std::string test_tx;
-    bool        debug         = false;
+    int         debug_level   = 0;    // 0=off, 1=timing/TX/RX, 2=+queue/DCD/PTY, 3=+HDLC
 
     // PTT control
     ptt::Config ptt;
 };
 
 static void signal_handler(int) { g_running = false; }
+
+// ---------------------------------------------------------------------------
+//  Timestamp helper — used by --monitor and --debug
+// ---------------------------------------------------------------------------
+static const char* dbg_ts() {
+    static thread_local char buf[32];
+    auto now = std::chrono::system_clock::now();
+    auto t   = std::chrono::system_clock::to_time_t(now);
+    auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(
+                   now.time_since_epoch()) % 1000;
+    struct tm tm;
+    localtime_r(&t, &tm);
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03d",
+             tm.tm_hour, tm.tm_min, tm.tm_sec, (int)ms.count());
+    return buf;
+}
 
 // ---------------------------------------------------------------------------
 //  PTY helpers (same pattern as bt_kiss_bridge)
@@ -117,24 +136,12 @@ static int create_tcp_server(int port) {
 //  Monitor display
 // ---------------------------------------------------------------------------
 static void show_frame(const uint8_t* data, size_t len, const char* direction) {
-    auto now = std::chrono::system_clock::now();
-    auto t = std::chrono::system_clock::to_time_t(now);
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now.time_since_epoch()) % 1000;
-    struct tm tm;
-    localtime_r(&t, &tm);
-    char ts[32];
-    snprintf(ts, sizeof(ts), "%02d:%02d:%02d.%03d", tm.tm_hour, tm.tm_min, tm.tm_sec, (int)ms.count());
-
     std::vector<uint8_t> raw(data, data + len);
     ax25::Frame frame;
-    if (ax25::Frame::decode(raw, frame)) {
-        printf("[%s]  %s  %s\n", ts, direction, frame.format().c_str());
-    } else {
-        printf("[%s]  %s  [%zu bytes, decode failed]\n", ts, direction, len);
-    }
-
-    // Hex dump
+    if (ax25::Frame::decode(raw, frame))
+        printf("[%s]  %s  %s\n", dbg_ts(), direction, frame.format().c_str());
+    else
+        printf("[%s]  %s  [%zu bytes, decode failed]\n", dbg_ts(), direction, len);
     printf("%s", hex_dump(data, len, "           ").c_str());
     fflush(stdout);
 }
@@ -217,7 +224,7 @@ static void usage() {
         "  --test-ptt        Toggle PTT 3 times (1s on, 1s off) and exit\n"
         "  --test-tx TEXT    Send one UI frame (CALL>CQ TEXT) via audio and exit\n"
         "                      e.g. --test-tx \"Hello from kiss_modem\"\n"
-        "  --debug           Verbose debug output (PTY hex, queue, TX timing)\n"
+        "  --debug N         Debug level 1-3 (1=timing/TX/RX, 2=+queue/DCD/PTY, 3=+HDLC)\n"
         "  -h, --help        Show this help\n"
         "\n"
         "Examples:\n"
@@ -263,7 +270,7 @@ static Config parse_args(int argc, char* argv[]) {
         {"cat-tx-off",   required_argument, nullptr, 15},
         {"test-ptt",     no_argument,       nullptr, 16},
         {"test-tx",      required_argument, nullptr, 17},
-        {"debug",        no_argument,       nullptr, 18},
+        {"debug",        required_argument, nullptr, 18},
         {"help",        no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
@@ -313,7 +320,11 @@ static Config parse_args(int argc, char* argv[]) {
             case 15:  cfg.ptt.cat_tx_off = optarg; break;
             case 16:  cfg.test_ptt = true; break;
             case 17:  cfg.test_tx = optarg; break;
-            case 18:  cfg.debug = true; break;
+            case 18: {
+                int lvl = atoi(optarg);
+                cfg.debug_level = (lvl >= 1 && lvl <= 3) ? lvl : 1;
+                break;
+            }
             case 'h': usage(); exit(0);
             default:  usage(); exit(1);
         }
@@ -573,22 +584,41 @@ static void run_bridge(const Config& cfg) {
     demod.init(cfg.modem_type, actual_rate);
     modulator.init(cfg.modem_type, actual_rate, amp);
     hdlc_dec.init();
-    hdlc_dec.set_debug(cfg.debug);
+    hdlc_dec.set_debug(cfg.debug_level);
 
     // KISS decoder for host → radio TX path
     ax25::kiss::Decoder kiss_dec;
+
+    // ── Half-duplex RX mute ────────────────────────────────────────────────
+    // Standard TNC behavior: suppress RX during TX.
+    // Without this, the demodulator decodes our own transmitted audio and
+    // echoes it back to the host — corrupting the AX.25 state machine.
+    std::atomic<bool> tx_active{false};
 
     // Wire RX: demod bit → HDLC → frame → KISS encode → PTY/TCP
     demod.set_on_bit([&hdlc_dec](int bit) { hdlc_dec.receive_bit(bit); });
 
     hdlc_dec.set_on_frame([&](const uint8_t* data, size_t len) {
+        // Suppress self-echo: drop any frame decoded while TX is active
+        if (tx_active.load(std::memory_order_acquire)) {
+            if (cfg.debug_level >= 2)
+                fprintf(stderr, "[%s]  [RX] dropped echo frame (%zu bytes)\n", dbg_ts(), len);
+            return;
+        }
+
         if (cfg.monitor) show_frame(data, len, "<- AIR");
 
         // KISS-wrap and send to PTY + TCP clients
         auto kissed = ax25::kiss::encode(std::vector<uint8_t>(data, data + len));
         ::write(pty_master, kissed.data(), kissed.size());
-        for (int fd : tcp_clients)
+        int tcp_count = 0;
+        for (int fd : tcp_clients) {
             ::write(fd, kissed.data(), kissed.size());
+            tcp_count++;
+        }
+        if (cfg.debug_level >= 1)
+            fprintf(stderr, "[%s]  [RX] -> host: %zu bytes (pty+%d tcp)\n",
+                    dbg_ts(), len, tcp_count);
     });
 
     // KISS params
@@ -599,14 +629,18 @@ static void run_bridge(const Config& cfg) {
     kp.txtail   = cfg.txtail;
 
     // ── TX queue + thread ──────────────────────────────────────────────────
-    // KISS-compliant TNC behavior: deterministic, queue-based, no randomization
+    // KISS-dumb: modem does not inspect AX.25 content — that is the application's job.
     //
-    // Flow: frame arrives → queue → DCD wait → TXTAIL gap →
-    //       batch all pending → PTT ON → preamble → frames → tail → PTT OFF
+    // State machine per burst:
+    //   WAIT_WORK → DCD_WAIT → 20ms settle → BATCH → MODULATE →
+    //   PTT ON → write → drain → PTT OFF → 50ms cooldown → loop
+    //
+    // Timing authority: cfg.txdelay / cfg.txtail always.
+    // KISS parameter commands from clients are stored in kp but never used for timing.
     //
     std::mutex tx_queue_mtx;
     std::condition_variable tx_queue_cv;
-    std::vector<std::vector<uint8_t>> tx_queue;
+    std::deque<std::vector<uint8_t>> tx_queue;
 
     std::thread tx_thread([&]() {
         std::vector<int16_t> tx_audio;
@@ -614,55 +648,62 @@ static void run_bridge(const Config& cfg) {
         hdlc_enc.set_on_bit([&modulator](int bit) { modulator.put_bit(bit); });
 
         while (g_running) {
-            // ── Step 1: wait for at least one frame ──
+            // ── WAIT_WORK: block until at least one frame is queued ──
+            // cv.wait predicate returns immediately if queue is non-empty,
+            // so the cooldown loop-back never blocks here unnecessarily.
             {
                 std::unique_lock<std::mutex> lk(tx_queue_mtx);
                 tx_queue_cv.wait(lk, [&] { return !tx_queue.empty() || !g_running; });
                 if (!g_running) break;
             }
 
-            // ── Step 2: wait for channel clear (DCD OFF) ──
-            if (!kp.fullduplex && demod.dcd()) {
-                if (cfg.debug) fprintf(stderr, "  [DCD] waiting...\n");
+            // ── DCD_WAIT: hold until channel clear ──
+            if (!kp.fullduplex) {
+                if (cfg.debug_level >= 2 && demod.dcd())
+                    fprintf(stderr, "[%s]  [DCD] waiting...\n", dbg_ts());
                 while (g_running && demod.dcd())
-                    usleep(5000);  // 5ms poll
-                if (cfg.debug) fprintf(stderr, "  [DCD] clear\n");
+                    usleep(5000);
+                if (cfg.debug_level >= 2)
+                    fprintf(stderr, "[%s]  [DCD] clear\n", dbg_ts());
             }
 
-            // ── Step 3: short gap after DCD clears (let channel settle) ──
-            usleep(20000);  // 20ms — just enough for squelch tail
+            // ── SETTLE: 20ms squelch tail guard ──
+            usleep(20000);
 
-            // ── Step 4: collect ALL pending frames ──
+            // ── BATCH: drain the full queue in one go ──
             std::vector<std::vector<uint8_t>> batch;
             {
                 std::lock_guard<std::mutex> lk(tx_queue_mtx);
-                batch.swap(tx_queue);  // grab everything, O(1)
+                batch.reserve(tx_queue.size());
+                while (!tx_queue.empty()) {
+                    batch.push_back(std::move(tx_queue.front()));
+                    tx_queue.pop_front();
+                }
             }
             if (batch.empty()) continue;
 
-            // ── Step 5: modulate into one audio burst ──
-            // KISS command overrides kiss_modem default; if KISS sends 0, use kiss_modem default
-            int td = (kp.txdelay > 0) ? kp.txdelay : cfg.txdelay;
-            int preamble_flags = td * cfg.baud / (8 * 100);
-            if (preamble_flags < 15) preamble_flags = 15;  // safety minimum ~100ms @ 1200
+            // ── MODULATE: preamble + frames + tail ──
+            int preamble_flags = cfg.txdelay * cfg.baud / (8 * 100);
+            if (preamble_flags < 15) preamble_flags = 15;
 
             tx_audio.clear();
             for (size_t i = 0; i < batch.size(); i++) {
-                int flags = (i == 0) ? preamble_flags : 3; // first=full preamble, rest=short gap
+                int flags = (i == 0) ? preamble_flags : 3;
                 hdlc_enc.send_frame(batch[i].data(), batch[i].size(), flags, 2);
             }
-            modulator.put_quiet_ms(kp.txtail * 10);
+            modulator.put_quiet_ms(cfg.txtail * 10);
 
             if (tx_audio.empty()) continue;
 
-            if (cfg.debug)
-                fprintf(stderr, "  [TX] burst: %zu frame(s), %zu samples (%.0f ms)\n",
-                        batch.size(), tx_audio.size(),
+            if (cfg.debug_level >= 1)
+                fprintf(stderr, "[%s]  [TX] burst: %zu frame(s), %zu samples (%.0f ms)\n",
+                        dbg_ts(), batch.size(), tx_audio.size(),
                         1000.0 * tx_audio.size() / actual_rate);
 
-            // ── Step 6: PTT ON → write audio → drain → PTT OFF ──
+            // ── TX: PTT ON → write → drain → PTT OFF ──
+            tx_active.store(true, std::memory_order_release);
             ptt_ctl.set(true);
-            if (cfg.debug) fprintf(stderr, "  [TX] PTT ON\n");
+            if (cfg.debug_level >= 1) fprintf(stderr, "[%s]  [TX] PTT ON\n", dbg_ts());
 
             size_t off = 0;
             while (off < tx_audio.size()) {
@@ -675,7 +716,16 @@ static void run_bridge(const Config& cfg) {
             audio->wait_drain();
 
             ptt_ctl.set(false);
-            if (cfg.debug) fprintf(stderr, "  [TX] PTT OFF\n");
+            if (cfg.debug_level >= 1) fprintf(stderr, "[%s]  [TX] PTT OFF\n", dbg_ts());
+
+            // Reset HDLC decoder — flush any partial frame from self-echo
+            hdlc_dec.init();
+            hdlc_dec.set_debug(cfg.debug_level);
+            tx_active.store(false, std::memory_order_release);
+
+            // ── COOLDOWN: 50ms hard guard before next PTT ──
+            usleep(50000);
+            // Loop back to WAIT_WORK — cv.wait will not block if queue is non-empty.
         }
     });
 
@@ -718,8 +768,8 @@ static void run_bridge(const Config& cfg) {
             uint8_t buf[2048];
             ssize_t n = ::read(pty_master, buf, sizeof(buf));
             if (n > 0) {
-                if (cfg.debug) {
-                    fprintf(stderr, "  [PTY] read %zd bytes:", n);
+                if (cfg.debug_level >= 2) {
+                    fprintf(stderr, "[%s]  [PTY] read %zd bytes:", dbg_ts(), n);
                     for (ssize_t i = 0; i < n && i < 32; i++) fprintf(stderr, " %02x", buf[i]);
                     if (n > 32) fprintf(stderr, " ...");
                     fprintf(stderr, "\n");
@@ -727,6 +777,8 @@ static void run_bridge(const Config& cfg) {
                 auto frames = kiss_dec.feed(buf, n);
                 for (auto& kf : frames) {
                     if (kf.command == ax25::kiss::Cmd::Data && kf.data.size() > 0) {
+                        if (cfg.debug_level >= 1)
+                            fprintf(stderr, "[%s]  [TX] <- pty: %zu bytes\n", dbg_ts(), kf.data.size());
                         if (cfg.monitor) show_frame(kf.data.data(), kf.data.size(), "-> AIR");
                         size_t depth;
                         {
@@ -735,9 +787,9 @@ static void run_bridge(const Config& cfg) {
                             depth = tx_queue.size();
                         }
                         tx_queue_cv.notify_one();
-                        if (cfg.debug)
-                            fprintf(stderr, "  [QUEUE] +1 frame (%zu bytes), depth=%zu\n",
-                                    kf.data.size(), depth);
+                        if (cfg.debug_level >= 2)
+                            fprintf(stderr, "[%s]  [QUEUE] +1 frame (%zu bytes), depth=%zu\n",
+                                    dbg_ts(), kf.data.size(), depth);
                     }
                     // Handle KISS parameter commands
                     else if (kf.command == ax25::kiss::Cmd::TxDelay && kf.data.size() >= 1)
@@ -766,6 +818,8 @@ static void run_bridge(const Config& cfg) {
                 auto frames = kiss_dec.feed(buf, n);
                 for (auto& kf : frames) {
                     if (kf.command == ax25::kiss::Cmd::Data && kf.data.size() > 0) {
+                        if (cfg.debug_level >= 1)
+                            fprintf(stderr, "[%s]  [TX] <- tcp: %zu bytes\n", dbg_ts(), kf.data.size());
                         if (cfg.monitor) show_frame(kf.data.data(), kf.data.size(), "-> AIR");
                         {
                             std::lock_guard<std::mutex> lk(tx_queue_mtx);

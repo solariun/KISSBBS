@@ -26,6 +26,7 @@
 #include <vector>
 #include <atomic>
 #include <unistd.h>
+#include <chrono>
 
 static constexpr int RX_RING = 65536;   // ~1.5s at 44100
 static constexpr int TX_RING = 131072;  // ~3s — holds full TX burst
@@ -227,6 +228,9 @@ public:
     }
 
     // ── TX: accumulate at modem rate, resample to output rate in drain ───
+    // TX ring is SPSC lock-free: wait_drain is the sole writer,
+    // tx_callback is the sole reader (CoreAudio real-time thread).
+    // No mutex in the render callback — avoids priority inversion / AU reset.
 
     int write(const int16_t* buf, int frames) override {
         if (!has_tx_) return 0;
@@ -258,19 +262,27 @@ public:
             src = &resampled;
         }
 
-        // Write to TX ring buffer (output callback will read from it)
-        {
-            std::lock_guard<std::mutex> lk(tx_mtx_);
-            for (size_t i = 0; i < src->size(); i++) {
-                tx_ring_[tx_wr_] = (*src)[i];
-                tx_wr_ = (tx_wr_ + 1) % TX_RING;
-                if (tx_avail_ < TX_RING) tx_avail_++;
-            }
+        // Write to TX ring (lock-free: single producer, no mutex)
+        int wr = tx_wr_.load(std::memory_order_relaxed);
+        for (size_t i = 0; i < src->size(); i++) {
+            int next = (wr + 1) % TX_RING;
+            if (next == tx_rd_.load(std::memory_order_acquire)) break; // ring full — drop
+            tx_ring_[wr] = (*src)[i];
+            wr = next;
         }
+        tx_wr_.store(wr, std::memory_order_release);
 
-        // Sleep for audio duration (Direwolf approach — don't trust AQ/AU drain)
-        int duration_ms = (int)(1000L * (long)src->size() / out_rate_);
-        usleep((unsigned)(duration_ms + 50) * 1000);
+        // Wait for ring to drain: 1ms poll, hard timeout = expected duration + 200ms
+        int drain_ms = (int)(1000L * (long)src->size() / out_rate_) + 200;
+        auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(drain_ms);
+        while (true) {
+            int avail = (tx_wr_.load(std::memory_order_acquire) -
+                         tx_rd_.load(std::memory_order_acquire) + TX_RING) % TX_RING;
+            if (avail == 0) break;
+            if (std::chrono::steady_clock::now() >= deadline) break;
+            usleep(1000);
+        }
 
         tx_pcm_.clear();
     }
@@ -311,13 +323,13 @@ private:
     bool has_tx_ = false;
     int  out_rate_ = 44100;
 
-    // TX: modem writes here, drain resamples + copies to tx_ring_
+    // TX: modem accumulates here; wait_drain resamples + copies to tx_ring_
     std::vector<int16_t> tx_pcm_;
 
-    // TX ring buffer for AudioUnit output callback
-    int16_t tx_ring_[TX_RING]{};
-    int     tx_wr_ = 0, tx_rd_ = 0, tx_avail_ = 0;
-    std::mutex tx_mtx_;
+    // TX ring — SPSC lock-free (wait_drain writes, tx_callback reads)
+    int16_t              tx_ring_[TX_RING]{};
+    std::atomic<int>     tx_wr_{0};
+    std::atomic<int>     tx_rd_{0};
 
     // ── Callbacks ────────────────────────────────────────────────────────
 
@@ -341,7 +353,7 @@ private:
         AudioQueueEnqueueBuffer(self->in_q_, buf, 0, nullptr);
     }
 
-    // AudioUnit output render callback (reads from TX ring)
+    // AudioUnit output render callback — lock-free, real-time safe
     static OSStatus tx_callback(void* ctx, AudioUnitRenderActionFlags*,
                                 const AudioTimeStamp*, UInt32, UInt32 frames,
                                 AudioBufferList* ioData) {
@@ -349,17 +361,19 @@ private:
         int16_t* out = static_cast<int16_t*>(ioData->mBuffers[0].mData);
         int n = (int)frames;
 
-        std::lock_guard<std::mutex> lk(self->tx_mtx_);
-        int to_read = (n < self->tx_avail_) ? n : self->tx_avail_;
+        int rd = self->tx_rd_.load(std::memory_order_relaxed);
+        int wr = self->tx_wr_.load(std::memory_order_acquire);
+        int avail = (wr - rd + TX_RING) % TX_RING;
+        int to_read = (n < avail) ? n : avail;
+
         for (int i = 0; i < to_read; i++) {
-            out[i] = self->tx_ring_[self->tx_rd_];
-            self->tx_rd_ = (self->tx_rd_ + 1) % TX_RING;
+            out[i] = self->tx_ring_[rd];
+            rd = (rd + 1) % TX_RING;
         }
-        self->tx_avail_ -= to_read;
-        // Silence for remaining
         for (int i = to_read; i < n; i++)
             out[i] = 0;
 
+        self->tx_rd_.store(rd, std::memory_order_release);
         return noErr;
     }
 };

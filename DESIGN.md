@@ -1072,6 +1072,24 @@ kiss_modem uses system audio APIs with zero external dependencies:
 - Exposes capture pollfd for `select()` integration
 - Package: `libasound2-dev` (Debian/Ubuntu) / `alsa-lib-devel` (Fedora)
 
+### Debug & Diagnostics
+
+kiss_modem provides a three-level `--debug N` flag.  All debug output is
+timestamped (`HH:MM:SS.mmm`) and goes to stderr (monitor frames go to stdout).
+
+| Level | Tag | What it shows |
+|-------|-----|---------------|
+| 1 | `[TX]` | PTT ON/OFF, burst frame count, sample count, audio duration |
+| 2 | `[DCD]`, `[QUEUE]`, `[PTY]` | DCD wait/clear, queue depth on enqueue, PTY/TCP raw hex |
+| 3 | `[HDLC]` | FCS failures (got vs expected), abort events with byte count |
+
+`--monitor` (frame display) is independent of debug level and always shows
+timestamped decoded AX.25 frames on stdout.
+
+Design rationale: kiss_modem is a KISS-dumb TNC — it does not inspect AX.25
+control bytes, manage T1 timers, or track connection state.  Debug output
+reflects only what the modem layer can observe: timing, audio, and HDLC events.
+
 ### Build Matrix & Compatibility
 
 **Supported platforms:**
